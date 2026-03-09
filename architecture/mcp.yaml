@@ -1,0 +1,10 @@
+# mcp — MCP server for broker tools
+# Source: mcp/src
+
+modules:
+  - id: tools
+    file: main.rs
+    files:
+      - tools.rs
+    owns: [mcp-server, broker-register, broker-presence, broker-send, broker-peek, broker-messages]
+    depends_on: []

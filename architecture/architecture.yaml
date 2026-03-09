@@ -13,28 +13,33 @@ system:
 
 containers:
   - id: api
-    path: src/api
+    path: broker/src/api
     description: HTTP + WebSocket API layer — routes, request/response types, WS handlers
     depends_on: [broker, db, identity, stanza]
 
   - id: broker
-    path: src/broker
+    path: broker/src/broker
     description: Core broker logic — agent state, presence, delivery engine, channel routing
     depends_on: [db]
 
   - id: db
-    path: src/db
+    path: broker/src/db
     description: SQLite persistence — schema, repository pattern for all data access
     depends_on: [identity]
 
   - id: identity
-    path: src/identity
+    path: broker/src/identity
     description: Authentication primitives — key hashing, verification
     depends_on: []
 
   - id: stanza
-    path: src/stanza
+    path: broker/src/stanza
     description: XML stanza parser — extracts routing headers (from, to, type), preserves raw XML
+    depends_on: []
+
+  - id: mcp
+    path: mcp/src
+    description: MCP server (stdio) — exposes broker tools for AI agents (register, presence, send, peek, messages)
     depends_on: []
 
 rules:

@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/agent-broker agent-broker-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/broker-mcp broker-mcp-${{ matrix.suffix }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/agent-broker.exe agent-broker-${{ matrix.suffix }}.exe
+          cp target/${{ matrix.target }}/release/broker-mcp.exe broker-mcp-${{ matrix.suffix }}.exe
+
+      - name: Upload agent-broker
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-broker-${{ matrix.suffix }}
+          path: agent-broker-${{ matrix.suffix }}*
+
+      - name: Upload broker-mcp
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-mcp-${{ matrix.suffix }}
+          path: broker-mcp-${{ matrix.suffix }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            agent-broker-linux-x64/agent-broker-linux-x64
+            agent-broker-macos-arm64/agent-broker-macos-arm64
+            agent-broker-macos-x64/agent-broker-macos-x64
+            agent-broker-windows-x64/agent-broker-windows-x64.exe
+            broker-mcp-linux-x64/broker-mcp-linux-x64
+            broker-mcp-macos-arm64/broker-mcp-macos-arm64
+            broker-mcp-macos-x64/broker-mcp-macos-x64
+            broker-mcp-windows-x64/broker-mcp-windows-x64.exe
