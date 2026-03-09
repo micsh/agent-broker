@@ -50,7 +50,7 @@ async fn main() {
         .route("/ws", axum::routing::get(api::handle_ws))
         .with_state(app_state);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("127.0.0.1:{port}");
     tracing::info!("Agent broker listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr)
