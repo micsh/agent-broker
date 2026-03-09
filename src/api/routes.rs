@@ -1,8 +1,9 @@
 use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::DeliveryEngine;
 use crate::db::repository::PendingMessage;
+use crate::stanza::{self, Destination};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put, delete};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -62,17 +63,6 @@ pub struct AuthenticatedRequest {
     pub state: AgentState,
 }
 
-#[derive(Deserialize)]
-pub struct SendRequest {
-    pub from: String,
-    pub from_project: String,
-    pub project_key: String,
-    pub to_agent: Option<String>,
-    pub to_channel: Option<String>,
-    pub body: String,
-    pub metadata: Option<String>,
-}
-
 #[derive(Serialize)]
 pub struct SendResponse {
     pub message_id: String,
@@ -97,6 +87,18 @@ fn verify_key(state: &AppState, project: &str, key: &str) -> Result<(), (StatusC
         return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
     }
     Ok(())
+}
+
+fn extract_auth(headers: &HeaderMap) -> Result<(&str, &str), (StatusCode, String)> {
+    let project = headers
+        .get("x-project")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project header".to_string()))?;
+    let key = headers
+        .get("x-project-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project-Key header".to_string()))?;
+    Ok((project, key))
 }
 
 // --- Handlers ---
@@ -150,28 +152,59 @@ async fn list_agents(
     Json(agents)
 }
 
+/// Accept raw stanza XML. Auth via X-Project / X-Project-Key headers.
 async fn send_message(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SendRequest>,
+    headers: HeaderMap,
+    body: String,
 ) -> Result<Json<SendResponse>, (StatusCode, String)> {
-    verify_key(&state, &req.from_project, &req.project_key)?;
+    let (project, key) = extract_auth(&headers)?;
+    verify_key(&state, project, key)?;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    state
-        .delivery
-        .deliver(
-            &id,
-            &req.from,
-            &req.from_project,
-            req.to_agent.as_deref(),
-            req.to_channel.as_deref(),
-            &req.body,
-            req.metadata.as_deref(),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let parsed = stanza::parse(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
 
-    Ok(Json(SendResponse { message_id: id }))
+    match parsed {
+        stanza::Stanza::Message(msg) => {
+            if !state.broker.repo.agent_exists(&msg.from, project) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Agent '{}' not registered in project '{}'", msg.from, project),
+                ));
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let (to_agent, to_channel) = match stanza::resolve_destination(&msg.to) {
+                Destination::Agent(a) => (Some(a), None),
+                Destination::Channel(c) => (None, Some(c)),
+            };
+
+            state
+                .delivery
+                .deliver(
+                    &id,
+                    &msg.from,
+                    project,
+                    to_agent.as_deref(),
+                    to_channel.as_deref(),
+                    &msg.raw,
+                    None,
+                )
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            Ok(Json(SendResponse { message_id: id }))
+        }
+        stanza::Stanza::Presence(p) => {
+            let agent_state = match p.status {
+                stanza::PresenceStatus::Available => AgentState::Available,
+                stanza::PresenceStatus::Busy => AgentState::Busy,
+                stanza::PresenceStatus::Offline => AgentState::Offline,
+            };
+            state.broker.set_state(&p.from, project, agent_state).await;
+            Ok(Json(SendResponse { message_id: String::new() }))
+        }
+    }
 }
 
 async fn get_messages(

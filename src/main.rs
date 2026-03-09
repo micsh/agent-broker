@@ -2,6 +2,7 @@ mod api;
 mod broker;
 mod db;
 mod identity;
+mod stanza;
 
 use api::AppState;
 use broker::BrokerState;

@@ -15,7 +15,7 @@ containers:
   - id: api
     path: src/api
     description: HTTP + WebSocket API layer — routes, request/response types, WS handlers
-    depends_on: [broker, db, identity]
+    depends_on: [broker, db, identity, stanza]
 
   - id: broker
     path: src/broker
@@ -29,7 +29,12 @@ containers:
 
   - id: identity
     path: src/identity
-    description: Authentication primitives — broker secret management, key hashing, verification
+    description: Authentication primitives — key hashing, verification
+    depends_on: []
+
+  - id: stanza
+    path: src/stanza
+    description: XML stanza parser — extracts routing headers (from, to, type), preserves raw XML
     depends_on: []
 
 rules:
@@ -48,5 +53,11 @@ rules:
   - id: identity-independence
     type: no_dependency
     from: identity
-    to: [api, broker, db]
-    reason: "Identity is a leaf module — pure crypto/IO, no dependencies on other layers"
+    to: [api, broker, db, stanza]
+    reason: "Identity is a leaf module — pure crypto, no dependencies on other layers"
+
+  - id: stanza-independence
+    type: no_dependency
+    from: stanza
+    to: [api, broker, db, identity]
+    reason: "Stanza parser is a leaf module — pure parsing, no dependencies on other layers"

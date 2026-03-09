@@ -1,0 +1,16 @@
+container:
+  id: stanza
+  description: XML stanza parser — extracts routing headers, preserves raw XML for forwarding
+
+modules:
+  - id: parser
+    file: parser.rs
+    files:
+      - mod.rs
+    description: Single-stanza parser — extracts from/to/type/status from opening tag attributes
+    owns: [parse, parse_message, parse_presence]
+
+  - id: types
+    file: types.rs
+    description: Stanza types — MessageStanza, PresenceStanza, MessageType, PresenceStatus, ParseError
+    owns: [Stanza, MessageStanza, PresenceStanza, MessageType, PresenceStatus, ParseError]
