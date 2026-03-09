@@ -1,0 +1,15 @@
+# api — HTTP + WebSocket API layer
+# Source: src/api
+
+modules:
+  - id: routes
+    file: mod.rs
+    files:
+      - routes.rs
+    owns: [http-endpoints, request-types, response-types]
+    depends_on: [broker/state, broker/delivery]
+
+  - id: ws
+    file: ws.rs
+    owns: [websocket-handler, connection-upgrade, live-streaming]
+    depends_on: [broker/state, broker/delivery]

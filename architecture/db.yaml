@@ -1,0 +1,14 @@
+# db — SQLite persistence: schema, migrations, connection management
+# Source: src/db
+
+modules:
+  - id: db
+    file: mod.rs
+    owns: [database-connection, sqlite-handle]
+    boundary: "Pure persistence — no business logic"
+
+  - id: schema
+    file: schema.rs
+    owns: [migrations, table-definitions]
+    boundary: "Schema only — no queries beyond DDL"
+

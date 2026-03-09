@@ -1,0 +1,41 @@
+guidance: |
+  Before making code changes, read the relevant container YAML.
+  After changes, update ownership and dependencies if they changed.
+  The broker is a dumb pipe with state — it knows WHO is connected and WHERE
+  messages go, but has zero knowledge of prompts, LLMs, or what agents do.
+
+system:
+  name: agent-broker
+  description: Lightweight agent message broker — identity, presence, and message routing for AI agents across projects.
+  ignore:
+    - "target/**"
+    - "tests/**"
+
+containers:
+  - id: api
+    path: src/api
+    description: HTTP + WebSocket API layer — routes, request/response types, WS handlers
+    depends_on: [broker]
+
+  - id: broker
+    path: src/broker
+    description: Core broker logic — agent state, presence, delivery engine, channel routing
+    depends_on: [db]
+
+  - id: db
+    path: src/db
+    description: SQLite persistence — schema, migrations, connection management
+    depends_on: []
+
+rules:
+  - id: db-independence
+    type: no_dependency
+    from: db
+    to: [api, broker]
+    reason: "Database layer must not depend on broker logic or API"
+
+  - id: broker-no-api
+    type: no_dependency
+    from: broker
+    to: api
+    reason: "Broker logic must not depend on API layer — API calls broker, not the other way"

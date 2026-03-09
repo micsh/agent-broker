@@ -1,0 +1,22 @@
+# Cross-cutting flows connecting modules across containers.
+
+stories:
+  - id: agent-connects
+    description: Agent connects via WebSocket, registers presence, receives pending messages
+    flow:
+      - api/ws
+      - broker/state
+      - broker/delivery
+
+  - id: agent-sends-message
+    description: Agent sends a message to another agent or channel, broker persists and routes
+    flow:
+      - api/ws
+      - broker/delivery
+      - broker/state
+
+  - id: discover-agents
+    description: Client queries which agents are online, filtered by project or state
+    flow:
+      - api/routes
+      - broker/state
