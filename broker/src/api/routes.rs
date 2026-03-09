@@ -23,6 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/presence", put(update_presence))
         .route("/send", post(send_message))
         .route("/messages", get(get_messages))
+        .route("/messages/peek", get(peek_messages))
         .route("/channels/{id}/subscribe", post(subscribe_channel))
         .route("/channels/{id}/unsubscribe", delete(unsubscribe_channel))
         .route("/health", get(health))
@@ -78,6 +79,18 @@ pub struct MessageQuery {
     pub name: String,
     pub project: String,
     pub project_key: String,
+}
+
+#[derive(Serialize)]
+pub struct PeekSender {
+    pub from: String,
+    pub at: String,
+}
+
+#[derive(Serialize)]
+pub struct PeekResponse {
+    pub count: usize,
+    pub senders: Vec<PeekSender>,
 }
 
 // --- Helpers ---
@@ -179,6 +192,22 @@ async fn send_message(
                 Destination::Channel(c) => (None, Some(c)),
             };
 
+            // Validate target agent exists before attempting delivery
+            if let Some(ref agent) = to_agent {
+                let (name, target_project) = if agent.contains('.') {
+                    let parts: Vec<&str> = agent.splitn(2, '.').collect();
+                    (parts[0], parts[1])
+                } else {
+                    (agent.as_str(), project)
+                };
+                if !state.broker.repo.agent_exists(name, target_project) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Target agent '{}' not found in project '{}'", name, target_project),
+                    ));
+                }
+            }
+
             state
                 .delivery
                 .deliver(
@@ -214,6 +243,25 @@ async fn get_messages(
     verify_key(&state, &query.project, &query.project_key)?;
     let messages = state.delivery.drain_pending(&query.name, &query.project);
     Ok(Json(messages))
+}
+
+async fn peek_messages(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MessageQuery>,
+) -> Result<Json<PeekResponse>, (StatusCode, String)> {
+    verify_key(&state, &query.project, &query.project_key)?;
+    let pending = state.broker.repo.peek_pending(&query.name, &query.project);
+    let senders: Vec<PeekSender> = pending
+        .iter()
+        .map(|(agent, project, at)| PeekSender {
+            from: format!("{}.{}", agent, project),
+            at: at.clone(),
+        })
+        .collect();
+    Ok(Json(PeekResponse {
+        count: senders.len(),
+        senders,
+    }))
 }
 
 async fn subscribe_channel(

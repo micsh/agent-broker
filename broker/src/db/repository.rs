@@ -203,6 +203,27 @@ impl Repository {
         messages
     }
 
+    /// Peek at pending messages: returns count and list of senders without consuming.
+    pub fn peek_pending(&self, name: &str, project: &str) -> Vec<(String, String, String)> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT m.from_agent, m.from_project, m.created_utc
+             FROM delivery_log dl
+             JOIN messages m ON dl.message_id = m.id
+             WHERE dl.agent_name = ?1 AND dl.project = ?2 AND dl.status = 'pending'
+             ORDER BY m.created_utc ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        match stmt.query_map(params![name, project], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        }) {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn cleanup(&self, delivered_hours: u64, pending_hours: u64) -> (usize, usize) {
         let conn = self.conn();
 
