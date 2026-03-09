@@ -10,6 +10,7 @@ use rmcp::{
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Mutex;
+use std::path::PathBuf;
 
 const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:4200";
 
@@ -70,6 +71,24 @@ fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
 }
 
+/// Key file path: ~/.agent-broker/keys/<project>.key
+fn key_file_path(project: &str) -> PathBuf {
+    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join(".agent-broker").join("keys").join(format!("{project}.key"))
+}
+
+fn load_key(project: &str) -> Option<String> {
+    std::fs::read_to_string(key_file_path(project)).ok().map(|s| s.trim().to_string())
+}
+
+fn save_key(project: &str, key: &str) {
+    let path = key_file_path(project);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, key);
+}
+
 #[tool_router]
 impl BrokerTools {
     pub fn new() -> Self {
@@ -98,14 +117,15 @@ impl BrokerTools {
             .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?;
 
         let project_key = if proj_resp.status().is_success() {
-            proj_resp.json::<RegProjResp>().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?.project_key
+            let key = proj_resp.json::<RegProjResp>().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?.project_key;
+            save_key(&args.project, &key);
+            key
         } else if proj_resp.status().as_u16() == 409 {
-            let g = self.session.lock().unwrap();
-            match g.as_ref() {
-                Some(s) if s.project == args.project => s.project_key.clone(),
-                _ => return Err(rmcp::ErrorData::invalid_params(
-                    format!("Project '{}' already exists.", args.project), None)),
-            }
+            // Project exists — load key from file
+            load_key(&args.project).ok_or_else(|| rmcp::ErrorData::invalid_params(
+                format!("Project '{}' exists but no saved key found at {}. \
+                         If you own this project, place the key in that file.",
+                         args.project, key_file_path(&args.project).display()), None))?
         } else {
             let body = proj_resp.text().await.unwrap_or_default();
             return Err(mcp_err(format!("Project registration failed: {body}")));

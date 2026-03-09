@@ -151,6 +151,7 @@ name = "broker-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "reqwest",
  "rmcp",
  "schemars",
