@@ -85,15 +85,7 @@ impl BrokerState {
         };
 
         let mut sessions = self.sessions.write().await;
-        sessions.insert(key.clone(), session);
-
-        // Update DB presence
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO presence (agent_name, project, state, session_id, updated_utc)
-             VALUES (?1, ?2, 'available', ?3, datetime('now'))",
-            rusqlite::params![name, project, session_id],
-        );
+        sessions.insert(key, session);
 
         tracing::info!("Agent connected: {}.{} (session: {})", name, project, session_id);
         rx
@@ -105,13 +97,6 @@ impl BrokerState {
         let mut sessions = self.sessions.write().await;
         sessions.remove(&key);
 
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "UPDATE presence SET state = 'offline', session_id = NULL, updated_utc = datetime('now')
-             WHERE agent_name = ?1 AND project = ?2",
-            rusqlite::params![name, project],
-        );
-
         tracing::info!("Agent disconnected: {}.{}", name, project);
     }
 
@@ -122,13 +107,6 @@ impl BrokerState {
         if let Some(session) = sessions.get_mut(&key) {
             session.state = state;
         }
-
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "UPDATE presence SET state = ?3, updated_utc = datetime('now')
-             WHERE agent_name = ?1 AND project = ?2",
-            rusqlite::params![name, project, state.to_string()],
-        );
     }
 
     /// Get all connected agents, optionally filtered by project.

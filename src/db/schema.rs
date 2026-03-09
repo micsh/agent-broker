@@ -13,16 +13,6 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (name, project)
         );
 
-        CREATE TABLE IF NOT EXISTS presence (
-            agent_name  TEXT NOT NULL,
-            project     TEXT NOT NULL,
-            state       TEXT NOT NULL DEFAULT 'offline',
-            session_id  TEXT,
-            updated_utc TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (agent_name, project),
-            FOREIGN KEY (agent_name, project) REFERENCES agents(name, project)
-        );
-
         CREATE TABLE IF NOT EXISTS channels (
             id          TEXT PRIMARY KEY,
             project     TEXT,
