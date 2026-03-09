@@ -13,6 +13,8 @@ impl DeliveryEngine {
     }
 
     /// Store a message and attempt live delivery.
+    /// The broker enriches stanzas: `from` becomes fully qualified (name.project),
+    /// and unqualified `to` scopes to the sender's project.
     pub async fn deliver(
         &self,
         id: &str,
@@ -23,22 +25,29 @@ impl DeliveryEngine {
         body: &str,
         metadata: Option<&str>,
     ) -> Result<(), String> {
+        // Enrich the from field to be fully qualified (name.project) if not already
+        let expected_suffix = format!(".{}", from_project);
+        let enriched = if from_agent.ends_with(&expected_suffix) {
+            body.to_string()
+        } else {
+            let qualified_from = format!("{}.{}", from_agent, from_project);
+            body.replace(
+                &format!("from=\"{}\"", from_agent),
+                &format!("from=\"{}\"", qualified_from),
+            )
+        };
+        let body = enriched.as_str();
+
         self.state.repo.insert_message(id, from_agent, from_project, to_agent, to_channel, body, metadata)?;
 
         if let Some(target) = to_agent {
             let (name, project) = if target.contains('.') {
+                // Cross-project: "David.AITeam.Platform"
                 let parts: Vec<&str> = target.splitn(2, '.').collect();
                 (parts[0].to_string(), parts[1].to_string())
             } else {
-                let sessions = self.state.sessions.read().await;
-                let found = sessions.values().find(|s| s.name == target);
-                match found {
-                    Some(s) => (s.name.clone(), s.project.clone()),
-                    None => {
-                        self.state.repo.record_pending(id, target, from_project)?;
-                        return Ok(());
-                    }
-                }
+                // Unqualified name: scope to sender's project only
+                (target.to_string(), from_project.to_string())
             };
 
             let delivered = self.state.send_to_agent(&name, &project, body).await;
