@@ -1,16 +1,22 @@
 use rusqlite::Connection;
 
-/// Run all schema migrations.
-pub fn migrate(conn: &Connection) -> Result<(), String> {
+/// Ensure all required tables exist.
+pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
+        CREATE TABLE IF NOT EXISTS projects (
+            name        TEXT PRIMARY KEY,
+            key_hash    TEXT NOT NULL,
+            created_utc TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS agents (
             name        TEXT NOT NULL,
             project     TEXT NOT NULL,
             role        TEXT NOT NULL DEFAULT '',
-            token       TEXT NOT NULL,
             created_utc TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (name, project)
+            PRIMARY KEY (name, project),
+            FOREIGN KEY (project) REFERENCES projects(name)
         );
 
         CREATE TABLE IF NOT EXISTS channels (
@@ -59,7 +65,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             WHERE status = 'pending';
         ",
     )
-    .map_err(|e| format!("Migration failed: {e}"))
+    .map_err(|e| format!("Schema setup failed: {e}"))
 }
 
 #[cfg(test)]
@@ -67,9 +73,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_migration_is_idempotent() {
+    fn test_schema_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap(); // second run should succeed
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();// second run should succeed
     }
 }

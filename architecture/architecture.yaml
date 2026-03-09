@@ -15,7 +15,7 @@ containers:
   - id: api
     path: src/api
     description: HTTP + WebSocket API layer — routes, request/response types, WS handlers
-    depends_on: [broker]
+    depends_on: [broker, db, identity]
 
   - id: broker
     path: src/broker
@@ -24,7 +24,12 @@ containers:
 
   - id: db
     path: src/db
-    description: SQLite persistence — schema, migrations, connection management
+    description: SQLite persistence — schema, repository pattern for all data access
+    depends_on: [identity]
+
+  - id: identity
+    path: src/identity
+    description: Authentication primitives — broker secret management, key hashing, verification
     depends_on: []
 
 rules:
@@ -39,3 +44,9 @@ rules:
     from: broker
     to: api
     reason: "Broker logic must not depend on API layer — API calls broker, not the other way"
+
+  - id: identity-independence
+    type: no_dependency
+    from: identity
+    to: [api, broker, db]
+    reason: "Identity is a leaf module — pure crypto/IO, no dependencies on other layers"

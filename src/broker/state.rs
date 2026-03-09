@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::Repository;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -14,9 +14,10 @@ pub struct AgentSession {
 }
 
 /// Agent presence state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
+    #[default]
     Available,
     Busy,
     Offline,
@@ -53,16 +54,16 @@ impl AgentKey {
     }
 }
 
-/// Shared broker state — in-memory connected agents + database handle.
+/// Shared broker state — in-memory connected agents + repository for persistence.
 pub struct BrokerState {
-    pub db: Arc<Db>,
+    pub repo: Arc<Repository>,
     pub sessions: RwLock<HashMap<AgentKey, AgentSession>>,
 }
 
 impl BrokerState {
-    pub fn new(db: Arc<Db>) -> Self {
+    pub fn new(repo: Arc<Repository>) -> Self {
         Self {
-            db,
+            repo,
             sessions: RwLock::new(HashMap::new()),
         }
     }
@@ -139,22 +140,7 @@ impl BrokerState {
 
     /// Broadcast a message to all agents on a channel.
     pub async fn send_to_channel(&self, channel_id: &str, message: &str, exclude: Option<&str>) {
-        let subscribers = {
-            let conn = self.db.conn();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT agent_name, project FROM subscriptions WHERE channel_id = ?1",
-                )
-                .unwrap();
-            let rows: Vec<(String, String)> = stmt
-                .query_map(rusqlite::params![channel_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
+        let subscribers = self.repo.get_subscribers(channel_id);
 
         let sessions = self.sessions.read().await;
         for (name, project) in subscribers {

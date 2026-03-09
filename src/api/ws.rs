@@ -9,7 +9,6 @@ use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// WebSocket upgrade handler.
 pub async fn handle_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -21,29 +20,25 @@ pub async fn handle_ws(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMessage {
-    /// Client → Broker: authenticate and register
+    /// Client → Broker: authenticate with project key
     Connect {
         name: String,
         project: String,
-        token: String,
+        project_key: String,
     },
-    /// Broker → Client: connection accepted
     Connected {
         session_id: String,
         pending_count: usize,
     },
-    /// Client → Broker: update presence state
     Presence {
         state: crate::broker::state::AgentState,
     },
-    /// Client → Broker: send a message
     Send {
         to_agent: Option<String>,
         to_channel: Option<String>,
         body: String,
         metadata: Option<String>,
     },
-    /// Broker → Client: incoming message
     Message {
         id: String,
         from_agent: String,
@@ -51,11 +46,9 @@ pub enum WsMessage {
         body: String,
         metadata: Option<String>,
     },
-    /// Broker → Client: delivery of pending messages on connect
     Pending {
         messages: Vec<PendingItem>,
     },
-    /// Broker → Client: error
     Error {
         message: String,
     },
@@ -74,17 +67,18 @@ pub struct PendingItem {
 async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Wait for Connect message
     let (name, project, session_id) = match wait_for_connect(&mut receiver, &state).await {
         Some(info) => info,
-        None => return,
+        None => {
+            let err = WsMessage::Error { message: "Authentication failed".to_string() };
+            let _ = sender.send(Message::Text(serde_json::to_string(&err).unwrap().into())).await;
+            return;
+        }
     };
 
-    // Drain pending messages
-    let pending = state.delivery.drain_pending(&name, &project).await;
+    let pending = state.delivery.drain_pending(&name, &project);
     let pending_count = pending.len();
 
-    // Send Connected acknowledgement
     let connected = WsMessage::Connected {
         session_id: session_id.clone(),
         pending_count,
@@ -93,7 +87,6 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Send pending messages
     if !pending.is_empty() {
         let items: Vec<PendingItem> = pending
             .into_iter()
@@ -110,10 +103,8 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         let _ = sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
     }
 
-    // Subscribe to live messages via broadcast channel
-    let mut rx: tokio::sync::broadcast::Receiver<String> = state.broker.connect(&name, &project, &session_id).await;
+    let mut rx = state.broker.connect(&name, &project, &session_id).await;
 
-    // Spawn task to forward broadcast messages to WebSocket
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             if sender.send(Message::Text(msg.into())).await.is_err() {
@@ -122,7 +113,6 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    // Process incoming WebSocket messages
     let broker = state.broker.clone();
     let delivery = state.delivery.clone();
     let agent_name = name.clone();
@@ -142,13 +132,11 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    // Wait for either task to finish (disconnect)
     tokio::select! {
         _ = &mut send_task => { recv_task.abort(); }
         _ = &mut recv_task => { send_task.abort(); }
     }
 
-    // Clean up
     state.broker.disconnect(&name, &project).await;
     tracing::info!("WebSocket closed: {}.{}", name, project);
 }
@@ -159,26 +147,24 @@ async fn wait_for_connect(
 ) -> Option<(String, String, String)> {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
-            if let Ok(WsMessage::Connect { name, project, token }) =
+            if let Ok(WsMessage::Connect { name, project, project_key }) =
                 serde_json::from_str::<WsMessage>(&text)
             {
-                // Verify token (simple check — agent must be registered)
-                let valid = {
-                    let conn = state.broker.db.conn();
-                    let mut stmt = conn
-                        .prepare("SELECT token FROM agents WHERE name = ?1 AND project = ?2")
-                        .ok()?;
-                    let stored_token: Option<String> = stmt
-                        .query_row(rusqlite::params![name, project], |row: &rusqlite::Row| row.get(0))
-                        .ok();
-                    // Accept if no agent registered yet (first connect) or token matches
-                    stored_token.is_none() || stored_token.as_deref() == Some(&token)
-                };
-
-                if valid {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    return Some((name, project, session_id));
+                // Verify the project key
+                if !state.broker.repo.verify_project_key(&project, &project_key) {
+                    tracing::warn!("WS auth failed: {}.{}", name, project);
+                    return None;
                 }
+
+                // Agent must be registered
+                if !state.broker.repo.agent_exists(&name, &project) {
+                    tracing::warn!("WS connect from unregistered agent: {}.{}", name, project);
+                    return None;
+                }
+
+                let session_id = uuid::Uuid::new_v4().to_string();
+                tracing::info!("WS connected: {}.{}", name, project);
+                return Some((name, project, session_id));
             }
         }
     }
