@@ -30,8 +30,9 @@ pub struct BrokerTools {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RegisterArgs {
-    /// Your agent name (e.g. "Archie")
-    pub name: String,
+    /// Your agent name (e.g. "Archie"). Optional if previously registered from this directory.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Project name (e.g. "CopilotCLI")
     pub project: String,
     /// Broker URL override. Defaults to http://127.0.0.1:4200
@@ -89,6 +90,34 @@ fn save_key(project: &str, key: &str) {
     let _ = std::fs::write(path, key);
 }
 
+/// Identity file: ~/.agent-broker/identities.json — maps CWD → agent name
+fn identities_path() -> PathBuf {
+    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join(".agent-broker").join("identities.json")
+}
+
+fn load_identities() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(identities_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_identity(cwd: &str, name: &str) {
+    let mut map = load_identities();
+    map.insert(cwd.to_string(), name.to_string());
+    let path = identities_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&map).unwrap_or_default());
+}
+
+fn lookup_identity() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?.to_string_lossy().to_string();
+    load_identities().get(&cwd).cloned()
+}
+
 #[tool_router]
 impl BrokerTools {
     pub fn new() -> Self {
@@ -109,6 +138,12 @@ impl BrokerTools {
 
     #[tool(description = "Register with the agent-broker. Must be called before other tools.")]
     async fn broker_register(&self, Parameters(args): Parameters<RegisterArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        let agent_name = match args.name {
+            Some(n) => n,
+            None => lookup_identity().ok_or_else(|| rmcp::ErrorData::invalid_params(
+                "No agent name provided and no saved identity for this directory. Pass 'name' on first use.", None))?,
+        };
+
         let broker_url = args.broker_url
             .unwrap_or_else(|| std::env::var("BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_URL.to_string()));
 
@@ -133,7 +168,7 @@ impl BrokerTools {
 
         let resp = self.client.post(format!("{}/agents/register", broker_url))
             .json(&serde_json::json!({
-                "name": args.name, "project": args.project,
+                "name": agent_name, "project": args.project,
                 "project_key": project_key, "role": "assistant"
             }))
             .send().await.map_err(|e| mcp_err(format!("Agent reg failed: {e}")))?;
@@ -143,12 +178,17 @@ impl BrokerTools {
             return Err(mcp_err(format!("Agent registration failed: {body}")));
         }
 
+        // Save CWD → name mapping for future sessions
+        if let Ok(cwd) = std::env::current_dir() {
+            save_identity(&cwd.to_string_lossy(), &agent_name);
+        }
+
         *self.session.lock().unwrap() = Some(Session {
-            project: args.project.clone(), project_key, agent_name: args.name.clone(), broker_url: broker_url.clone(),
+            project: args.project.clone(), project_key, agent_name: agent_name.clone(), broker_url: broker_url.clone(),
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            format!("Registered as {}.{} on {}", args.name, args.project, broker_url))]))
+            format!("Registered as {}.{} on {}", agent_name, args.project, broker_url))]))
     }
 
     #[tool(description = "List online agents. Optionally filter by project.")]

@@ -41,7 +41,6 @@ async fn main() {
     let cleanup_delivery = delivery.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
-        interval.tick().await;
         loop {
             interval.tick().await;
             let (delivered, pending) = cleanup_delivery.cleanup(6, 168);
