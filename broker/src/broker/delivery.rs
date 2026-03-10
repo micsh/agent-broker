@@ -15,6 +15,7 @@ impl DeliveryEngine {
     /// Store a message and attempt live delivery.
     /// The broker enriches stanzas: `from` becomes fully qualified (name.project),
     /// and unqualified `to` scopes to the sender's project.
+    /// `mentions` are agent names that should receive the message even if not subscribed to the channel.
     pub async fn deliver(
         &self,
         id: &str,
@@ -24,6 +25,7 @@ impl DeliveryEngine {
         to_channel: Option<&str>,
         body: &str,
         metadata: Option<&str>,
+        mentions: &[String],
     ) -> Result<(), String> {
         // Enrich the from field to be fully qualified (name.project) if not already
         let expected_suffix = format!(".{}", from_project);
@@ -42,11 +44,9 @@ impl DeliveryEngine {
 
         if let Some(target) = to_agent {
             let (name, project) = if target.contains('.') {
-                // Cross-project: "David.AITeam.Platform"
                 let parts: Vec<&str> = target.splitn(2, '.').collect();
                 (parts[0].to_string(), parts[1].to_string())
             } else {
-                // Unqualified name: scope to sender's project only
                 (target.to_string(), from_project.to_string())
             };
 
@@ -59,7 +59,43 @@ impl DeliveryEngine {
         }
 
         if let Some(channel) = to_channel {
+            // Fan out to channel subscribers
             self.state.send_to_channel(channel, body, Some(from_agent)).await;
+
+            // Deliver to mentioned agents not subscribed to this channel
+            if !mentions.is_empty() {
+                let subscribers: std::collections::HashSet<String> = self
+                    .state
+                    .repo
+                    .get_subscribers(channel)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+
+                for mention in mentions {
+                    if mention == from_agent || subscribers.contains(mention.as_str()) {
+                        continue;
+                    }
+                    // Resolve mentioned agent: check sender's project first
+                    let (name, project) = if mention.contains('.') {
+                        let parts: Vec<&str> = mention.splitn(2, '.').collect();
+                        (parts[0].to_string(), parts[1].to_string())
+                    } else {
+                        (mention.clone(), from_project.to_string())
+                    };
+
+                    if !self.state.repo.agent_exists(&name, &project) {
+                        continue;
+                    }
+
+                    let delivered = self.state.send_to_agent(&name, &project, body).await;
+                    if delivered {
+                        let _ = self.state.repo.record_delivered(id, &name, &project);
+                    } else {
+                        let _ = self.state.repo.record_pending(id, &name, &project);
+                    }
+                }
+            }
         }
 
         Ok(())

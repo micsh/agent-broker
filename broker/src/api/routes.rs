@@ -218,6 +218,7 @@ async fn send_message(
                     to_channel.as_deref(),
                     &msg.raw,
                     None,
+                    &msg.mentions,
                 )
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;

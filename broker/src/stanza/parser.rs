@@ -37,10 +37,16 @@ fn parse_message(xml: &str, raw: &str) -> Result<MessageStanza, ParseError> {
         value: type_str,
     })?;
 
+    let mentions = attrs
+        .get("mentions")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
     Ok(MessageStanza {
         from,
         to,
         message_type,
+        mentions,
         raw: raw.to_string(),
     })
 }
@@ -310,5 +316,59 @@ mod tests {
             super::super::types::resolve_destination("Zoe.AITeam"),
             super::super::types::Destination::Agent("Zoe.AITeam".to_string())
         );
+    }
+
+    // --- Mention parsing ---
+
+    #[test]
+    fn parse_mentions_attribute() {
+        let xml = r##"<message type="post" from="Sarah" to="#implementation" mentions="Zoe,Maya">
+  <body>@Zoe and @Maya please coordinate.</body>
+</message>"##;
+        match parse(xml).unwrap() {
+            Stanza::Message(m) => {
+                assert_eq!(m.mentions, vec!["Zoe", "Maya"]);
+            }
+            _ => panic!("Expected Message"),
+        }
+    }
+
+    #[test]
+    fn parse_single_mention() {
+        let xml = r##"<message type="post" from="Sarah" to="#implementation" mentions="Zoe">
+  <body>@Zoe do this.</body>
+</message>"##;
+        match parse(xml).unwrap() {
+            Stanza::Message(m) => {
+                assert_eq!(m.mentions, vec!["Zoe"]);
+            }
+            _ => panic!("Expected Message"),
+        }
+    }
+
+    #[test]
+    fn parse_no_mentions_attribute() {
+        let xml = r##"<message type="post" from="Maya" to="#analysis">
+  <body>No mentions here.</body>
+</message>"##;
+        match parse(xml).unwrap() {
+            Stanza::Message(m) => {
+                assert!(m.mentions.is_empty());
+            }
+            _ => panic!("Expected Message"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_mentions_attribute() {
+        let xml = r##"<message type="post" from="Maya" to="#analysis" mentions="">
+  <body>Empty mentions.</body>
+</message>"##;
+        match parse(xml).unwrap() {
+            Stanza::Message(m) => {
+                assert!(m.mentions.is_empty());
+            }
+            _ => panic!("Expected Message"),
+        }
     }
 }

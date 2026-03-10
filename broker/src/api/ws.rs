@@ -178,6 +178,7 @@ async fn handle_stanza(
                     to_channel.as_deref(),
                     &msg.raw,
                     None,
+                    &msg.mentions,
                 )
                 .await
             {

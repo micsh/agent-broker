@@ -10,12 +10,14 @@ pub enum Stanza {
 }
 
 /// Only the fields the broker needs for routing. Body, subject, thread,
-/// mentions, post-type etc. are application concerns — forwarded as raw XML.
+/// post-type etc. are application concerns — forwarded as raw XML.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageStanza {
     pub from: String,
     pub to: String,
     pub message_type: MessageType,
+    /// Comma-separated agent names from the `mentions` attribute, if present.
+    pub mentions: Vec<String>,
     pub raw: String,
 }
 
