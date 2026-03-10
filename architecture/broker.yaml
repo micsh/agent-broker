@@ -6,13 +6,14 @@ modules:
     file: mod.rs
     files:
       - state.rs
-    owns: [agent-sessions, presence-tracking, agent-discovery, channel-broadcast]
+      - dispatch.rs
+    owns: [agent-sessions, presence-tracking, agent-discovery, channel-broadcast, stanza-dispatch]
     boundary: "In-memory state + DB sync — no HTTP/WS concerns"
-    depends_on: [db/db]
+    depends_on: [db/db, stanza/types, stanza/parser]
 
   - id: delivery
     file: delivery.rs
     owns: [message-delivery, store-and-forward, pending-drain]
     boundary: "Delivery decisions only — no connection management"
-    depends_on: [db/db]
+    depends_on: [db/db, stanza/types]
 
