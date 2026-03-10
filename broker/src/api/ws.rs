@@ -1,7 +1,7 @@
-use crate::broker::state::{AgentState, BrokerState};
-use crate::broker::DeliveryEngine;
+use crate::broker::state::BrokerState;
+use crate::broker::{DeliveryEngine, dispatch_stanza};
 use crate::api::routes::AppState;
-use crate::stanza::{self, Stanza, Destination};
+use crate::stanza;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -118,13 +118,8 @@ async fn wait_for_connect(
             if let Ok(WsEnvelope::Connect { name, project, project_key }) =
                 serde_json::from_str::<WsEnvelope>(&text)
             {
-                if !state.broker.repo.verify_project_key(&project, &project_key) {
-                    tracing::warn!("WS auth failed: {}.{}", name, project);
-                    return None;
-                }
-
-                if !state.broker.repo.agent_exists(&name, &project) {
-                    tracing::warn!("WS connect from unregistered agent: {}.{}", name, project);
+                if let Err(reason) = state.broker.authenticate(&name, &project, &project_key) {
+                    tracing::warn!("WS auth failed for {}.{}: {}", name, project, reason);
                     return None;
                 }
 
@@ -145,7 +140,7 @@ async fn handle_stanza(
     broker: &Arc<BrokerState>,
     delivery: &Arc<DeliveryEngine>,
 ) {
-    let stanza = match stanza::parse(text) {
+    let parsed = match stanza::parse(text) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("Invalid stanza from {}.{}: {}", agent_name, agent_project, e);
@@ -153,53 +148,26 @@ async fn handle_stanza(
         }
     };
 
-    match stanza {
-        Stanza::Message(msg) => {
-            if msg.from != agent_name {
-                tracing::warn!(
-                    "Stanza 'from' mismatch: stanza says '{}', authenticated as '{}'",
-                    msg.from, agent_name
-                );
-                return;
-            }
+    // Validate from field matches authenticated identity
+    let stanza_from = match &parsed {
+        stanza::Stanza::Message(msg) => &msg.from,
+        stanza::Stanza::Presence(p) => &p.from,
+    };
+    if stanza_from != agent_name {
+        tracing::warn!(
+            "Stanza 'from' mismatch: stanza says '{}', authenticated as '{}'",
+            stanza_from, agent_name
+        );
+        return;
+    }
 
-            let id = uuid::Uuid::new_v4().to_string();
-            let (to_agent, to_channel) = match stanza::resolve_destination(&msg.to) {
-                Destination::Agent(a) => (Some(a), None),
-                Destination::Channel(c) => (None, Some(c)),
-            };
-
-            if let Err(e) = delivery
-                .deliver(
-                    &id,
-                    agent_name,
-                    agent_project,
-                    to_agent.as_deref(),
-                    to_channel.as_deref(),
-                    &msg.raw,
-                    None,
-                    &msg.mentions,
-                )
-                .await
-            {
-                tracing::error!("Delivery failed for {}.{}: {}", agent_name, agent_project, e);
+    // WS dispatch doesn't validate target existence (broker stores for offline agents)
+    if let Err(e) = dispatch_stanza(parsed, agent_project, broker, delivery, false).await {
+        match e {
+            crate::broker::DispatchError::DeliveryFailed(reason) => {
+                tracing::error!("Delivery failed for {}.{}: {}", agent_name, agent_project, reason);
             }
-        }
-        Stanza::Presence(p) => {
-            if p.from != agent_name {
-                tracing::warn!(
-                    "Presence 'from' mismatch: stanza says '{}', authenticated as '{}'",
-                    p.from, agent_name
-                );
-                return;
-            }
-
-            let agent_state = match p.status {
-                stanza::PresenceStatus::Available => AgentState::Available,
-                stanza::PresenceStatus::Busy => AgentState::Busy,
-                stanza::PresenceStatus::Offline => AgentState::Offline,
-            };
-            broker.set_state(agent_name, agent_project, agent_state).await;
+            _ => {}
         }
     }
 }

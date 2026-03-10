@@ -1,4 +1,5 @@
 use crate::db::Repository;
+use crate::stanza::PresenceStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -33,6 +34,16 @@ impl std::fmt::Display for AgentState {
     }
 }
 
+impl From<PresenceStatus> for AgentState {
+    fn from(status: PresenceStatus) -> Self {
+        match status {
+            PresenceStatus::Available => AgentState::Available,
+            PresenceStatus::Busy => AgentState::Busy,
+            PresenceStatus::Offline => AgentState::Offline,
+        }
+    }
+}
+
 /// Composite key for an agent: name + project.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct AgentKey {
@@ -56,7 +67,7 @@ impl AgentKey {
 
 /// Shared broker state — in-memory connected agents + repository for persistence.
 pub struct BrokerState {
-    pub repo: Arc<Repository>,
+    pub(crate) repo: Arc<Repository>,
     pub sessions: RwLock<HashMap<AgentKey, AgentSession>>,
 }
 
@@ -67,6 +78,54 @@ impl BrokerState {
             sessions: RwLock::new(HashMap::new()),
         }
     }
+
+    // --- Delegated repository methods ---
+
+    pub fn verify_project_key(&self, project: &str, key: &str) -> bool {
+        self.repo.verify_project_key(project, key)
+    }
+
+    pub fn register_project(&self, name: &str, key: &str) -> Result<(), String> {
+        self.repo.register_project(name, key)
+    }
+
+    pub fn register_agent(&self, name: &str, project: &str, role: &str) -> Result<(), String> {
+        self.repo.register_agent(name, project, role)
+    }
+
+    pub fn agent_exists(&self, name: &str, project: &str) -> bool {
+        self.repo.agent_exists(name, project)
+    }
+
+    /// Authenticate an agent: verify project key and check agent registration.
+    /// Returns Ok(()) on success, Err(reason) on failure.
+    pub fn authenticate(&self, name: &str, project: &str, key: &str) -> Result<(), String> {
+        if !self.repo.verify_project_key(project, key) {
+            return Err("Invalid project key".to_string());
+        }
+        if !self.repo.agent_exists(name, project) {
+            return Err(format!("Agent '{}' not registered in project '{}'", name, project));
+        }
+        Ok(())
+    }
+
+    pub fn ensure_channel(&self, id: &str, project: &str) {
+        self.repo.ensure_channel(id, project)
+    }
+
+    pub fn subscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
+        self.repo.subscribe(agent_name, project, channel_id)
+    }
+
+    pub fn unsubscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
+        self.repo.unsubscribe(agent_name, project, channel_id)
+    }
+
+    pub fn peek_pending(&self, name: &str, project: &str) -> Vec<(String, String, String)> {
+        self.repo.peek_pending(name, project)
+    }
+
+    // --- Session management ---
 
     /// Register an agent connection. Returns a broadcast receiver for live messages.
     pub async fn connect(

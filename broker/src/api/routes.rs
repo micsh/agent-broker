@@ -1,7 +1,7 @@
 use crate::broker::state::{AgentState, BrokerState};
-use crate::broker::DeliveryEngine;
+use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
 use crate::db::repository::PendingMessage;
-use crate::stanza::{self, Destination};
+use crate::stanza;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put, delete};
@@ -96,7 +96,7 @@ pub struct PeekResponse {
 // --- Helpers ---
 
 fn verify_key(state: &AppState, project: &str, key: &str) -> Result<(), (StatusCode, String)> {
-    if !state.broker.repo.verify_project_key(project, key) {
+    if !state.broker.verify_project_key(project, key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
     }
     Ok(())
@@ -125,7 +125,7 @@ async fn register_project(
     Json(req): Json<RegisterProjectRequest>,
 ) -> Result<Json<RegisterProjectResponse>, (StatusCode, String)> {
     let project_key = uuid::Uuid::new_v4().to_string();
-    state.broker.repo.register_project(&req.name, &project_key)
+    state.broker.register_project(&req.name, &project_key)
         .map_err(|e| (StatusCode::CONFLICT, e))?;
 
     tracing::info!("Project registered: {}", req.name);
@@ -138,7 +138,7 @@ async fn register_agent(
 ) -> Result<Json<RegisterAgentResponse>, (StatusCode, String)> {
     verify_key(&state, &req.project, &req.project_key)?;
 
-    state.broker.repo.register_agent(&req.name, &req.project, &req.role)
+    state.broker.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -177,63 +177,24 @@ async fn send_message(
     let parsed = stanza::parse(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
 
-    match parsed {
-        stanza::Stanza::Message(msg) => {
-            if !state.broker.repo.agent_exists(&msg.from, project) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    format!("Agent '{}' not registered in project '{}'", msg.from, project),
-                ));
-            }
-
-            let id = uuid::Uuid::new_v4().to_string();
-            let (to_agent, to_channel) = match stanza::resolve_destination(&msg.to) {
-                Destination::Agent(a) => (Some(a), None),
-                Destination::Channel(c) => (None, Some(c)),
-            };
-
-            // Validate target agent exists before attempting delivery
-            if let Some(ref agent) = to_agent {
-                let (name, target_project) = if agent.contains('.') {
-                    let parts: Vec<&str> = agent.splitn(2, '.').collect();
-                    (parts[0], parts[1])
-                } else {
-                    (agent.as_str(), project)
-                };
-                if !state.broker.repo.agent_exists(name, target_project) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!("Target agent '{}' not found in project '{}'", name, target_project),
-                    ));
-                }
-            }
-
-            state
-                .delivery
-                .deliver(
-                    &id,
-                    &msg.from,
-                    project,
-                    to_agent.as_deref(),
-                    to_channel.as_deref(),
-                    &msg.raw,
-                    None,
-                    &msg.mentions,
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-            Ok(Json(SendResponse { message_id: id }))
+    // Validate sender exists before dispatch
+    if let stanza::Stanza::Message(ref msg) = parsed {
+        if !state.broker.agent_exists(&msg.from, project) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Agent '{}' not registered in project '{}'", msg.from, project),
+            ));
         }
-        stanza::Stanza::Presence(p) => {
-            let agent_state = match p.status {
-                stanza::PresenceStatus::Available => AgentState::Available,
-                stanza::PresenceStatus::Busy => AgentState::Busy,
-                stanza::PresenceStatus::Offline => AgentState::Offline,
-            };
-            state.broker.set_state(&p.from, project, agent_state).await;
-            Ok(Json(SendResponse { message_id: String::new() }))
-        }
+    }
+
+    match dispatch_stanza(parsed, project, &state.broker, &state.delivery, true).await {
+        Ok(DispatchResult::MessageSent(id)) => Ok(Json(SendResponse { message_id: id })),
+        Ok(DispatchResult::PresenceUpdated) => Ok(Json(SendResponse { message_id: String::new() })),
+        Err(DispatchError::TargetNotFound { agent, project }) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Target agent '{}' not found in project '{}'", agent, project),
+        )),
+        Err(DispatchError::DeliveryFailed(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }
 
@@ -251,7 +212,7 @@ async fn peek_messages(
     Query(query): Query<MessageQuery>,
 ) -> Result<Json<PeekResponse>, (StatusCode, String)> {
     verify_key(&state, &query.project, &query.project_key)?;
-    let pending = state.broker.repo.peek_pending(&query.name, &query.project);
+    let pending = state.broker.peek_pending(&query.name, &query.project);
     let senders: Vec<PeekSender> = pending
         .iter()
         .map(|(agent, project, at)| PeekSender {
@@ -271,8 +232,8 @@ async fn subscribe_channel(
     Json(req): Json<AuthenticatedRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     verify_key(&state, &req.project, &req.project_key)?;
-    state.broker.repo.ensure_channel(&channel_id, &req.project);
-    state.broker.repo.subscribe(&req.name, &req.project, &channel_id);
+    state.broker.ensure_channel(&channel_id, &req.project);
+    state.broker.subscribe(&req.name, &req.project, &channel_id);
     Ok(StatusCode::OK)
 }
 
@@ -282,6 +243,6 @@ async fn unsubscribe_channel(
     Json(req): Json<AuthenticatedRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     verify_key(&state, &req.project, &req.project_key)?;
-    state.broker.repo.unsubscribe(&req.name, &req.project, &channel_id);
+    state.broker.unsubscribe(&req.name, &req.project, &channel_id);
     Ok(StatusCode::OK)
 }

@@ -1,5 +1,6 @@
 use crate::broker::state::BrokerState;
 use crate::db::repository::PendingMessage;
+use crate::stanza;
 use std::sync::Arc;
 
 /// Handles store-and-forward delivery for offline agents.
@@ -27,35 +28,14 @@ impl DeliveryEngine {
         metadata: Option<&str>,
         mentions: &[String],
     ) -> Result<(), String> {
-        // Enrich the from field to be fully qualified (name.project) if not already
-        let expected_suffix = format!(".{}", from_project);
-        let enriched = if from_agent.ends_with(&expected_suffix) {
-            body.to_string()
-        } else {
-            let qualified_from = format!("{}.{}", from_agent, from_project);
-            body.replace(
-                &format!("from=\"{}\"", from_agent),
-                &format!("from=\"{}\"", qualified_from),
-            )
-        };
+        let enriched = stanza::enrich_from(body, from_agent, from_project);
         let body = enriched.as_str();
 
         self.state.repo.insert_message(id, from_agent, from_project, to_agent, to_channel, body, metadata)?;
 
         if let Some(target) = to_agent {
-            let (name, project) = if target.contains('.') {
-                let parts: Vec<&str> = target.splitn(2, '.').collect();
-                (parts[0].to_string(), parts[1].to_string())
-            } else {
-                (target.to_string(), from_project.to_string())
-            };
-
-            let delivered = self.state.send_to_agent(&name, &project, body).await;
-            if delivered {
-                self.state.repo.record_delivered(id, &name, &project)?;
-            } else {
-                self.state.repo.record_pending(id, &name, &project)?;
-            }
+            let (name, project) = stanza::resolve_agent_name(target, from_project);
+            self.deliver_to_agent(id, name, project, body).await?;
         }
 
         if let Some(channel) = to_channel {
@@ -76,28 +56,33 @@ impl DeliveryEngine {
                     if mention == from_agent || subscribers.contains(mention.as_str()) {
                         continue;
                     }
-                    // Resolve mentioned agent: check sender's project first
-                    let (name, project) = if mention.contains('.') {
-                        let parts: Vec<&str> = mention.splitn(2, '.').collect();
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        (mention.clone(), from_project.to_string())
-                    };
+                    let (name, project) = stanza::resolve_agent_name(mention, from_project);
 
-                    if !self.state.repo.agent_exists(&name, &project) {
+                    if !self.state.repo.agent_exists(name, project) {
                         continue;
                     }
 
-                    let delivered = self.state.send_to_agent(&name, &project, body).await;
-                    if delivered {
-                        let _ = self.state.repo.record_delivered(id, &name, &project);
-                    } else {
-                        let _ = self.state.repo.record_pending(id, &name, &project);
-                    }
+                    self.deliver_to_agent(id, name, project, body).await?;
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Attempt live delivery to a single agent, recording delivered or pending status.
+    async fn deliver_to_agent(
+        &self,
+        message_id: &str,
+        name: &str,
+        project: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        if self.state.send_to_agent(name, project, body).await {
+            self.state.repo.record_delivered(message_id, name, project)?;
+        } else {
+            self.state.repo.record_pending(message_id, name, project)?;
+        }
         Ok(())
     }
 

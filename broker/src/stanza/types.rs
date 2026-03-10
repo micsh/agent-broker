@@ -87,6 +87,32 @@ pub fn resolve_destination(to: &str) -> Destination {
     }
 }
 
+/// Resolve an agent target (e.g. "Zoe" or "Zoe.OtherProject") into (name, project).
+/// If the target contains a dot, it's split as name.project.
+/// Otherwise, defaults to the sender's project.
+pub fn resolve_agent_name<'a>(target: &'a str, default_project: &'a str) -> (&'a str, &'a str) {
+    if let Some(dot) = target.find('.') {
+        (&target[..dot], &target[dot + 1..])
+    } else {
+        (target, default_project)
+    }
+}
+
+/// Qualify the `from` attribute in raw stanza XML to be fully qualified (name.project).
+/// If already qualified, returns the body unchanged.
+pub fn enrich_from(body: &str, from_agent: &str, from_project: &str) -> String {
+    let expected_suffix = format!(".{}", from_project);
+    if from_agent.ends_with(&expected_suffix) {
+        body.to_string()
+    } else {
+        let qualified = format!("{}.{}", from_agent, from_project);
+        body.replace(
+            &format!("from=\"{}\"", from_agent),
+            &format!("from=\"{}\"", qualified),
+        )
+    }
+}
+
 /// Error returned when a stanza cannot be parsed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
