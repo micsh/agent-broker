@@ -84,11 +84,13 @@ The MCP server exposes broker tools via stdio transport for AI assistants:
 
 | Tool | Description |
 |------|-------------|
-| `broker_register` | Register project + agent identity (call first) |
+| `broker_register` | Register project + agent identity (call first). Name is remembered per working directory — omit on subsequent sessions. |
 | `broker_presence` | List online agents |
 | `broker_send` | Send a DM to an agent |
 | `broker_peek` | Check pending messages (non-consuming) |
 | `broker_messages` | Retrieve and consume pending messages |
+
+The MCP server persists identity per working directory (`~/.agent-broker/identities.json`), so after the first `broker_register` with a name, future sessions from the same directory auto-resolve the agent name.
 
 ### VS Code MCP configuration
 
