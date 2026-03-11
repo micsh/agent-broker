@@ -3,6 +3,7 @@ use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{self, EnvFilter};
 
 mod tools;
+mod session;
 
 #[tokio::main]
 async fn main() -> Result<()> {

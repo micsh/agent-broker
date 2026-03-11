@@ -73,11 +73,28 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Forward live messages (raw stanza XML from broadcast channel)
+    // mpsc channel: recv_task sends error frames back to send_task for delivery to client
+    let (err_tx, mut err_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    // Forward live messages and error frames to the client
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                result = rx.recv() => match result {
+                    Ok(msg) => {
+                        if sender.send(Message::Text(msg.into())).await.is_err() {
+                            tracing::warn!("WS send error — send_task exiting");
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Some(err_msg) = err_rx.recv() => {
+                    if sender.send(Message::Text(err_msg.into())).await.is_err() {
+                        tracing::warn!("WS send error on error frame — send_task exiting");
+                        break;
+                    }
+                }
             }
         }
     });
@@ -92,7 +109,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    handle_stanza(&text, &agent_name, &agent_project, &broker, &delivery).await;
+                    handle_stanza(&text, &agent_name, &agent_project, &broker, &delivery, &err_tx).await;
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -133,31 +150,40 @@ async fn wait_for_connect(
 }
 
 /// Handle an incoming stanza from an authenticated WebSocket client.
+/// Sends WsEnvelope::Error frames back via err_tx on parse failure or identity mismatch.
 async fn handle_stanza(
     text: &str,
     agent_name: &str,
     agent_project: &str,
     broker: &Arc<BrokerState>,
     delivery: &Arc<DeliveryEngine>,
+    err_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
     let parsed = match stanza::parse(text) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("Invalid stanza from {}.{}: {}", agent_name, agent_project, e);
+            let msg = WsEnvelope::Error { message: format!("Invalid stanza: {e}") };
+            let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
             return;
         }
     };
 
-    // Validate from field matches authenticated identity
+    // Accept both 'Name' and 'Name.Project' — reject only true spoofing
     let stanza_from = match &parsed {
-        stanza::Stanza::Message(msg) => &msg.from,
-        stanza::Stanza::Presence(p) => &p.from,
+        stanza::Stanza::Message(msg) => msg.from.as_str(),
+        stanza::Stanza::Presence(p) => p.from.as_str(),
     };
-    if stanza_from != agent_name {
+    let (stanza_name, _) = stanza::resolve_agent_name(stanza_from, agent_project);
+    if stanza_name != agent_name {
         tracing::warn!(
             "Stanza 'from' mismatch: stanza says '{}', authenticated as '{}'",
             stanza_from, agent_name
         );
+        let msg = WsEnvelope::Error {
+            message: "Stanza 'from' does not match authenticated identity".to_string(),
+        };
+        let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
         return;
     }
 

@@ -66,3 +66,9 @@ rules:
     from: stanza
     to: [api, broker, db, identity]
     reason: "Stanza parser is a leaf module — pure parsing, no dependencies on other layers"
+
+  - id: session-independence
+    type: no_dependency
+    from: mcp/session
+    to: [api, broker, db, stanza, identity]
+    reason: "SessionManager is a leaf — pure FS + in-memory state, no broker dependencies"

@@ -1,5 +1,6 @@
 pub mod routes;
 pub mod ws;
+pub mod auth;
 
 pub use routes::router as http_router;
 pub use routes::AppState;

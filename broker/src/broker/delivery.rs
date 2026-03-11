@@ -39,8 +39,15 @@ impl DeliveryEngine {
         }
 
         if let Some(channel) = to_channel {
-            // Fan out to channel subscribers within the sender's project
-            self.state.send_to_channel(channel, from_project, body, Some(from_agent)).await;
+            // Fan out to channel subscribers within the sender's project, recording delivery status
+            let results = self.state.send_to_channel(channel, from_project, body, Some(from_agent)).await;
+            for (sub_name, sub_project, delivered) in results {
+                if delivered {
+                    self.state.repo.record_delivered(id, &sub_name, &sub_project)?;
+                } else {
+                    self.state.repo.record_pending(id, &sub_name, &sub_project)?;
+                }
+            }
 
             // Deliver to mentioned agents not subscribed to this channel
             if !mentions.is_empty() {
@@ -94,5 +101,64 @@ impl DeliveryEngine {
     /// Run TTL cleanup. Called periodically.
     pub fn cleanup(&self, delivered_hours: u64, pending_hours: u64) -> (usize, usize) {
         self.state.repo.cleanup(delivered_hours, pending_hours)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::state::BrokerState;
+    use crate::db;
+
+    fn setup() -> (Arc<BrokerState>, DeliveryEngine) {
+        let repo = Arc::new(db::open_memory().unwrap());
+        let state = Arc::new(BrokerState::new(repo));
+        let delivery = DeliveryEngine::new(state.clone());
+        (state, delivery)
+    }
+
+    #[tokio::test]
+    async fn channel_message_stored_as_pending_for_offline_subscriber() {
+        let (state, delivery) = setup();
+
+        // Register project and agents
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Sender", "proj", "").unwrap();
+        state.repo.register_agent("Subscriber", "proj", "").unwrap();
+
+        // Subscribe Subscriber to the channel (Subscriber is offline — no WS session)
+        state.repo.ensure_channel("general", "proj");
+        state.repo.subscribe("Subscriber", "proj", "general");
+
+        // Sender sends a channel message
+        let body = r##"<message type="post" from="Sender" to="#general"><body>Hello</body></message>"##;
+        delivery.deliver("msg-1", "Sender", "proj", None, Some("general"), body, None, &[]).await.unwrap();
+
+        // Subscriber was offline — message must be stored as pending
+        let pending = state.repo.drain_pending("Subscriber", "proj");
+        assert_eq!(pending.len(), 1, "offline subscriber should have 1 pending message");
+        assert_eq!(pending[0].id, "msg-1");
+    }
+
+    #[tokio::test]
+    async fn channel_message_recorded_delivered_for_live_subscriber() {
+        let (state, delivery) = setup();
+
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Sender", "proj", "").unwrap();
+        state.repo.register_agent("Receiver", "proj", "").unwrap();
+
+        state.repo.ensure_channel("general", "proj");
+        state.repo.subscribe("Receiver", "proj", "general");
+
+        // Connect Receiver so it has a live session (broadcast channel)
+        let _rx = state.connect("Receiver", "proj").await;
+
+        let body = r##"<message type="post" from="Sender" to="#general"><body>Hi</body></message>"##;
+        delivery.deliver("msg-2", "Sender", "proj", None, Some("general"), body, None, &[]).await.unwrap();
+
+        // Receiver was live — no pending messages should remain
+        let pending = state.repo.drain_pending("Receiver", "proj");
+        assert_eq!(pending.len(), 0, "live subscriber should have 0 pending messages");
     }
 }

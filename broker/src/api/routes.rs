@@ -1,9 +1,10 @@
+use crate::api::auth::ProjectAuth;
 use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
 use crate::db::repository::PendingMessage;
 use crate::stanza;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::routing::{get, post, put, delete};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -55,13 +56,18 @@ pub struct RegisterAgentResponse {
     pub session_id: String,
 }
 
+/// Presence update payload -- credentials carried by ProjectAuth extractor.
 #[derive(Deserialize)]
-pub struct AuthenticatedRequest {
+pub struct PresenceRequest {
     pub name: String,
-    pub project: String,
-    pub project_key: String,
     #[serde(default)]
     pub state: AgentState,
+}
+
+/// Channel subscribe/unsubscribe payload -- credentials carried by ProjectAuth extractor.
+#[derive(Deserialize)]
+pub struct ChannelRequest {
+    pub name: String,
 }
 
 #[derive(Serialize)]
@@ -74,10 +80,10 @@ pub struct AgentQuery {
     pub project: Option<String>,
 }
 
+/// Message retrieval query -- project is supplied via X-Project header (ProjectAuth extractor).
 #[derive(Deserialize)]
 pub struct MessageQuery {
     pub name: String,
-    pub project: String,
 }
 
 #[derive(Serialize)]
@@ -90,27 +96,6 @@ pub struct PeekSender {
 pub struct PeekResponse {
     pub count: usize,
     pub senders: Vec<PeekSender>,
-}
-
-// --- Helpers ---
-
-fn verify_key(state: &AppState, project: &str, key: &str) -> Result<(), (StatusCode, String)> {
-    if !state.broker.verify_project_key(project, key) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
-    }
-    Ok(())
-}
-
-fn extract_auth(headers: &HeaderMap) -> Result<(&str, &str), (StatusCode, String)> {
-    let project = headers
-        .get("x-project")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project header".to_string()))?;
-    let key = headers
-        .get("x-project-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project-Key header".to_string()))?;
-    Ok((project, key))
 }
 
 // --- Handlers ---
@@ -131,11 +116,14 @@ async fn register_project(
     Ok(Json(RegisterProjectResponse { project_key }))
 }
 
+/// POST /agents/register -- body auth (first-contact route; caller has no session context yet).
 async fn register_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterAgentRequest>,
 ) -> Result<Json<RegisterAgentResponse>, (StatusCode, String)> {
-    verify_key(&state, &req.project, &req.project_key)?;
+    if !state.broker.verify_project_key(&req.project, &req.project_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
+    }
 
     if !state.broker.project_exists(&req.project) {
         return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
@@ -144,20 +132,11 @@ async fn register_agent(
     state.broker.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // NOTE: this is a correlation ID only — live sessions are created exclusively on WS handshake.
+    // NOTE: this is a correlation ID only -- live sessions are created exclusively on WS handshake.
     let session_id = uuid::Uuid::new_v4().to_string();
 
     tracing::info!("Agent registered: {}.{}", req.name, req.project);
     Ok(Json(RegisterAgentResponse { session_id }))
-}
-
-async fn update_presence(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AuthenticatedRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    verify_key(&state, &req.project, &req.project_key)?;
-    state.broker.set_state(&req.name, &req.project, req.state).await;
-    Ok(StatusCode::OK)
 }
 
 async fn list_agents(
@@ -168,21 +147,18 @@ async fn list_agents(
     Json(agents)
 }
 
-/// Accept raw stanza XML. Auth via X-Project / X-Project-Key headers.
+/// Accept raw stanza XML. Auth via ProjectAuth extractor (X-Project + X-Project-Key headers).
 async fn send_message(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    ProjectAuth { project }: ProjectAuth,
     body: String,
 ) -> Result<Json<SendResponse>, (StatusCode, String)> {
-    let (project, key) = extract_auth(&headers)?;
-    verify_key(&state, project, key)?;
-
     let parsed = stanza::parse(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
 
     // Validate sender exists before dispatch
     if let stanza::Stanza::Message(ref msg) = parsed {
-        if !state.broker.agent_exists(&msg.from, project) {
+        if !state.broker.agent_exists(&msg.from, &project) {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!("Agent '{}' not registered in project '{}'", msg.from, project),
@@ -190,7 +166,7 @@ async fn send_message(
         }
     }
 
-    match dispatch_stanza(parsed, project, &state.broker, &state.delivery, true).await {
+    match dispatch_stanza(parsed, &project, &state.broker, &state.delivery, true).await {
         Ok(DispatchResult::MessageSent(id)) => Ok(Json(SendResponse { message_id: id })),
         Ok(DispatchResult::PresenceUpdated) => Ok(Json(SendResponse { message_id: String::new() })),
         Err(DispatchError::TargetNotFound { agent, project }) => Err((
@@ -201,35 +177,34 @@ async fn send_message(
     }
 }
 
+async fn update_presence(
+    State(state): State<Arc<AppState>>,
+    ProjectAuth { project }: ProjectAuth,
+    Json(req): Json<PresenceRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.broker.set_state(&req.name, &project, req.state).await;
+    Ok(StatusCode::OK)
+}
+
 async fn get_messages(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    ProjectAuth { project }: ProjectAuth,
     Query(query): Query<MessageQuery>,
 ) -> Result<Json<Vec<PendingMessage>>, (StatusCode, String)> {
-    let key = headers
-        .get("x-project-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project-Key header".to_string()))?;
-    verify_key(&state, &query.project, key)?;
-    let messages = state.delivery.drain_pending(&query.name, &query.project);
+    let messages = state.delivery.drain_pending(&query.name, &project);
     Ok(Json(messages))
 }
 
 async fn peek_messages(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    ProjectAuth { project }: ProjectAuth,
     Query(query): Query<MessageQuery>,
 ) -> Result<Json<PeekResponse>, (StatusCode, String)> {
-    let key = headers
-        .get("x-project-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project-Key header".to_string()))?;
-    verify_key(&state, &query.project, key)?;
-    let pending = state.broker.peek_pending(&query.name, &query.project);
+    let pending = state.broker.peek_pending(&query.name, &project);
     let senders: Vec<PeekSender> = pending
         .iter()
-        .map(|(agent, project, at)| PeekSender {
-            from: format!("{}.{}", agent, project),
+        .map(|(agent, proj, at)| PeekSender {
+            from: format!("{}.{}", agent, proj),
             at: at.clone(),
         })
         .collect();
@@ -242,20 +217,20 @@ async fn peek_messages(
 async fn subscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
-    Json(req): Json<AuthenticatedRequest>,
+    ProjectAuth { project }: ProjectAuth,
+    Json(req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    verify_key(&state, &req.project, &req.project_key)?;
-    state.broker.ensure_channel(&channel_id, &req.project);
-    state.broker.subscribe(&req.name, &req.project, &channel_id);
+    state.broker.ensure_channel(&channel_id, &project);
+    state.broker.subscribe(&req.name, &project, &channel_id);
     Ok(StatusCode::OK)
 }
 
 async fn unsubscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
-    Json(req): Json<AuthenticatedRequest>,
+    ProjectAuth { project }: ProjectAuth,
+    Json(req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    verify_key(&state, &req.project, &req.project_key)?;
-    state.broker.unsubscribe(&req.name, &req.project, &channel_id);
+    state.broker.unsubscribe(&req.name, &project, &channel_id);
     Ok(StatusCode::OK)
 }

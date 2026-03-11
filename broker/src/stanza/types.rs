@@ -147,6 +147,30 @@ mod tests {
             "Body text with from=\"Maya\" must not be rewritten; got: {enriched}"
         );
     }
+
+    // --- T2: from= normalisation via resolve_agent_name ---
+
+    #[test]
+    fn resolve_agent_name_bare_name_passes() {
+        // "Victoria" authenticated as "Victoria" in "my-project" — bare name accepted
+        let (name, _) = resolve_agent_name("Victoria", "my-project");
+        assert_eq!(name, "Victoria");
+    }
+
+    #[test]
+    fn resolve_agent_name_qualified_same_project_passes() {
+        // "Victoria.my-project" — qualified form, same project → name extracted correctly
+        let (name, project) = resolve_agent_name("Victoria.my-project", "my-project");
+        assert_eq!(name, "Victoria");
+        assert_eq!(project, "my-project");
+    }
+
+    #[test]
+    fn resolve_agent_name_different_agent_detected() {
+        // "OtherAgent" authenticated as "Victoria" — name mismatch detectable
+        let (name, _) = resolve_agent_name("OtherAgent", "my-project");
+        assert_ne!(name, "Victoria");
+    }
 }
 
 /// Error returned when a stanza cannot be parsed.

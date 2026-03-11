@@ -1,3 +1,4 @@
+use crate::session::{SessionManager, load_key, lookup_identity};
 use rmcp::{
     ServerHandler,
     handler::server::{
@@ -9,22 +10,14 @@ use rmcp::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use std::sync::Mutex;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:4200";
-
-struct Session {
-    project: String,
-    project_key: String,
-    agent_name: String,
-    broker_url: String,
-}
 
 #[derive(Clone)]
 pub struct BrokerTools {
     client: Client,
-    session: std::sync::Arc<Mutex<Option<Session>>>,
+    session: Arc<SessionManager>,
     tool_router: ToolRouter<BrokerTools>,
 }
 
@@ -42,7 +35,7 @@ pub struct RegisterArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendArgs {
-    /// Target agent — fully qualified for cross-project: "Name.Project"
+    /// Target agent -- fully qualified for cross-project: "Name.Project"
     pub to: String,
     /// Message body text
     pub message: String,
@@ -53,6 +46,12 @@ pub struct PresenceArgs {
     /// Optional project name to filter by
     #[serde(default)]
     pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StanzaArgs {
+    /// Raw stanza XML to send
+    pub stanza: String,
 }
 
 #[derive(Deserialize)]
@@ -68,60 +67,8 @@ struct PeekSender { from: String, at: String }
 #[derive(Deserialize)]
 struct PeekResp { count: usize, senders: Vec<PeekSender> }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StanzaArgs {
-    /// Raw stanza XML to send
-    pub stanza: String,
-}
-
 fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
-}
-
-/// Key file path: ~/.agent-broker/keys/<project>.key
-fn key_file_path(project: &str) -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join(".agent-broker").join("keys").join(format!("{project}.key"))
-}
-
-fn load_key(project: &str) -> Option<String> {
-    std::fs::read_to_string(key_file_path(project)).ok().map(|s| s.trim().to_string())
-}
-
-fn save_key(project: &str, key: &str) {
-    let path = key_file_path(project);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, key);
-}
-
-/// Identity file: ~/.agent-broker/identities.json — maps CWD → agent name
-fn identities_path() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join(".agent-broker").join("identities.json")
-}
-
-fn load_identities() -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string(identities_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_identity(cwd: &str, name: &str) {
-    let mut map = load_identities();
-    map.insert(cwd.to_string(), name.to_string());
-    let path = identities_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, serde_json::to_string_pretty(&map).unwrap_or_default());
-}
-
-fn lookup_identity() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?.to_string_lossy().to_string();
-    load_identities().get(&cwd).cloned()
 }
 
 #[tool_router]
@@ -129,16 +76,8 @@ impl BrokerTools {
     pub fn new() -> Self {
         Self {
             client: Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap(),
-            session: std::sync::Arc::new(Mutex::new(None)),
+            session: Arc::new(SessionManager::new()),
             tool_router: Self::tool_router(),
-        }
-    }
-
-    fn sess(&self) -> Result<(String, String, String, String), rmcp::ErrorData> {
-        let g = self.session.lock().unwrap();
-        match g.as_ref() {
-            Some(s) => Ok((s.agent_name.clone(), s.project.clone(), s.project_key.clone(), s.broker_url.clone())),
-            None => Err(rmcp::ErrorData::invalid_params("Not registered. Call broker_register first.", None)),
         }
     }
 
@@ -158,15 +97,12 @@ impl BrokerTools {
             .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?;
 
         let project_key = if proj_resp.status().is_success() {
-            let key = proj_resp.json::<RegProjResp>().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?.project_key;
-            save_key(&args.project, &key);
-            key
+            proj_resp.json::<RegProjResp>().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?.project_key
         } else if proj_resp.status().as_u16() == 409 {
-            // Project exists — load key from file
+            // Project exists -- load key from file
             load_key(&args.project).ok_or_else(|| rmcp::ErrorData::invalid_params(
-                format!("Project '{}' exists but no saved key found at {}. \
-                         If you own this project, place the key in that file.",
-                         args.project, key_file_path(&args.project).display()), None))?
+                format!("Project '{}' exists but no saved key found. If you own this project, place the key in ~/.agent-broker/keys/{}.key",
+                         args.project, args.project), None))?
         } else {
             let body = proj_resp.text().await.unwrap_or_default();
             return Err(mcp_err(format!("Project registration failed: {body}")));
@@ -184,14 +120,8 @@ impl BrokerTools {
             return Err(mcp_err(format!("Agent registration failed: {body}")));
         }
 
-        // Save CWD → name mapping for future sessions
-        if let Ok(cwd) = std::env::current_dir() {
-            save_identity(&cwd.to_string_lossy(), &agent_name);
-        }
-
-        *self.session.lock().unwrap() = Some(Session {
-            project: args.project.clone(), project_key, agent_name: agent_name.clone(), broker_url: broker_url.clone(),
-        });
+        // Delegate key persistence, identity persistence, and session mutation to SessionManager
+        self.session.register(agent_name.clone(), args.project.clone(), project_key, broker_url.clone());
 
         Ok(CallToolResult::success(vec![Content::text(
             format!("Registered as {}.{} on {}", agent_name, args.project, broker_url))]))
@@ -199,7 +129,7 @@ impl BrokerTools {
 
     #[tool(description = "List online agents. Optionally filter by project.")]
     async fn broker_presence(&self, Parameters(args): Parameters<PresenceArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (_, _, _, url) = self.sess()?;
+        let (_, _, _, url) = self.session.get()?;
         let mut ep = format!("{}/agents", url);
         if let Some(ref p) = args.project { ep = format!("{}?project={}", ep, p); }
 
@@ -208,19 +138,19 @@ impl BrokerTools {
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
         if agents.is_empty() { return Ok(CallToolResult::success(vec![Content::text("No agents online.")])); }
-        let lines: Vec<String> = agents.iter().map(|a| format!("{}.{} — {}", a.name, a.project, a.state)).collect();
+        let lines: Vec<String> = agents.iter().map(|a| format!("{}.{} -- {}", a.name, a.project, a.state)).collect();
         Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
     }
 
     #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project. For channels/threads/reactions use broker_send_stanza.")]
     async fn broker_send(&self, Parameters(args): Parameters<SendArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (name, ..) = self.sess()?;
+        let (name, ..) = self.session.get()?;
         let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\">{}</message>", name, args.to, args.message);
         self.send_raw(stanza).await
     }
 
     async fn send_raw(&self, stanza: String) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (_, project, key, url) = self.sess()?;
+        let (_, project, key, url) = self.session.get()?;
         let resp = self.client.post(format!("{}/send", url))
             .header("X-Project", &project)
             .header("X-Project-Key", &key)
@@ -243,9 +173,10 @@ impl BrokerTools {
 
     #[tool(description = "Peek at pending messages: count and senders, without consuming.")]
     async fn broker_peek(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (name, project, key, url) = self.sess()?;
+        let (name, project, key, url) = self.session.get()?;
         let peek: PeekResp = self.client
-            .get(format!("{}/messages/peek?name={}&project={}", url, name, project))
+            .get(format!("{}/messages/peek?name={}", url, name))
+            .header("X-Project", &project)
             .header("X-Project-Key", &key)
             .send().await.map_err(|e| mcp_err(format!("Peek failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
@@ -257,9 +188,10 @@ impl BrokerTools {
 
     #[tool(description = "Retrieve and consume all pending messages.")]
     async fn broker_messages(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (name, project, key, url) = self.sess()?;
+        let (name, project, key, url) = self.session.get()?;
         let messages: Vec<PendingMsg> = self.client
-            .get(format!("{}/messages?name={}&project={}", url, name, project))
+            .get(format!("{}/messages?name={}", url, name))
+            .header("X-Project", &project)
             .header("X-Project-Key", &key)
             .send().await.map_err(|e| mcp_err(format!("Fetch failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;

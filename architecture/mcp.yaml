@@ -7,4 +7,9 @@ modules:
     files:
       - tools.rs
     owns: [mcp-server, broker-register, broker-presence, broker-send, broker-peek, broker-messages]
+    depends_on: [mcp/session]
+
+  - id: session
+    file: session.rs
+    owns: [session-state, credential-persistence, identity-persistence]
     depends_on: []

@@ -194,19 +194,29 @@ impl BrokerState {
     }
 
     /// Broadcast a message to all agents on a channel within the given project.
-    pub async fn send_to_channel(&self, channel_id: &str, project: &str, message: &str, exclude: Option<&str>) {
+    /// Returns per-subscriber delivery results: (name, project, delivered).
+    pub async fn send_to_channel(
+        &self,
+        channel_id: &str,
+        project: &str,
+        message: &str,
+        exclude: Option<&str>,
+    ) -> Vec<(String, String, bool)> {
         let subscribers = self.repo.get_subscribers(channel_id, project);
-
         let sessions = self.sessions.read().await;
-        for (name, project) in subscribers {
+        let mut results = Vec::new();
+        for (name, proj) in subscribers {
             if exclude.is_some_and(|e| e == name) {
                 continue;
             }
-            let key = AgentKey::new(&name, &project);
-            if let Some(session) = sessions.get(&key) {
-                let _ = session.tx.send(message.to_string());
-            }
+            let key = AgentKey::new(&name, &proj);
+            let delivered = match sessions.get(&key) {
+                Some(session) => session.tx.send(message.to_string()).is_ok(),
+                None => false,
+            };
+            results.push((name, proj, delivered));
         }
+        results
     }
 }
 
