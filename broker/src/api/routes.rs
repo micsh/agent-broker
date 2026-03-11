@@ -78,7 +78,6 @@ pub struct AgentQuery {
 pub struct MessageQuery {
     pub name: String,
     pub project: String,
-    pub project_key: String,
 }
 
 #[derive(Serialize)]
@@ -138,11 +137,15 @@ async fn register_agent(
 ) -> Result<Json<RegisterAgentResponse>, (StatusCode, String)> {
     verify_key(&state, &req.project, &req.project_key)?;
 
+    if !state.broker.project_exists(&req.project) {
+        return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
+    }
+
     state.broker.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // NOTE: this is a correlation ID only — live sessions are created exclusively on WS handshake.
     let session_id = uuid::Uuid::new_v4().to_string();
-    let _rx = state.broker.connect(&req.name, &req.project, &session_id).await;
 
     tracing::info!("Agent registered: {}.{}", req.name, req.project);
     Ok(Json(RegisterAgentResponse { session_id }))
@@ -200,18 +203,28 @@ async fn send_message(
 
 async fn get_messages(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<MessageQuery>,
 ) -> Result<Json<Vec<PendingMessage>>, (StatusCode, String)> {
-    verify_key(&state, &query.project, &query.project_key)?;
+    let key = headers
+        .get("x-project-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project-Key header".to_string()))?;
+    verify_key(&state, &query.project, key)?;
     let messages = state.delivery.drain_pending(&query.name, &query.project);
     Ok(Json(messages))
 }
 
 async fn peek_messages(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<MessageQuery>,
 ) -> Result<Json<PeekResponse>, (StatusCode, String)> {
-    verify_key(&state, &query.project, &query.project_key)?;
+    let key = headers
+        .get("x-project-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project-Key header".to_string()))?;
+    verify_key(&state, &query.project, key)?;
     let pending = state.broker.peek_pending(&query.name, &query.project);
     let senders: Vec<PeekSender> = pending
         .iter()

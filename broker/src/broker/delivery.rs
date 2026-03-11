@@ -39,15 +39,15 @@ impl DeliveryEngine {
         }
 
         if let Some(channel) = to_channel {
-            // Fan out to channel subscribers
-            self.state.send_to_channel(channel, body, Some(from_agent)).await;
+            // Fan out to channel subscribers within the sender's project
+            self.state.send_to_channel(channel, from_project, body, Some(from_agent)).await;
 
             // Deliver to mentioned agents not subscribed to this channel
             if !mentions.is_empty() {
                 let subscribers: std::collections::HashSet<String> = self
                     .state
                     .repo
-                    .get_subscribers(channel)
+                    .get_subscribers(channel, from_project)
                     .into_iter()
                     .map(|(name, _)| name)
                     .collect();

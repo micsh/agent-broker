@@ -68,6 +68,12 @@ struct PeekSender { from: String, at: String }
 #[derive(Deserialize)]
 struct PeekResp { count: usize, senders: Vec<PeekSender> }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StanzaArgs {
+    /// Raw stanza XML to send
+    pub stanza: String,
+}
+
 fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
 }
@@ -206,30 +212,41 @@ impl BrokerTools {
         Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
     }
 
-    #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project.")]
+    #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project. For channels/threads/reactions use broker_send_stanza.")]
     async fn broker_send(&self, Parameters(args): Parameters<SendArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (name, project, key, url) = self.sess()?;
+        let (name, ..) = self.sess()?;
         let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\">{}</message>", name, args.to, args.message);
+        self.send_raw(stanza).await
+    }
 
+    async fn send_raw(&self, stanza: String) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_, project, key, url) = self.sess()?;
         let resp = self.client.post(format!("{}/send", url))
-            .header("X-Project", &project).header("X-Project-Key", &key)
-            .header("Content-Type", "application/xml").body(stanza)
+            .header("X-Project", &project)
+            .header("X-Project-Key", &key)
+            .header("Content-Type", "application/xml")
+            .body(stanza)
             .send().await.map_err(|e| mcp_err(format!("Send failed: {e}")))?;
-
         if resp.status().is_success() {
             let r: SendResp = resp.json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
-            Ok(CallToolResult::success(vec![Content::text(format!("Sent to {} (id: {})", args.to, r.message_id))]))
+            Ok(CallToolResult::success(vec![Content::text(format!("Sent (id: {})", r.message_id))]))
         } else {
             let body = resp.text().await.unwrap_or_default();
             Err(mcp_err(format!("Send failed: {body}")))
         }
     }
 
+    #[tool(description = "Send a raw stanza XML frame. Use for channel posts, replies, reactions, and presence updates.")]
+    async fn broker_send_stanza(&self, Parameters(args): Parameters<StanzaArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.send_raw(args.stanza).await
+    }
+
     #[tool(description = "Peek at pending messages: count and senders, without consuming.")]
     async fn broker_peek(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let (name, project, key, url) = self.sess()?;
         let peek: PeekResp = self.client
-            .get(format!("{}/messages/peek?name={}&project={}&project_key={}", url, name, project, key))
+            .get(format!("{}/messages/peek?name={}&project={}", url, name, project))
+            .header("X-Project-Key", &key)
             .send().await.map_err(|e| mcp_err(format!("Peek failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
@@ -242,7 +259,8 @@ impl BrokerTools {
     async fn broker_messages(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let (name, project, key, url) = self.sess()?;
         let messages: Vec<PendingMsg> = self.client
-            .get(format!("{}/messages?name={}&project={}&project_key={}", url, name, project, key))
+            .get(format!("{}/messages?name={}&project={}", url, name, project))
+            .header("X-Project-Key", &key)
             .send().await.map_err(|e| mcp_err(format!("Fetch failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
@@ -261,6 +279,6 @@ impl ServerHandler for BrokerTools {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send, broker_peek, broker_messages.".to_string())
+        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send, broker_send_stanza, broker_peek, broker_messages.".to_string())
     }
 }

@@ -2,6 +2,25 @@
 
 A lightweight message broker for AI agent communication — identity, presence, and message routing across projects.
 
+## Install
+
+Quick install (recommended):
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/micsh/agent-broker/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/micsh/agent-broker/main/install.ps1 | iex
+```
+
+Both binaries (`agent-broker` and `broker-mcp`) are installed to `~/.agent-broker/bin` by default. Pass an argument to choose a different directory:
+
+```bash
+./install.sh /usr/local/bin          # Linux/macOS
+.\install.ps1 -InstallDir C:\tools   # Windows
+```
+
 ## What it does
 
 The agent-broker is a standalone daemon that enables AI agents to communicate across process boundaries. Agents register with a project, connect via WebSocket for real-time delivery, and exchange XML stanzas with fully qualified identities (`Agent.Project`).
@@ -50,15 +69,25 @@ BROKER_PORT=5000 BROKER_DATA=/path/to/data ./target/release/agent-broker
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/projects/register` | Register a project, receive auth key |
-| POST | `/agents/register` | Register an agent under a project |
-| GET | `/agents` | List agents (optional `?project=` filter) |
+| POST | `/agents/register` | Register an agent under a project. Returns a `session_id` correlation ID. Live sessions are created on WebSocket connect only. Returns 404 if project not found. |
+| GET | `/agents` | List connected agents (optional `?project=` filter) |
 | PUT | `/presence` | Update agent presence state |
 | POST | `/send` | Send a stanza (raw XML body, `X-Project`/`X-Project-Key` headers) |
-| GET | `/messages` | Retrieve and consume pending messages |
-| GET | `/messages/peek` | Peek at pending messages (non-consuming) |
+| GET | `/messages` | Retrieve and consume pending messages (`X-Project-Key` header required) |
+| GET | `/messages/peek` | Peek at pending messages without consuming (`X-Project-Key` header required) |
 | POST | `/channels/{id}/subscribe` | Subscribe agent to a channel |
 | DELETE | `/channels/{id}/unsubscribe` | Unsubscribe from a channel |
 | GET | `/health` | Health check |
+
+### Authentication
+
+Most endpoints authenticate via JSON body fields (`name`, `project`, `project_key`). The exceptions are:
+
+| Endpoint | Auth method |
+|----------|-------------|
+| `POST /send` | `X-Project` and `X-Project-Key` headers |
+| `GET /messages` | `name` and `project` query params + `X-Project-Key` header |
+| `GET /messages/peek` | `name` and `project` query params + `X-Project-Key` header |
 
 ## Stanza format
 
@@ -86,8 +115,9 @@ The MCP server exposes broker tools via stdio transport for AI assistants:
 |------|-------------|
 | `broker_register` | Register project + agent identity (call first). Name is remembered per working directory — omit on subsequent sessions. |
 | `broker_presence` | List online agents |
-| `broker_send` | Send a DM to an agent |
-| `broker_peek` | Check pending messages (non-consuming) |
+| `broker_send` | Send a DM to an agent. Use `Name.Project` for cross-project. |
+| `broker_send_stanza` | Send a raw stanza XML frame. Use for channel posts, replies, reactions, and presence updates. |
+| `broker_peek` | Check pending messages without consuming |
 | `broker_messages` | Retrieve and consume pending messages |
 
 The MCP server persists identity per working directory (`~/.agent-broker/identities.json`), so after the first `broker_register` with a name, future sessions from the same directory auto-resolve the agent name.

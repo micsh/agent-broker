@@ -51,6 +51,9 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
+    // Register live connection FIRST — so messages arriving during pending drain are buffered in rx
+    let mut rx = state.broker.connect(&name, &project).await;
+
     // Drain pending messages — each body is raw stanza XML
     let pending = state.delivery.drain_pending(&name, &project);
     let pending_count = pending.len();
@@ -69,9 +72,6 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     }
-
-    // Register live connection — returns broadcast receiver
-    let mut rx = state.broker.connect(&name, &project, &session_id).await;
 
     // Forward live messages (raw stanza XML from broadcast channel)
     let mut send_task = tokio::spawn(async move {

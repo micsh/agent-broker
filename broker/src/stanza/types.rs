@@ -100,16 +100,52 @@ pub fn resolve_agent_name<'a>(target: &'a str, default_project: &'a str) -> (&'a
 
 /// Qualify the `from` attribute in raw stanza XML to be fully qualified (name.project).
 /// If already qualified, returns the body unchanged.
+/// Replacement is scoped to the opening tag only — body content is never rewritten.
 pub fn enrich_from(body: &str, from_agent: &str, from_project: &str) -> String {
     let expected_suffix = format!(".{}", from_project);
     if from_agent.ends_with(&expected_suffix) {
-        body.to_string()
-    } else {
-        let qualified = format!("{}.{}", from_agent, from_project);
-        body.replace(
-            &format!("from=\"{}\"", from_agent),
-            &format!("from=\"{}\"", qualified),
-        )
+        return body.to_string();
+    }
+    let qualified = format!("{}.{}", from_agent, from_project);
+    let tag_end = body.find('>').unwrap_or(body.len());
+    let (opening, rest) = body.split_at(tag_end);
+    let fixed = opening.replace(
+        &format!("from=\"{}\"", from_agent),
+        &format!("from=\"{}\"", qualified),
+    );
+    format!("{}{}", fixed, rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrich_from_qualifies_unqualified_agent() {
+        let xml = r##"<message type="post" from="Zoe" to="#impl"><body>Done.</body></message>"##;
+        let result = enrich_from(xml, "Zoe", "myproject");
+        assert!(result.contains(r#"from="Zoe.myproject""#));
+    }
+
+    #[test]
+    fn enrich_from_already_qualified_returns_unchanged() {
+        let xml = r##"<message type="post" from="Maya.proj" to="#analysis"><body>Hello</body></message>"##;
+        let result = enrich_from(xml, "Maya.proj", "proj");
+        assert_eq!(result, xml);
+    }
+
+    #[test]
+    fn enrich_from_does_not_rewrite_body_content() {
+        // The body text contains from="Maya" — only the opening tag attribute must be updated.
+        let xml = r##"<message type="post" from="Maya" to="#analysis"><body>Sent from="Maya" directly.</body></message>"##;
+        let enriched = enrich_from(xml, "Maya", "proj");
+        // Opening tag should have the qualified name
+        assert!(enriched.starts_with(r#"<message type="post" from="Maya.proj""#));
+        // Body content must be preserved verbatim
+        assert!(
+            enriched.contains(r#"from="Maya""#),
+            "Body text with from=\"Maya\" must not be rewritten; got: {enriched}"
+        );
     }
 }
 

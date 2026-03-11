@@ -109,15 +109,15 @@ impl Repository {
         );
     }
 
-    pub fn get_subscribers(&self, channel_id: &str) -> Vec<(String, String)> {
+    pub fn get_subscribers(&self, channel_id: &str, project: &str) -> Vec<(String, String)> {
         let conn = self.conn();
         let mut stmt = match conn.prepare(
-            "SELECT agent_name, project FROM subscriptions WHERE channel_id = ?1",
+            "SELECT agent_name, project FROM subscriptions WHERE channel_id = ?1 AND project = ?2",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = match stmt.query_map(params![channel_id], |row| {
+        let rows = match stmt.query_map(params![channel_id, project], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
             Ok(r) => r,
@@ -227,36 +227,79 @@ impl Repository {
     pub fn cleanup(&self, delivered_hours: u64, pending_hours: u64) -> (usize, usize) {
         let conn = self.conn();
 
-        let delivered_deleted = conn.execute(
-            "DELETE FROM messages WHERE id IN (
-                SELECT m.id FROM messages m
-                JOIN delivery_log dl ON dl.message_id = m.id
-                WHERE dl.status = 'delivered'
-                AND dl.delivered_utc < datetime('now', ?1)
-            )",
-            params![format!("-{delivered_hours} hours")],
-        ).unwrap_or(0);
+        // Delete delivery_log entries BEFORE messages — foreign_keys=ON means deleting
+        // a message while delivery_log still references it will fail with a constraint
+        // error. Remove the referencing rows first, then the messages become deletable.
 
+        // Step 1: Drop old delivered delivery_log entries.
         let _ = conn.execute(
-            "DELETE FROM delivery_log WHERE message_id NOT IN (SELECT id FROM messages)",
-            [],
+            "DELETE FROM delivery_log
+             WHERE status = 'delivered'
+             AND delivered_utc < datetime('now', ?1)",
+            params![format!("-{delivered_hours} hours")],
         );
 
+        // Step 2: Delete messages that are no longer referenced by any delivery_log entry.
+        // These are messages whose every delivery was completed and aged out in step 1.
+        let delivered_deleted = conn.execute(
+            "DELETE FROM messages
+             WHERE id NOT IN (SELECT message_id FROM delivery_log)",
+            [],
+        ).unwrap_or(0);
+
+        // Step 3: Drop expired pending delivery_log entries.
+        let _ = conn.execute(
+            "DELETE FROM delivery_log
+             WHERE status = 'pending'
+             AND message_id IN (
+                 SELECT id FROM messages
+                 WHERE created_utc < datetime('now', ?1)
+             )",
+            params![format!("-{pending_hours} hours")],
+        );
+
+        // Step 4: Delete messages that are now unreferenced and old enough.
         let pending_deleted = conn.execute(
-            "DELETE FROM messages WHERE id IN (
-                SELECT m.id FROM messages m
-                JOIN delivery_log dl ON dl.message_id = m.id
-                WHERE dl.status = 'pending'
-                AND m.created_utc < datetime('now', ?1)
-            )",
+            "DELETE FROM messages
+             WHERE id NOT IN (SELECT message_id FROM delivery_log)
+             AND created_utc < datetime('now', ?1)",
             params![format!("-{pending_hours} hours")],
         ).unwrap_or(0);
 
-        let _ = conn.execute(
-            "DELETE FROM delivery_log WHERE message_id NOT IN (SELECT id FROM messages)",
-            [],
-        );
-
         (delivered_deleted, pending_deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::ensure_schema;
+
+    #[test]
+    fn get_subscribers_isolated_by_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+
+        repo.register_project("alpha", "key1").unwrap();
+        repo.register_project("beta", "key2").unwrap();
+        repo.register_agent("AgentA", "alpha", "").unwrap();
+        repo.register_agent("AgentB", "beta", "").unwrap();
+
+        // Both projects use a channel with the same logical name.
+        // The first ensure_channel wins the channel row; the second is a no-op.
+        // Subscriptions are still per (agent, project, channel_id).
+        repo.ensure_channel("general", "alpha");
+        repo.ensure_channel("general", "beta");
+        repo.subscribe("AgentA", "alpha", "general");
+        repo.subscribe("AgentB", "beta", "general");
+
+        let alpha = repo.get_subscribers("general", "alpha");
+        assert_eq!(alpha.len(), 1, "alpha should have exactly one subscriber");
+        assert_eq!(alpha[0].0, "AgentA");
+
+        let beta = repo.get_subscribers("general", "beta");
+        assert_eq!(beta.len(), 1, "beta should have exactly one subscriber");
+        assert_eq!(beta[0].0, "AgentB");
     }
 }

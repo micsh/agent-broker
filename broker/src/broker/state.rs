@@ -9,7 +9,6 @@ use tokio::sync::{broadcast, RwLock};
 pub struct AgentSession {
     pub name: String,
     pub project: String,
-    pub session_id: String,
     pub state: AgentState,
     pub tx: broadcast::Sender<String>,
 }
@@ -58,11 +57,6 @@ impl AgentKey {
             project: project.to_string(),
         }
     }
-
-    /// Display as Name.Project.
-    pub fn display(&self) -> String {
-        format!("{}.{}", self.name, self.project)
-    }
 }
 
 /// Shared broker state — in-memory connected agents + repository for persistence.
@@ -95,6 +89,10 @@ impl BrokerState {
 
     pub fn agent_exists(&self, name: &str, project: &str) -> bool {
         self.repo.agent_exists(name, project)
+    }
+
+    pub fn project_exists(&self, name: &str) -> bool {
+        self.repo.project_exists(name)
     }
 
     /// Authenticate an agent: verify project key and check agent registration.
@@ -132,14 +130,12 @@ impl BrokerState {
         &self,
         name: &str,
         project: &str,
-        session_id: &str,
     ) -> broadcast::Receiver<String> {
         let (tx, rx) = broadcast::channel(64);
         let key = AgentKey::new(name, project);
         let session = AgentSession {
             name: name.to_string(),
             project: project.to_string(),
-            session_id: session_id.to_string(),
             state: AgentState::Available,
             tx,
         };
@@ -147,7 +143,7 @@ impl BrokerState {
         let mut sessions = self.sessions.write().await;
         sessions.insert(key, session);
 
-        tracing::info!("Agent connected: {}.{} (session: {})", name, project, session_id);
+        tracing::info!("Agent connected: {}.{}", name, project);
         rx
     }
 
@@ -197,9 +193,9 @@ impl BrokerState {
         }
     }
 
-    /// Broadcast a message to all agents on a channel.
-    pub async fn send_to_channel(&self, channel_id: &str, message: &str, exclude: Option<&str>) {
-        let subscribers = self.repo.get_subscribers(channel_id);
+    /// Broadcast a message to all agents on a channel within the given project.
+    pub async fn send_to_channel(&self, channel_id: &str, project: &str, message: &str, exclude: Option<&str>) {
+        let subscribers = self.repo.get_subscribers(channel_id, project);
 
         let sessions = self.sessions.read().await;
         for (name, project) in subscribers {
