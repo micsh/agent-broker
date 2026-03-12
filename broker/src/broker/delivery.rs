@@ -161,4 +161,170 @@ mod tests {
         let pending = state.repo.drain_pending("Receiver", "proj");
         assert_eq!(pending.len(), 0, "live subscriber should have 0 pending messages");
     }
+
+    // --- Body preservation: pending (store-and-forward) path ---
+
+    #[tokio::test]
+    async fn dm_plain_body_preserved_through_pending_drain() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body>hello world</body></message>"##;
+        delivery.deliver("m1", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        // Body content must be preserved verbatim (only from= is enriched)
+        assert!(pending[0].body.contains("<body>hello world</body>"),
+            "plain body not preserved; got: {}", pending[0].body);
+    }
+
+    #[tokio::test]
+    async fn dm_xml_entities_in_body_preserved_through_pending_drain() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // Body containing XML special characters — broker must not escape or transform them
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body>a &lt; b &gt; c &amp; d</body></message>"##;
+        delivery.deliver("m2", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains(r"a &lt; b &gt; c &amp; d"),
+            "XML entities in body not preserved; got: {}", pending[0].body);
+    }
+
+    #[tokio::test]
+    async fn dm_nested_xml_in_body_preserved_through_pending_drain() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // Body containing nested XML fragment — opaque to broker, must pass through unchanged
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body><thread id="t-123" /><inner>nested content</inner></body></message>"##;
+        delivery.deliver("m3", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains(r#"<thread id="t-123" /><inner>nested content</inner>"#),
+            "nested XML in body not preserved; got: {}", pending[0].body);
+    }
+
+    #[tokio::test]
+    async fn dm_empty_body_element_preserved_through_pending_drain() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // A stanza with an empty <body></body> — broker must accept and preserve as-is
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body></body></message>"##;
+        delivery.deliver("m4", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains("<body></body>"),
+            "empty body element not preserved; got: {}", pending[0].body);
+    }
+
+    #[tokio::test]
+    async fn dm_no_body_element_preserved_through_pending_drain() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // A stanza with no body element at all — broker must accept and deliver unchanged
+        let body = r##"<message type="dm" from="Alice" to="Bob"></message>"##;
+        delivery.deliver("m5", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains("</message>"),
+            "no-body stanza not preserved; got: {}", pending[0].body);
+        // Body content section must be empty (no body element injected)
+        assert!(!pending[0].body.contains("<body>"),
+            "broker must not inject a <body> element; got: {}", pending[0].body);
+    }
+
+    #[tokio::test]
+    async fn enrich_from_does_not_touch_body_content() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // Body text contains from="Alice" — must NOT be rewritten by enrich_from
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body>Sent from="Alice" directly.</body></message>"##;
+        delivery.deliver("m6", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj");
+        assert_eq!(pending.len(), 1);
+        // Opening tag: from= must be qualified
+        assert!(pending[0].body.starts_with(r#"<message type="dm" from="Alice.proj""#),
+            "opening tag from= not enriched; got: {}", pending[0].body);
+        // Body text with from="Alice" must NOT be rewritten
+        assert!(pending[0].body.contains(r#"from="Alice" directly"#),
+            "enrich_from rewrote body content (must not); got: {}", pending[0].body);
+    }
+
+    // --- Body preservation: live delivery (WS broadcast) path ---
+
+    #[tokio::test]
+    async fn dm_plain_body_preserved_via_live_delivery() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        // Bob connects live
+        let mut rx = state.connect("Bob", "proj").await;
+
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body>live hello</body></message>"##;
+        delivery.deliver("m7", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        // Bob receives message via broadcast channel (live WS path)
+        let received = rx.recv().await.expect("should receive live message");
+        assert!(received.contains("<body>live hello</body>"),
+            "plain body not preserved on live delivery; got: {received}");
+    }
+
+    #[tokio::test]
+    async fn dm_xml_entities_preserved_via_live_delivery() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        let mut rx = state.connect("Bob", "proj").await;
+
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body>x &lt; y &gt; z</body></message>"##;
+        delivery.deliver("m8", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let received = rx.recv().await.expect("should receive live message");
+        assert!(received.contains(r"x &lt; y &gt; z"),
+            "XML entities not preserved on live delivery; got: {received}");
+    }
+
+    #[tokio::test]
+    async fn dm_nested_xml_preserved_via_live_delivery() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Alice", "proj", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "").unwrap();
+
+        let mut rx = state.connect("Bob", "proj").await;
+
+        let body = r##"<message type="dm" from="Alice" to="Bob"><body><ref post-id="p-abc" /></body></message>"##;
+        delivery.deliver("m9", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
+
+        let received = rx.recv().await.expect("should receive live message");
+        assert!(received.contains(r#"<ref post-id="p-abc" />"#),
+            "nested XML not preserved on live delivery; got: {received}");
+    }
 }
