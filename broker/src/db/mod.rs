@@ -50,6 +50,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     }
 
     conn.execute_batch("
+        PRAGMA foreign_keys=OFF;
         BEGIN;
 
         CREATE TABLE channels_new (
@@ -78,5 +79,6 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         ALTER TABLE subscriptions_new RENAME TO subscriptions;
 
         COMMIT;
+        PRAGMA foreign_keys=ON;
     ").map_err(|e| format!("Channel schema migration failed: {e}"))
 }
