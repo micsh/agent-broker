@@ -59,18 +59,22 @@ impl DeliveryEngine {
                     .map(|(name, _)| name)
                     .collect();
 
-                for mention in mentions {
-                    if mention == from_agent || subscribers.contains(mention.as_str()) {
-                        continue;
-                    }
-                    let (name, project) = stanza::resolve_agent_name(mention, from_project);
-
-                    if !self.state.repo.agent_exists(name, project) {
-                        continue;
-                    }
-
-                    self.deliver_to_agent(id, name, project, body).await?;
+            // ASSUMPTION: all projects registered on this broker instance are trusted actors.
+            // Cross-project mention delivery is an intentional coordination mechanism, not an attack vector.
+            // IF INVALID (e.g. broker deployed as shared public service with open self-registration):
+            // implement Option 1 from ADR-002 — per-project allowlist in cross_project_permissions table,
+            // default-deny, with API for project admins to manage the allowlist.
+            for mention in mentions {
+                // Normalize: 'David.agent-broker' → 'David' before checking against unqualified subscriber set
+                let (mention_name, mention_project) = stanza::resolve_agent_name(mention, from_project);
+                if mention_name == from_agent || subscribers.contains(mention_name) {
+                    continue;
                 }
+                if !self.state.repo.agent_exists(mention_name, mention_project) {
+                    continue;
+                }
+                self.deliver_to_agent(id, mention_name, mention_project, body).await?;
+            }
             }
         }
 
@@ -88,6 +92,7 @@ impl DeliveryEngine {
         if self.state.send_to_agent(name, project, body).await {
             self.state.repo.record_delivered(message_id, name, project)?;
         } else {
+            tracing::warn!("No live WS session for {}.{} — message {} queued as pending", name, project, message_id);
             self.state.repo.record_pending(message_id, name, project)?;
         }
         Ok(())
@@ -326,5 +331,18 @@ mod tests {
         let received = rx.recv().await.expect("should receive live message");
         assert!(received.contains(r#"<ref post-id="p-abc" />"#),
             "nested XML not preserved on live delivery; got: {received}");
+    }
+
+    #[tokio::test]
+    async fn channel_message_with_no_subscribers_does_not_error() {
+        let (state, delivery) = setup();
+        state.repo.register_project("proj", "key").unwrap();
+        state.repo.register_agent("Sender", "proj", "").unwrap();
+        state.repo.ensure_channel("empty-channel", "proj");
+        // No subscriptions added
+
+        let body = r##"<message type="post" from="Sender" to="#empty-channel"><body>hi</body></message>"##;
+        let result = delivery.deliver("msg-zero", "Sender", "proj", None, Some("empty-channel"), body, None, &[]).await;
+        assert!(result.is_ok(), "delivery to channel with no subscribers must not error");
     }
 }

@@ -71,6 +71,16 @@ fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
 }
 
+/// Escape XML special characters in plain-text content before embedding in a stanza.
+/// Applied only to user-supplied plain text (broker_send message param), not to raw XML.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&apos;")
+}
+
 #[tool_router]
 impl BrokerTools {
     pub fn new() -> Self {
@@ -144,8 +154,13 @@ impl BrokerTools {
 
     #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project. For channels/threads/reactions use broker_send_stanza.")]
     async fn broker_send(&self, Parameters(args): Parameters<SendArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        // T7: reject empty or whitespace-only messages before constructing the stanza
+        if args.message.trim().is_empty() {
+            return Err(mcp_err("message must not be empty".to_string()));
+        }
         let (name, ..) = self.session.get()?;
-        let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\">{}</message>", name, args.to, args.message);
+        // T3: XML-escape plain text to produce a well-formed stanza body
+        let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\">{}</message>", name, args.to, xml_escape(&args.message));
         self.send_raw(stanza).await
     }
 

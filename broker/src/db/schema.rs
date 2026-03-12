@@ -20,20 +20,22 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
         );
 
         CREATE TABLE IF NOT EXISTS channels (
-            id          TEXT PRIMARY KEY,
-            project     TEXT,
+            id          TEXT NOT NULL,
+            project     TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
-            created_utc TEXT NOT NULL DEFAULT (datetime('now'))
+            created_utc TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (id, project),
+            FOREIGN KEY (project) REFERENCES projects(name)
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
-            agent_name  TEXT NOT NULL,
-            project     TEXT NOT NULL,
-            channel_id  TEXT NOT NULL,
+            agent_name     TEXT NOT NULL,
+            project        TEXT NOT NULL,
+            channel_id     TEXT NOT NULL,
             subscribed_utc TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (agent_name, project, channel_id),
             FOREIGN KEY (agent_name, project) REFERENCES agents(name, project),
-            FOREIGN KEY (channel_id) REFERENCES channels(id)
+            FOREIGN KEY (channel_id, project) REFERENCES channels(id, project)
         );
 
         CREATE TABLE IF NOT EXISTS messages (

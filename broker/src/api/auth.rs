@@ -34,3 +34,40 @@ impl FromRequestParts<Arc<AppState>> for ProjectAuth {
         })
     }
 }
+
+/// Extends ProjectAuth with authenticated agent identity.
+/// Reads X-Agent-Name header and verifies the agent exists in the project.
+pub struct AgentAuth {
+    pub project: String,
+    pub agent_name: String,
+}
+
+impl FromRequestParts<Arc<AppState>> for AgentAuth {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // Reuse ProjectAuth for project + key verification
+        let ProjectAuth { project } = ProjectAuth::from_request_parts(parts, state).await?;
+
+        let agent_name = parts
+            .headers
+            .get("x-agent-name")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((StatusCode::BAD_REQUEST, "Missing X-Agent-Name header".to_string()))?;
+
+        if !state.broker.agent_exists(agent_name, &project) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Agent '{}' not registered in project '{}'", agent_name, project),
+            ));
+        }
+
+        Ok(AgentAuth {
+            project,
+            agent_name: agent_name.to_string(),
+        })
+    }
+}

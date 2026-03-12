@@ -1,4 +1,4 @@
-use crate::api::auth::ProjectAuth;
+use crate::api::auth::{ProjectAuth, AgentAuth};
 use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
 use crate::db::repository::PendingMessage;
@@ -56,7 +56,7 @@ pub struct RegisterAgentResponse {
     pub session_id: String,
 }
 
-/// Presence update payload -- credentials carried by ProjectAuth extractor.
+/// Presence update payload -- credentials carried by AgentAuth extractor.
 #[derive(Deserialize)]
 pub struct PresenceRequest {
     pub name: String,
@@ -64,7 +64,7 @@ pub struct PresenceRequest {
     pub state: AgentState,
 }
 
-/// Channel subscribe/unsubscribe payload -- credentials carried by ProjectAuth extractor.
+/// Channel subscribe/unsubscribe payload -- credentials carried by AgentAuth extractor.
 #[derive(Deserialize)]
 pub struct ChannelRequest {
     pub name: String,
@@ -129,6 +129,14 @@ async fn register_agent(
         return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
     }
 
+    // T2: reject names containing '.' to prevent resolve_agent_name misrouting
+    if req.name.contains('.') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Agent name must not contain '.' -- use the 'project' field for project scoping".to_string(),
+        ));
+    }
+
     state.broker.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -147,21 +155,27 @@ async fn list_agents(
     Json(agents)
 }
 
-/// Accept raw stanza XML. Auth via ProjectAuth extractor (X-Project + X-Project-Key headers).
+/// Accept raw stanza XML. Auth via AgentAuth extractor (X-Project + X-Project-Key + X-Agent-Name headers).
 async fn send_message(
     State(state): State<Arc<AppState>>,
-    ProjectAuth { project }: ProjectAuth,
+    AgentAuth { project, agent_name }: AgentAuth,
     body: String,
 ) -> Result<Json<SendResponse>, (StatusCode, String)> {
+    // T6: reject empty or whitespace-only body
+    if body.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Request body must not be empty".to_string()));
+    }
+
     let parsed = stanza::parse(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
 
-    // Validate sender exists before dispatch
+    // T8b: verify stanza from= matches authenticated agent (accept qualified or unqualified form)
     if let stanza::Stanza::Message(ref msg) = parsed {
-        if !state.broker.agent_exists(&msg.from, &project) {
+        let (stanza_name, _) = stanza::resolve_agent_name(&msg.from, &project);
+        if stanza_name != agent_name {
             return Err((
                 StatusCode::FORBIDDEN,
-                format!("Agent '{}' not registered in project '{}'", msg.from, project),
+                format!("Stanza from='{}' does not match authenticated agent '{}'", msg.from, agent_name),
             ));
         }
     }
@@ -179,9 +193,16 @@ async fn send_message(
 
 async fn update_presence(
     State(state): State<Arc<AppState>>,
-    ProjectAuth { project }: ProjectAuth,
+    AgentAuth { project, agent_name }: AgentAuth,
     Json(req): Json<PresenceRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // T8b: payload name must match authenticated agent identity
+    if req.name != agent_name {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
+        ));
+    }
     state.broker.set_state(&req.name, &project, req.state).await;
     Ok(StatusCode::OK)
 }
@@ -217,9 +238,16 @@ async fn peek_messages(
 async fn subscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
-    ProjectAuth { project }: ProjectAuth,
+    AgentAuth { project, agent_name }: AgentAuth,
     Json(req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // T8b: payload name must match authenticated agent identity
+    if req.name != agent_name {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
+        ));
+    }
     state.broker.ensure_channel(&channel_id, &project);
     state.broker.subscribe(&req.name, &project, &channel_id);
     Ok(StatusCode::OK)
@@ -228,9 +256,16 @@ async fn subscribe_channel(
 async fn unsubscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
-    ProjectAuth { project }: ProjectAuth,
+    AgentAuth { project, agent_name }: AgentAuth,
     Json(req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // T8b: payload name must match authenticated agent identity
+    if req.name != agent_name {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
+        ));
+    }
     state.broker.unsubscribe(&req.name, &project, &channel_id);
     Ok(StatusCode::OK)
 }
