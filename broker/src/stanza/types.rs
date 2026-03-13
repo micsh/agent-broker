@@ -80,6 +80,15 @@ pub enum Destination {
     CrossProjectChannel { channel: String, project: String },
 }
 
+/// A resolved mention — name and project are already determined before delivery.
+/// SameProject: bare name found in from_project (or a qualified same-project mention).
+/// CrossProject: bare name resolved globally to exactly one other project, or explicitly qualified.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedMention {
+    SameProject { name: String },
+    CrossProject { name: String, project: String },
+}
+
 /// Interpret the `to` attribute: '#channel' → Channel, '#channel.Project' → CrossProjectChannel,
 /// otherwise → Agent.
 pub fn resolve_destination(to: &str) -> Destination {

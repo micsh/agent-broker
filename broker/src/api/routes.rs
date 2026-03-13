@@ -187,6 +187,14 @@ async fn send_message(
             StatusCode::NOT_FOUND,
             format!("Channel '{}' in project '{}' not found", channel, project),
         )),
+        Err(DispatchError::AmbiguousMention { name, projects }) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Mention @{} is ambiguous: found in projects [{}]. Use Name.Project to disambiguate.",
+                name,
+                projects.join(", ")
+            ),
+        )),
     }
 }
 

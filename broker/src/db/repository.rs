@@ -87,6 +87,19 @@ impl Repository {
             .is_some()
     }
 
+    /// Find all (name, project) pairs with the given name across all projects.
+    /// Returns empty Vec if no agent has this name. Used for implicit cross-project mention resolution.
+    pub fn find_agents_by_name(&self, name: &str) -> Vec<(String, String)> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT name, project FROM agents WHERE name = ?1")
+            .expect("find_agents_by_name query is static — compile-time valid");
+        stmt.query_map(params![name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("find_agents_by_name query execution")
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
     // --- Channels ---
 
     /// Ensure a channel exists within a project. Returns Err if the channel name is invalid.
@@ -427,5 +440,41 @@ mod tests {
         assert!(repo.ensure_channel("my-channel", "proj").is_ok(),
             "hyphen in channel name must be accepted");
         assert!(repo.channel_exists("my-channel", "proj"));
+    }
+
+    #[test]
+    fn find_agents_by_name_returns_empty_when_absent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj-a", "key").unwrap();
+        repo.register_agent("Alice", "proj-a", "").unwrap();
+        let result = repo.find_agents_by_name("Bob");
+        assert!(result.is_empty(), "unknown name should return empty Vec; got: {:?}", result);
+    }
+
+    #[test]
+    fn find_agents_by_name_returns_single_when_unique() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj-a", "key").unwrap();
+        repo.register_agent("Alice", "proj-a", "").unwrap();
+        let result = repo.find_agents_by_name("Alice");
+        assert_eq!(result, vec![("Alice".to_string(), "proj-a".to_string())],
+            "unique name should return exactly one entry");
+    }
+
+    #[test]
+    fn find_agents_by_name_returns_multiple_when_ambiguous() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj-a", "key1").unwrap();
+        repo.register_project("proj-b", "key2").unwrap();
+        repo.register_agent("Alice", "proj-a", "").unwrap();
+        repo.register_agent("Alice", "proj-b", "").unwrap();
+        let result = repo.find_agents_by_name("Alice");
+        assert_eq!(result.len(), 2, "same name in two projects should return 2 entries; got: {:?}", result);
     }
 }

@@ -1,6 +1,6 @@
 use crate::broker::state::BrokerState;
 use crate::db::repository::PendingMessage;
-use crate::stanza;
+use crate::stanza::{self, ResolvedMention};
 use std::sync::Arc;
 
 /// Handles store-and-forward delivery for offline agents.
@@ -26,7 +26,7 @@ impl DeliveryEngine {
         to_channel: Option<&str>,
         body: &str,
         metadata: Option<&str>,
-        mentions: &[String],
+        mentions: &[ResolvedMention],
     ) -> Result<(), String> {
         let enriched_body = stanza::enrich_from(body, from_agent, from_project);
         let enriched_body = enriched_body.as_str();
@@ -66,7 +66,7 @@ impl DeliveryEngine {
         channel: &str,
         target_project: &str,
         body: &str,
-        mentions: &[String],
+        mentions: &[ResolvedMention],
     ) -> Result<(), String> {
         let enriched_body = stanza::enrich_from(body, from_agent, from_project);
         let enriched_body = enriched_body.as_str();
@@ -96,7 +96,7 @@ impl DeliveryEngine {
         from_project: &str,
         channel: &str,
         body: &str,
-        mentions: &[String],
+        mentions: &[ResolvedMention],
     ) -> Result<(), String> {
         if mentions.is_empty() {
             return Ok(());
@@ -110,8 +110,10 @@ impl DeliveryEngine {
             .collect();
 
         for mention in mentions {
-            // Normalize: 'David.agent-broker' → ('David', 'agent-broker')
-            let (mention_name, mention_project) = stanza::resolve_agent_name(mention, from_project);
+            let (mention_name, mention_project): (&str, &str) = match mention {
+                ResolvedMention::SameProject { name } => (name.as_str(), from_project),
+                ResolvedMention::CrossProject { name, project } => (name.as_str(), project.as_str()),
+            };
             // Skip sender (qualified check — avoids blocking a cross-project agent with the same name)
             // and agents already receiving the message as channel subscribers
             if (mention_name == from_agent && mention_project == from_project)
@@ -123,6 +125,8 @@ impl DeliveryEngine {
             if mention_project != from_project
                 && !self.state.repo.is_cross_project_allowed(from_project, mention_project)
             {
+                // ASSUMPTION: sender accepts silent skip on auth denial for implicitly-resolved
+                // cross-project mentions. IF INVALID: surface as a non-blocking warning instead.
                 tracing::debug!(
                     "Cross-project mention to {}.{} denied by auth table",
                     mention_name, mention_project
@@ -446,7 +450,7 @@ mod tests {
         let body = r##"<message type="post" from="Sender" to="#general.target-proj" mentions="Mentioned.target-proj"><body>hi</body></message>"##;
         delivery.deliver_to_cross_project_channel(
             "xp-2", "Sender", "source-proj", "general", "target-proj", body,
-            &["Mentioned.target-proj".to_string()],
+            &[ResolvedMention::CrossProject { name: "Mentioned".to_string(), project: "target-proj".to_string() }],
         ).await.unwrap();
 
         let pending = state.repo.drain_pending("Mentioned", "target-proj");

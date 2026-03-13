@@ -193,6 +193,16 @@ async fn handle_stanza(
             crate::broker::DispatchError::DeliveryFailed(reason) => {
                 tracing::error!("Delivery failed for {}.{}: {}", agent_name, agent_project, reason);
             }
+            crate::broker::DispatchError::AmbiguousMention { name, projects } => {
+                let msg = WsEnvelope::Error {
+                    message: format!(
+                        "Mention @{} is ambiguous: found in projects [{}]. Use Name.Project to disambiguate.",
+                        name,
+                        projects.join(", ")
+                    ),
+                };
+                let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
+            }
             _ => {}
         }
     }
