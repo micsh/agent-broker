@@ -12,8 +12,8 @@ pub enum DispatchResult {
 }
 
 /// Dispatch a parsed or raw stanza through the broker.
-/// Handles both message delivery (with sender validation, destination resolution,
-/// target validation) and presence updates.
+/// Handles message delivery (sender validation, destination resolution, target validation)
+/// and presence updates.
 ///
 /// `from_project` is the authenticated project of the sender.
 /// `validate_target` controls whether target agent existence is checked (HTTP = yes, WS = no).
@@ -27,67 +27,51 @@ pub async fn dispatch_stanza(
     match stanza {
         Stanza::Message(msg) => {
             let id = uuid::Uuid::new_v4().to_string();
-            let (to_agent, to_channel, to_cross) = match stanza::resolve_destination(&msg.to) {
-                Destination::Agent(a) => (Some(a), None, None),
-                Destination::Channel(c) => (None, Some(c), None),
-                Destination::CrossProjectChannel { channel, project } => (None, None, Some((channel, project))),
-            };
-
-            if validate_target {
-                if let Some(ref agent) = to_agent {
-                    let (name, target_project) = stanza::resolve_agent_name(agent, from_project);
-                    if !broker.agent_exists(name, target_project) {
-                        return Err(DispatchError::TargetNotFound {
-                            agent: name.to_string(),
-                            project: target_project.to_string(),
+            match stanza::resolve_destination(&msg.to) {
+                Destination::Agent(ref agent) => {
+                    if validate_target {
+                        let (name, target_project) = stanza::resolve_agent_name(agent, from_project);
+                        if !broker.agent_exists(name, target_project) {
+                            return Err(DispatchError::TargetNotFound {
+                                agent: name.to_string(),
+                                project: target_project.to_string(),
+                            });
+                        }
+                    }
+                    delivery
+                        .deliver(&id, &msg.from, from_project, Some(agent), None, &msg.raw, None, &msg.mentions)
+                        .await
+                        .map_err(DispatchError::DeliveryFailed)?;
+                }
+                Destination::Channel(ref channel) => {
+                    delivery
+                        .deliver(&id, &msg.from, from_project, None, Some(channel), &msg.raw, None, &msg.mentions)
+                        .await
+                        .map_err(DispatchError::DeliveryFailed)?;
+                }
+                Destination::CrossProjectChannel { channel, project: target_project } => {
+                    // Auth check — 403 if denied
+                    if !broker.is_cross_project_allowed(from_project, &target_project) {
+                        return Err(DispatchError::CrossProjectDenied {
+                            source: from_project.to_string(),
+                            target: target_project,
                         });
                     }
+                    // Channel existence check — opaque 404 (does not distinguish project vs channel not found)
+                    if !broker.channel_exists(&channel, &target_project) {
+                        return Err(DispatchError::CrossProjectNotFound {
+                            channel,
+                            project: target_project,
+                        });
+                    }
+                    delivery
+                        .deliver_to_cross_project_channel(
+                            &id, &msg.from, from_project, &channel, &target_project, &msg.raw, &msg.mentions,
+                        )
+                        .await
+                        .map_err(DispatchError::DeliveryFailed)?;
                 }
             }
-
-            if let Some((channel, target_project)) = to_cross {
-                // Auth check — 403 if denied
-                if !broker.is_cross_project_allowed(from_project, &target_project) {
-                    return Err(DispatchError::CrossProjectDenied {
-                        source: from_project.to_string(),
-                        target: target_project,
-                    });
-                }
-                // Channel existence check — opaque 404 (don't distinguish project vs channel not found)
-                if !broker.channel_exists(&channel, &target_project) {
-                    return Err(DispatchError::CrossProjectNotFound {
-                        channel,
-                        project: target_project,
-                    });
-                }
-                delivery
-                    .deliver_to_cross_project_channel(
-                        &id,
-                        &msg.from,
-                        from_project,
-                        &channel,
-                        &target_project,
-                        &msg.raw,
-                    )
-                    .await
-                    .map_err(DispatchError::DeliveryFailed)?;
-                return Ok(DispatchResult::MessageSent(id));
-            }
-
-            delivery
-                .deliver(
-                    &id,
-                    &msg.from,
-                    from_project,
-                    to_agent.as_deref(),
-                    to_channel.as_deref(),
-                    &msg.raw,
-                    None,
-                    &msg.mentions,
-                )
-                .await
-                .map_err(DispatchError::DeliveryFailed)?;
-
             Ok(DispatchResult::MessageSent(id))
         }
         Stanza::Presence(p) => {

@@ -120,7 +120,7 @@ impl Repository {
 
     /// Seed the default cross-project allow entry ('*' → project) for a newly registered project.
     /// This permits any project to post to this project's channels by default.
-    pub fn seed_cross_project_default(&self, project: &str) {
+    fn seed_cross_project_default(&self, project: &str) {
         let _ = self.conn().execute(
             "INSERT OR IGNORE INTO cross_project_allowed_sources (source_project, target_project) VALUES ('*', ?1)",
             params![project],
@@ -209,20 +209,24 @@ impl Repository {
     }
 
     pub fn drain_pending(&self, name: &str, project: &str) -> Vec<PendingMessage> {
-        let conn = self.conn();
-        let mut stmt = match conn.prepare(
-            "SELECT m.id, m.from_agent, m.from_project, m.body, m.metadata, m.created_utc
-             FROM delivery_log dl
-             JOIN messages m ON dl.message_id = m.id
-             WHERE dl.agent_name = ?1 AND dl.project = ?2 AND dl.status = 'pending'
-             ORDER BY m.created_utc ASC",
-        ) {
-            Ok(s) => s,
+        let mut conn = self.conn();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
             Err(_) => return Vec::new(),
         };
 
-        let messages: Vec<PendingMessage> = match stmt
-            .query_map(params![name, project], |row| {
+        let messages: Vec<PendingMessage> = {
+            let mut stmt = match tx.prepare(
+                "SELECT m.id, m.from_agent, m.from_project, m.body, m.metadata, m.created_utc
+                 FROM delivery_log dl
+                 JOIN messages m ON dl.message_id = m.id
+                 WHERE dl.agent_name = ?1 AND dl.project = ?2 AND dl.status = 'pending'
+                 ORDER BY m.created_utc ASC",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            match stmt.query_map(params![name, project], |row| {
                 Ok(PendingMessage {
                     id: row.get(0)?,
                     from_agent: row.get(1)?,
@@ -234,16 +238,18 @@ impl Repository {
             }) {
                 Ok(r) => r.filter_map(|r| r.ok()).collect(),
                 Err(_) => return Vec::new(),
-            };
+            }
+        };
 
         if !messages.is_empty() {
-            let _ = conn.execute(
+            let _ = tx.execute(
                 "UPDATE delivery_log SET status = 'delivered', delivered_utc = datetime('now')
                  WHERE agent_name = ?1 AND project = ?2 AND status = 'pending'",
                 params![name, project],
             );
         }
 
+        let _ = tx.commit();
         messages
     }
 
@@ -346,5 +352,80 @@ mod tests {
         let beta = repo.get_subscribers("general", "beta");
         assert_eq!(beta.len(), 1, "beta should have exactly one subscriber");
         assert_eq!(beta[0].0, "AgentB");
+    }
+
+    #[test]
+    fn is_cross_project_allowed_wildcard_sentinel() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+
+        repo.register_project("target", "key1").unwrap();
+        // register_project seeds ('*', 'target') — any source should be allowed
+        assert!(repo.is_cross_project_allowed("any-source", "target"),
+            "wildcard sentinel should allow any source");
+        assert!(repo.is_cross_project_allowed("another-source", "target"),
+            "wildcard sentinel should allow multiple sources");
+    }
+
+    #[test]
+    fn is_cross_project_allowed_explicit_pair() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        // Manually insert explicit pair (no wildcard) before handing conn to repo
+        conn.execute(
+            "INSERT INTO cross_project_allowed_sources VALUES ('ProjectA', 'ProjectB')",
+            [],
+        ).unwrap();
+        let repo = Repository::new(conn);
+
+        assert!(repo.is_cross_project_allowed("ProjectA", "ProjectB"),
+            "explicit pair should be allowed");
+        assert!(!repo.is_cross_project_allowed("ProjectC", "ProjectB"),
+            "unlisted source should be denied when no wildcard");
+    }
+
+    #[test]
+    fn is_cross_project_allowed_denied_no_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        // No rows at all — any query should return false
+        assert!(!repo.is_cross_project_allowed("any", "target"),
+            "empty table should deny all");
+    }
+
+    #[test]
+    fn channel_exists_returns_true_when_present() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.ensure_channel("mychan", "proj").unwrap();
+        assert!(repo.channel_exists("mychan", "proj"));
+        assert!(!repo.channel_exists("mychan", "other-proj"));
+        assert!(!repo.channel_exists("other-chan", "proj"));
+    }
+
+    #[test]
+    fn ensure_channel_rejects_dot_in_name() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        let result = repo.ensure_channel("chan.name", "proj");
+        assert!(result.is_err(), "dot in channel name must be rejected");
+        assert!(result.unwrap_err().contains("must only contain"), "error message should describe constraint");
+    }
+
+    #[test]
+    fn ensure_channel_accepts_hyphen_in_name() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        assert!(repo.ensure_channel("my-channel", "proj").is_ok(),
+            "hyphen in channel name must be accepted");
+        assert!(repo.channel_exists("my-channel", "proj"));
     }
 }

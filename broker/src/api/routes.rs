@@ -65,9 +65,7 @@ pub struct PresenceRequest {
 
 /// Channel subscribe/unsubscribe payload -- credentials carried by AgentAuth extractor.
 #[derive(Deserialize)]
-pub struct ChannelRequest {
-    pub name: String,
-}
+pub struct ChannelRequest {}
 
 #[derive(Serialize)]
 pub struct SendResponse {
@@ -122,7 +120,7 @@ async fn register_agent(
         return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
     }
 
-    // T2: reject names containing '.' to prevent resolve_agent_name misrouting
+    // Reject names containing '.' to prevent resolve_agent_name misrouting
     if req.name.contains('.') {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -154,7 +152,7 @@ async fn send_message(
     AgentAuth { project, agent_name }: AgentAuth,
     body: String,
 ) -> Result<Json<SendResponse>, (StatusCode, String)> {
-    // T6: reject empty or whitespace-only body
+    // Reject empty or whitespace-only body
     if body.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Request body must not be empty".to_string()));
     }
@@ -162,7 +160,7 @@ async fn send_message(
     let parsed = stanza::parse(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
 
-    // T8b: verify stanza from= matches authenticated agent (accept qualified or unqualified form)
+    // Verify stanza from= matches authenticated agent (accept qualified or unqualified form)
     if let stanza::Stanza::Message(ref msg) = parsed {
         let (stanza_name, _) = stanza::resolve_agent_name(&msg.from, &project);
         if stanza_name != agent_name {
@@ -231,18 +229,11 @@ async fn subscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
     AgentAuth { project, agent_name }: AgentAuth,
-    Json(req): Json<ChannelRequest>,
+    Json(_req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // T8b: payload name must match authenticated agent identity
-    if req.name != agent_name {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
-        ));
-    }
     state.broker.ensure_channel(&channel_id, &project)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    state.broker.subscribe(&req.name, &project, &channel_id);
+    state.broker.subscribe(&agent_name, &project, &channel_id);
     Ok(StatusCode::OK)
 }
 
@@ -250,15 +241,8 @@ async fn unsubscribe_channel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
     AgentAuth { project, agent_name }: AgentAuth,
-    Json(req): Json<ChannelRequest>,
+    Json(_req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // T8b: payload name must match authenticated agent identity
-    if req.name != agent_name {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
-        ));
-    }
-    state.broker.unsubscribe(&req.name, &project, &channel_id);
+    state.broker.unsubscribe(&agent_name, &project, &channel_id);
     Ok(StatusCode::OK)
 }

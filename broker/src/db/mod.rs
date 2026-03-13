@@ -35,12 +35,12 @@ pub fn open_memory() -> Result<Repository, String> {
     Ok(Repository::new(conn))
 }
 
-/// Run schema migrations.
+/// Run schema migrations (private — called from open() and open_memory()).
 /// Migration 1: channels composite PK (from old single-column PK) + backfill orphaned channel rows
 ///   from subscriptions (NEW-8: pre-CT-2 data may have subscription references without channel rows).
 /// Migration 2: seed cross_project_allowed_sources default-allow entries for all existing projects.
 /// Safe to run on a fresh database (idempotent).
-pub fn migrate(conn: &Connection) -> Result<(), String> {
+fn migrate(conn: &Connection) -> Result<(), String> {
     // Migration 1: channels composite PK
     // Detect old single-column PK: pragma_table_info returns one row per column with pk > 0
     let pk_count: i64 = conn

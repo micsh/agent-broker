@@ -126,6 +126,7 @@ pub fn enrich_to_for_remote(body: &str, channel: &str, from_project: &str) -> St
 }
 
 
+/// Qualify the `from` attribute in raw stanza XML to fully-qualified form (name.project).
 /// If already qualified, returns the body unchanged.
 /// Replacement is scoped to the opening tag only — body content is never rewritten.
 pub fn enrich_from(body: &str, from_agent: &str, from_project: &str) -> String {

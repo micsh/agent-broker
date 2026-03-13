@@ -154,12 +154,12 @@ impl BrokerTools {
 
     #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project. For channels/threads/reactions use broker_send_stanza.")]
     async fn broker_send(&self, Parameters(args): Parameters<SendArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        // T7: reject empty or whitespace-only messages before constructing the stanza
+        // Reject empty or whitespace-only messages before constructing the stanza
         if args.message.trim().is_empty() {
             return Err(mcp_err("message must not be empty".to_string()));
         }
         let (name, ..) = self.session.get()?;
-        // T3: XML-escape plain text; T6: wrap in <body> for cross-team protocol compatibility
+        // XML-escape plain text; wrap in <body> for cross-team protocol compatibility
         let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\"><body>{}</body></message>", name, args.to, xml_escape(&args.message));
         self.send_raw(stanza).await
     }
