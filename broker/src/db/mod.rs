@@ -36,7 +36,8 @@ pub fn open_memory() -> Result<Repository, String> {
 }
 
 /// Run schema migrations.
-/// Migration 1: channels composite PK (from old single-column PK).
+/// Migration 1: channels composite PK (from old single-column PK) + backfill orphaned channel rows
+///   from subscriptions (NEW-8: pre-CT-2 data may have subscription references without channel rows).
 /// Migration 2: seed cross_project_allowed_sources default-allow entries for all existing projects.
 /// Safe to run on a fresh database (idempotent).
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -77,6 +78,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             DROP TABLE channels;
             ALTER TABLE channels_new RENAME TO channels;
             ALTER TABLE subscriptions_new RENAME TO subscriptions;
+
+            -- NEW-8: backfill any channel rows that existed only as subscription references
+            -- (pre-CT-2 data may have subscriptions whose channel rows were lost in the migration).
+            INSERT OR IGNORE INTO channels (id, project, created_utc)
+            SELECT DISTINCT channel_id, project, datetime('now')
+            FROM subscriptions
+            WHERE (channel_id || '|' || project) NOT IN
+                (SELECT id || '|' || project FROM channels);
 
             COMMIT;
             PRAGMA foreign_keys=ON;
