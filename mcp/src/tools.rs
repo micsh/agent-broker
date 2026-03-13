@@ -165,10 +165,11 @@ impl BrokerTools {
     }
 
     async fn send_raw(&self, stanza: String) -> Result<CallToolResult, rmcp::ErrorData> {
-        let (_, project, key, url) = self.session.get()?;
+        let (name, project, key, url) = self.session.get()?;
         let resp = self.client.post(format!("{}/send", url))
             .header("X-Project", &project)
             .header("X-Project-Key", &key)
+            .header("X-Agent-Name", &name)
             .header("Content-Type", "application/xml")
             .body(stanza)
             .send().await.map_err(|e| mcp_err(format!("Send failed: {e}")))?;
