@@ -74,14 +74,25 @@ impl PresenceStatus {
 pub enum Destination {
     /// Direct message to an agent. May be "Name" or "Name.Project".
     Agent(String),
-    /// Broadcast to a channel (the '#' prefix is stripped).
+    /// Broadcast to a channel within the sender's project (the '#' prefix is stripped).
     Channel(String),
+    /// Cross-project channel post: '#channel.Project' — channel in a different project.
+    CrossProjectChannel { channel: String, project: String },
 }
 
-/// Interpret the `to` attribute: '#channel' → channel, otherwise → agent.
+/// Interpret the `to` attribute: '#channel' → Channel, '#channel.Project' → CrossProjectChannel,
+/// otherwise → Agent.
 pub fn resolve_destination(to: &str) -> Destination {
     if to.starts_with('#') {
-        Destination::Channel(to[1..].to_string())
+        let s = &to[1..];
+        if let Some(dot) = s.find('.') {
+            Destination::CrossProjectChannel {
+                channel: s[..dot].to_string(),
+                project: s[dot + 1..].to_string(),
+            }
+        } else {
+            Destination::Channel(s.to_string())
+        }
     } else {
         Destination::Agent(to.to_string())
     }
@@ -145,6 +156,39 @@ mod tests {
         assert!(
             enriched.contains(r#"from="Maya""#),
             "Body text with from=\"Maya\" must not be rewritten; got: {enriched}"
+        );
+    }
+
+    #[test]
+    fn resolve_cross_project_channel() {
+        assert_eq!(
+            resolve_destination("#general.AITeam.Platform"),
+            Destination::CrossProjectChannel {
+                channel: "general".to_string(),
+                project: "AITeam.Platform".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_same_project_channel_unchanged() {
+        assert_eq!(resolve_destination("#planning"), Destination::Channel("planning".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_unchanged() {
+        assert_eq!(resolve_destination("Victoria"), Destination::Agent("Victoria".to_string()));
+    }
+
+    #[test]
+    fn resolve_cross_project_channel_first_dot_split() {
+        // '#general.notes' — first dot splits at 'notes', even when project name has no dot
+        assert_eq!(
+            resolve_destination("#general.notes"),
+            Destination::CrossProjectChannel {
+                channel: "general".to_string(),
+                project: "notes".to_string(),
+            }
         );
     }
 

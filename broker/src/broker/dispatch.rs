@@ -27,9 +27,10 @@ pub async fn dispatch_stanza(
     match stanza {
         Stanza::Message(msg) => {
             let id = uuid::Uuid::new_v4().to_string();
-            let (to_agent, to_channel) = match stanza::resolve_destination(&msg.to) {
-                Destination::Agent(a) => (Some(a), None),
-                Destination::Channel(c) => (None, Some(c)),
+            let (to_agent, to_channel, to_cross) = match stanza::resolve_destination(&msg.to) {
+                Destination::Agent(a) => (Some(a), None, None),
+                Destination::Channel(c) => (None, Some(c), None),
+                Destination::CrossProjectChannel { channel, project } => (None, None, Some((channel, project))),
             };
 
             if validate_target {
@@ -42,6 +43,35 @@ pub async fn dispatch_stanza(
                         });
                     }
                 }
+            }
+
+            if let Some((channel, target_project)) = to_cross {
+                // Auth check — 403 if denied
+                if !broker.is_cross_project_allowed(from_project, &target_project) {
+                    return Err(DispatchError::CrossProjectDenied {
+                        source: from_project.to_string(),
+                        target: target_project,
+                    });
+                }
+                // Channel existence check — opaque 404 (don't distinguish project vs channel not found)
+                if !broker.channel_exists(&channel, &target_project) {
+                    return Err(DispatchError::CrossProjectNotFound {
+                        channel,
+                        project: target_project,
+                    });
+                }
+                delivery
+                    .deliver_to_cross_project_channel(
+                        &id,
+                        &msg.from,
+                        from_project,
+                        &channel,
+                        &target_project,
+                        &msg.raw,
+                    )
+                    .await
+                    .map_err(DispatchError::DeliveryFailed)?;
+                return Ok(DispatchResult::MessageSent(id));
             }
 
             delivery
@@ -73,4 +103,8 @@ pub enum DispatchError {
     TargetNotFound { agent: String, project: String },
     /// Delivery engine returned an error.
     DeliveryFailed(String),
+    /// Cross-project channel post denied by the authorization table.
+    CrossProjectDenied { source: String, target: String },
+    /// Target channel or project does not exist.
+    CrossProjectNotFound { channel: String, project: String },
 }

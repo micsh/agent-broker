@@ -49,35 +49,71 @@ impl DeliveryEngine {
                 }
             }
 
-            // Deliver to mentioned agents not subscribed to this channel
+            // Deliver to mentioned agents not subscribed to this channel.
+            // Auth table (cross_project_allowed_sources) gates cross-project mentions — default-allow ('*').
             if !mentions.is_empty() {
-                let subscribers: std::collections::HashSet<String> = self
+                let subscribers: std::collections::HashSet<(String, String)> = self
                     .state
                     .repo
                     .get_subscribers(channel, from_project)
                     .into_iter()
-                    .map(|(name, _)| name)
                     .collect();
 
-            // ASSUMPTION: all projects registered on this broker instance are trusted actors.
-            // Cross-project mention delivery is an intentional coordination mechanism, not an attack vector.
-            // IF INVALID (e.g. broker deployed as shared public service with open self-registration):
-            // implement Option 1 from ADR-002 — per-project allowlist in cross_project_permissions table,
-            // default-deny, with API for project admins to manage the allowlist.
-            for mention in mentions {
-                // Normalize: 'David.agent-broker' → 'David' before checking against unqualified subscriber set
-                let (mention_name, mention_project) = stanza::resolve_agent_name(mention, from_project);
-                if mention_name == from_agent || subscribers.contains(mention_name) {
-                    continue;
+                for mention in mentions {
+                    // Normalize: 'David.agent-broker' → ('David', 'agent-broker')
+                    let (mention_name, mention_project) = stanza::resolve_agent_name(mention, from_project);
+                    // Skip if this is the sender (qualified check to avoid blocking cross-project agents
+                    // with the same name) or already a channel subscriber
+                    if (mention_name == from_agent && mention_project == from_project)
+                        || subscribers.contains(&(mention_name.to_string(), mention_project.to_string()))
+                    {
+                        continue;
+                    }
+                    // T4: auth check for cross-project mentions — silently skip if denied
+                    if mention_project != from_project
+                        && !self.state.repo.is_cross_project_allowed(from_project, mention_project)
+                    {
+                        tracing::debug!(
+                            "Cross-project mention to {}.{} denied by auth table",
+                            mention_name, mention_project
+                        );
+                        continue;
+                    }
+                    if !self.state.repo.agent_exists(mention_name, mention_project) {
+                        continue;
+                    }
+                    self.deliver_to_agent(id, mention_name, mention_project, body).await?;
                 }
-                if !self.state.repo.agent_exists(mention_name, mention_project) {
-                    continue;
-                }
-                self.deliver_to_agent(id, mention_name, mention_project, body).await?;
-            }
             }
         }
 
+        Ok(())
+    }
+
+    /// Deliver a message to a channel in a different project.
+    /// Enriches the stanza from= attribute, persists the message, and fans out to target subscribers.
+    pub async fn deliver_to_cross_project_channel(
+        &self,
+        id: &str,
+        from_agent: &str,
+        from_project: &str,
+        channel: &str,
+        target_project: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let enriched = stanza::enrich_from(body, from_agent, from_project);
+        let body = enriched.as_str();
+
+        self.state.repo.insert_message(id, from_agent, from_project, None, Some(channel), body, None)?;
+
+        let results = self.state.send_to_channel(channel, target_project, body, None).await;
+        for (sub_name, sub_project, delivered) in results {
+            if delivered {
+                self.state.repo.record_delivered(id, &sub_name, &sub_project)?;
+            } else {
+                self.state.repo.record_pending(id, &sub_name, &sub_project)?;
+            }
+        }
         Ok(())
     }
 
@@ -132,7 +168,7 @@ mod tests {
         state.repo.register_agent("Subscriber", "proj", "").unwrap();
 
         // Subscribe Subscriber to the channel (Subscriber is offline — no WS session)
-        state.repo.ensure_channel("general", "proj");
+        state.repo.ensure_channel("general", "proj").unwrap();
         state.repo.subscribe("Subscriber", "proj", "general");
 
         // Sender sends a channel message
@@ -153,7 +189,7 @@ mod tests {
         state.repo.register_agent("Sender", "proj", "").unwrap();
         state.repo.register_agent("Receiver", "proj", "").unwrap();
 
-        state.repo.ensure_channel("general", "proj");
+        state.repo.ensure_channel("general", "proj").unwrap();
         state.repo.subscribe("Receiver", "proj", "general");
 
         // Connect Receiver so it has a live session (broadcast channel)
@@ -338,7 +374,7 @@ mod tests {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
         state.repo.register_agent("Sender", "proj", "").unwrap();
-        state.repo.ensure_channel("empty-channel", "proj");
+        state.repo.ensure_channel("empty-channel", "proj").unwrap();
         // No subscriptions added
 
         let body = r##"<message type="post" from="Sender" to="#empty-channel"><body>hi</body></message>"##;

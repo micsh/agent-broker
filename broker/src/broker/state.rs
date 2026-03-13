@@ -107,8 +107,16 @@ impl BrokerState {
         Ok(())
     }
 
-    pub fn ensure_channel(&self, id: &str, project: &str) {
+    pub fn ensure_channel(&self, id: &str, project: &str) -> Result<(), String> {
         self.repo.ensure_channel(id, project)
+    }
+
+    pub fn channel_exists(&self, channel_id: &str, project: &str) -> bool {
+        self.repo.channel_exists(channel_id, project)
+    }
+
+    pub fn is_cross_project_allowed(&self, source_project: &str, target_project: &str) -> bool {
+        self.repo.is_cross_project_allowed(source_project, target_project)
     }
 
     pub fn subscribe(&self, agent_name: &str, project: &str, channel_id: &str) {

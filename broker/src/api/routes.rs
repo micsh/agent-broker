@@ -1,4 +1,4 @@
-use crate::api::auth::{ProjectAuth, AgentAuth};
+use crate::api::auth::AgentAuth;
 use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
 use crate::db::repository::PendingMessage;
@@ -56,10 +56,9 @@ pub struct RegisterAgentResponse {
     pub session_id: String,
 }
 
-/// Presence update payload -- credentials carried by AgentAuth extractor.
+/// Presence update payload -- agent identity comes from AgentAuth extractor.
 #[derive(Deserialize)]
 pub struct PresenceRequest {
-    pub name: String,
     #[serde(default)]
     pub state: AgentState,
 }
@@ -78,12 +77,6 @@ pub struct SendResponse {
 #[derive(Deserialize)]
 pub struct AgentQuery {
     pub project: Option<String>,
-}
-
-/// Message retrieval query -- project is supplied via X-Project header (ProjectAuth extractor).
-#[derive(Deserialize)]
-pub struct MessageQuery {
-    pub name: String,
 }
 
 #[derive(Serialize)]
@@ -188,6 +181,14 @@ async fn send_message(
             format!("Target agent '{}' not found in project '{}'", agent, project),
         )),
         Err(DispatchError::DeliveryFailed(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(DispatchError::CrossProjectDenied { source, target }) => Err((
+            StatusCode::FORBIDDEN,
+            format!("Cross-project post from '{}' to '{}' is not authorized", source, target),
+        )),
+        Err(DispatchError::CrossProjectNotFound { channel, project }) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Channel '{}' in project '{}' not found", channel, project),
+        )),
     }
 }
 
@@ -196,32 +197,23 @@ async fn update_presence(
     AgentAuth { project, agent_name }: AgentAuth,
     Json(req): Json<PresenceRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // T8b: payload name must match authenticated agent identity
-    if req.name != agent_name {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
-        ));
-    }
-    state.broker.set_state(&req.name, &project, req.state).await;
+    state.broker.set_state(&agent_name, &project, req.state).await;
     Ok(StatusCode::OK)
 }
 
 async fn get_messages(
     State(state): State<Arc<AppState>>,
-    ProjectAuth { project }: ProjectAuth,
-    Query(query): Query<MessageQuery>,
+    AgentAuth { project, agent_name }: AgentAuth,
 ) -> Result<Json<Vec<PendingMessage>>, (StatusCode, String)> {
-    let messages = state.delivery.drain_pending(&query.name, &project);
+    let messages = state.delivery.drain_pending(&agent_name, &project);
     Ok(Json(messages))
 }
 
 async fn peek_messages(
     State(state): State<Arc<AppState>>,
-    ProjectAuth { project }: ProjectAuth,
-    Query(query): Query<MessageQuery>,
+    AgentAuth { project, agent_name }: AgentAuth,
 ) -> Result<Json<PeekResponse>, (StatusCode, String)> {
-    let pending = state.broker.peek_pending(&query.name, &project);
+    let pending = state.broker.peek_pending(&agent_name, &project);
     let senders: Vec<PeekSender> = pending
         .iter()
         .map(|(agent, proj, at)| PeekSender {
@@ -248,7 +240,8 @@ async fn subscribe_channel(
             format!("Name '{}' does not match authenticated agent '{}'", req.name, agent_name),
         ));
     }
-    state.broker.ensure_channel(&channel_id, &project);
+    state.broker.ensure_channel(&channel_id, &project)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     state.broker.subscribe(&req.name, &project, &channel_id);
     Ok(StatusCode::OK)
 }

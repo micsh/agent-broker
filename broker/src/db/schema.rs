@@ -65,6 +65,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_utc);
         CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_log(agent_name, project, status)
             WHERE status = 'pending';
+
+        CREATE TABLE IF NOT EXISTS cross_project_allowed_sources (
+            source_project TEXT NOT NULL,
+            target_project TEXT NOT NULL,
+            PRIMARY KEY (source_project, target_project)
+        );
         ",
     )
     .map_err(|e| format!("Schema setup failed: {e}"))

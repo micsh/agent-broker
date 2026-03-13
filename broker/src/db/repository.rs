@@ -38,6 +38,7 @@ impl Repository {
             "INSERT INTO projects (name, key_hash) VALUES (?1, ?2)",
             params![name, key_hash],
         ).map_err(|e| format!("Failed to register project (already exists?): {e}"))?;
+        self.seed_cross_project_default(name);
         Ok(())
     }
 
@@ -88,11 +89,54 @@ impl Repository {
 
     // --- Channels ---
 
-    pub fn ensure_channel(&self, id: &str, project: &str) {
+    /// Ensure a channel exists within a project. Returns Err if the channel name is invalid.
+    /// Valid channel names match `[\w-]+` — word characters and hyphens only.
+    /// Dots are prohibited because '#channel.Project' is the cross-project addressing syntax.
+    pub fn ensure_channel(&self, id: &str, project: &str) -> Result<(), String> {
+        let valid = !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return Err(format!(
+                "Channel name '{}' must only contain word characters and hyphens — \
+                 dots are reserved for cross-project addressing (#channel.Project)",
+                id
+            ));
+        }
         let _ = self.conn().execute(
             "INSERT OR IGNORE INTO channels (id, project) VALUES (?1, ?2)",
             params![id, project],
         );
+        Ok(())
+    }
+
+    /// Check whether a channel exists in the given project.
+    pub fn channel_exists(&self, channel_id: &str, project: &str) -> bool {
+        let conn = self.conn();
+        conn.prepare("SELECT 1 FROM channels WHERE id = ?1 AND project = ?2")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row(params![channel_id, project], |_| Ok(())).ok())
+            .is_some()
+    }
+
+    /// Seed the default cross-project allow entry ('*' → project) for a newly registered project.
+    /// This permits any project to post to this project's channels by default.
+    pub fn seed_cross_project_default(&self, project: &str) {
+        let _ = self.conn().execute(
+            "INSERT OR IGNORE INTO cross_project_allowed_sources (source_project, target_project) VALUES ('*', ?1)",
+            params![project],
+        );
+    }
+
+    /// Check whether source_project is allowed to post to target_project's channels.
+    /// Returns true if a ('*', target_project) or (source_project, target_project) row exists.
+    pub fn is_cross_project_allowed(&self, source_project: &str, target_project: &str) -> bool {
+        let conn = self.conn();
+        conn.prepare(
+            "SELECT 1 FROM cross_project_allowed_sources \
+             WHERE target_project = ?1 AND (source_project = ?2 OR source_project = '*') LIMIT 1"
+        ).ok()
+        .and_then(|mut stmt| stmt.query_row(params![target_project, source_project], |_| Ok(())).ok())
+        .is_some()
     }
 
     pub fn subscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
@@ -287,10 +331,11 @@ mod tests {
         repo.register_agent("AgentB", "beta", "").unwrap();
 
         // Both projects use a channel with the same logical name.
-        // The first ensure_channel wins the channel row; the second is a no-op.
+        // Each (channel_id, project) pair is an independent row — channels in different projects
+        // with the same name do not collide. Both ensure_channel calls create their own row.
         // Subscriptions are still per (agent, project, channel_id).
-        repo.ensure_channel("general", "alpha");
-        repo.ensure_channel("general", "beta");
+        repo.ensure_channel("general", "alpha").unwrap();
+        repo.ensure_channel("general", "beta").unwrap();
         repo.subscribe("AgentA", "alpha", "general");
         repo.subscribe("AgentB", "beta", "general");
 

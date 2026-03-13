@@ -159,8 +159,8 @@ impl BrokerTools {
             return Err(mcp_err("message must not be empty".to_string()));
         }
         let (name, ..) = self.session.get()?;
-        // T3: XML-escape plain text to produce a well-formed stanza body
-        let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\">{}</message>", name, args.to, xml_escape(&args.message));
+        // T3: XML-escape plain text; T6: wrap in <body> for cross-team protocol compatibility
+        let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\"><body>{}</body></message>", name, args.to, xml_escape(&args.message));
         self.send_raw(stanza).await
     }
 
@@ -191,9 +191,10 @@ impl BrokerTools {
     async fn broker_peek(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let (name, project, key, url) = self.session.get()?;
         let peek: PeekResp = self.client
-            .get(format!("{}/messages/peek?name={}", url, name))
+            .get(format!("{}/messages/peek", url))
             .header("X-Project", &project)
             .header("X-Project-Key", &key)
+            .header("X-Agent-Name", &name)
             .send().await.map_err(|e| mcp_err(format!("Peek failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
@@ -206,9 +207,10 @@ impl BrokerTools {
     async fn broker_messages(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let (name, project, key, url) = self.session.get()?;
         let messages: Vec<PendingMsg> = self.client
-            .get(format!("{}/messages?name={}", url, name))
+            .get(format!("{}/messages", url))
             .header("X-Project", &project)
             .header("X-Project-Key", &key)
+            .header("X-Agent-Name", &name)
             .send().await.map_err(|e| mcp_err(format!("Fetch failed: {e}")))?
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
