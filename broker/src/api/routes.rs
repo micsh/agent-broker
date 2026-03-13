@@ -100,7 +100,7 @@ async fn register_project(
     Json(req): Json<RegisterProjectRequest>,
 ) -> Result<Json<RegisterProjectResponse>, (StatusCode, String)> {
     let project_key = uuid::Uuid::new_v4().to_string();
-    state.broker.register_project(&req.name, &project_key)
+    state.broker.repo.register_project(&req.name, &project_key)
         .map_err(|e| (StatusCode::CONFLICT, e))?;
 
     tracing::info!("Project registered: {}", req.name);
@@ -112,11 +112,11 @@ async fn register_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterAgentRequest>,
 ) -> Result<Json<RegisterAgentResponse>, (StatusCode, String)> {
-    if !state.broker.verify_project_key(&req.project, &req.project_key) {
+    if !state.broker.repo.verify_project_key(&req.project, &req.project_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
     }
 
-    if !state.broker.project_exists(&req.project) {
+    if !state.broker.repo.project_exists(&req.project) {
         return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
     }
 
@@ -128,7 +128,7 @@ async fn register_agent(
         ));
     }
 
-    state.broker.register_agent(&req.name, &req.project, &req.role)
+    state.broker.repo.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // NOTE: this is a correlation ID only -- live sessions are created exclusively on WS handshake.
@@ -219,7 +219,7 @@ async fn peek_messages(
     State(state): State<Arc<AppState>>,
     AgentAuth { project, agent_name }: AgentAuth,
 ) -> Result<Json<PeekResponse>, (StatusCode, String)> {
-    let pending = state.broker.peek_pending(&agent_name, &project);
+    let pending = state.broker.repo.peek_pending(&agent_name, &project);
     let senders: Vec<PeekSender> = pending
         .iter()
         .map(|(agent, proj, at)| PeekSender {
@@ -239,9 +239,9 @@ async fn subscribe_channel(
     AgentAuth { project, agent_name }: AgentAuth,
     Json(_req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.ensure_channel(&channel_id, &project)
+    state.broker.repo.ensure_channel(&channel_id, &project)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    state.broker.subscribe(&agent_name, &project, &channel_id);
+    state.broker.repo.subscribe(&agent_name, &project, &channel_id);
     Ok(StatusCode::OK)
 }
 
@@ -251,6 +251,6 @@ async fn unsubscribe_channel(
     AgentAuth { project, agent_name }: AgentAuth,
     Json(_req): Json<ChannelRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.unsubscribe(&agent_name, &project, &channel_id);
+    state.broker.repo.unsubscribe(&agent_name, &project, &channel_id);
     Ok(StatusCode::OK)
 }

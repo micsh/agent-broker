@@ -33,7 +33,7 @@ pub async fn dispatch_stanza(
                 Destination::Agent(ref agent) => {
                     if validate_target {
                         let (name, target_project) = stanza::resolve_agent_name(agent, from_project);
-                        if !broker.agent_exists(name, target_project) {
+                        if !broker.repo.agent_exists(name, target_project) {
                             return Err(DispatchError::TargetNotFound {
                                 agent: name.to_string(),
                                 project: target_project.to_string(),
@@ -53,14 +53,14 @@ pub async fn dispatch_stanza(
                 }
                 Destination::CrossProjectChannel { channel, project: target_project } => {
                     // Auth check — 403 if denied
-                    if !broker.is_cross_project_allowed(from_project, &target_project) {
+                    if !broker.repo.is_cross_project_allowed(from_project, &target_project) {
                         return Err(DispatchError::CrossProjectDenied {
                             source: from_project.to_string(),
                             target: target_project,
                         });
                     }
                     // Channel existence check — opaque 404 (does not distinguish project vs channel not found)
-                    if !broker.channel_exists(&channel, &target_project) {
+                    if !broker.repo.channel_exists(&channel, &target_project) {
                         return Err(DispatchError::CrossProjectNotFound {
                             channel,
                             project: target_project,

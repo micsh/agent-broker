@@ -26,7 +26,7 @@ impl FromRequestParts<Arc<AppState>> for ProjectAuth {
             .get("x-project-key")
             .and_then(|v| v.to_str().ok())
             .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project-Key header".to_string()))?;
-        if !state.broker.verify_project_key(project, key) {
+        if !state.broker.repo.verify_project_key(project, key) {
             return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
         }
         Ok(ProjectAuth {
@@ -58,7 +58,7 @@ impl FromRequestParts<Arc<AppState>> for AgentAuth {
             .and_then(|v| v.to_str().ok())
             .ok_or((StatusCode::BAD_REQUEST, "Missing X-Agent-Name header".to_string()))?;
 
-        if !state.broker.agent_exists(agent_name, &project) {
+        if !state.broker.repo.agent_exists(agent_name, &project) {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!("Agent '{}' not registered in project '{}'", agent_name, project),

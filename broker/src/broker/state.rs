@@ -73,28 +73,6 @@ impl BrokerState {
         }
     }
 
-    // --- Delegated repository methods ---
-
-    pub fn verify_project_key(&self, project: &str, key: &str) -> bool {
-        self.repo.verify_project_key(project, key)
-    }
-
-    pub fn register_project(&self, name: &str, key: &str) -> Result<(), String> {
-        self.repo.register_project(name, key)
-    }
-
-    pub fn register_agent(&self, name: &str, project: &str, role: &str) -> Result<(), String> {
-        self.repo.register_agent(name, project, role)
-    }
-
-    pub fn agent_exists(&self, name: &str, project: &str) -> bool {
-        self.repo.agent_exists(name, project)
-    }
-
-    pub fn project_exists(&self, name: &str) -> bool {
-        self.repo.project_exists(name)
-    }
-
     /// Authenticate an agent: verify project key and check agent registration.
     /// Returns Ok(()) on success, Err(reason) on failure.
     pub fn authenticate(&self, name: &str, project: &str, key: &str) -> Result<(), String> {
@@ -105,30 +83,6 @@ impl BrokerState {
             return Err(format!("Agent '{}' not registered in project '{}'", name, project));
         }
         Ok(())
-    }
-
-    pub fn ensure_channel(&self, id: &str, project: &str) -> Result<(), String> {
-        self.repo.ensure_channel(id, project)
-    }
-
-    pub fn channel_exists(&self, channel_id: &str, project: &str) -> bool {
-        self.repo.channel_exists(channel_id, project)
-    }
-
-    pub fn is_cross_project_allowed(&self, source_project: &str, target_project: &str) -> bool {
-        self.repo.is_cross_project_allowed(source_project, target_project)
-    }
-
-    pub fn subscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
-        self.repo.subscribe(agent_name, project, channel_id)
-    }
-
-    pub fn unsubscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
-        self.repo.unsubscribe(agent_name, project, channel_id)
-    }
-
-    pub fn peek_pending(&self, name: &str, project: &str) -> Vec<(String, String, String)> {
-        self.repo.peek_pending(name, project)
     }
 
     // --- Session management ---
