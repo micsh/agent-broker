@@ -82,7 +82,14 @@ impl DeliveryEngine {
                     if !self.state.repo.agent_exists(mention_name, mention_project) {
                         continue;
                     }
-                    self.deliver_to_agent(id, mention_name, mention_project, body).await?;
+                    // For cross-project mentions, qualify the to= so the recipient knows
+                    // which project's channel to reply to (e.g. to="#general" → to="#general.from_project")
+                    let delivery_body = if mention_project != from_project {
+                        std::borrow::Cow::Owned(stanza::enrich_to_for_remote(body, channel, from_project))
+                    } else {
+                        std::borrow::Cow::Borrowed(body)
+                    };
+                    self.deliver_to_agent(id, mention_name, mention_project, &delivery_body).await?;
                 }
             }
         }

@@ -109,7 +109,23 @@ pub fn resolve_agent_name<'a>(target: &'a str, default_project: &'a str) -> (&'a
     }
 }
 
-/// Qualify the `from` attribute in raw stanza XML to be fully qualified (name.project).
+/// Qualify the `to` attribute in raw stanza XML for a remote recipient.
+/// Turns `to="#general"` into `to="#general.from_project"` in the opening tag only.
+/// If already qualified (the channel address contains a '.'), returns unchanged.
+/// Body content is never rewritten.
+pub fn enrich_to_for_remote(body: &str, channel: &str, from_project: &str) -> String {
+    let unqualified = format!("to=\"#{}\"", channel);
+    let qualified = format!("to=\"#{}.{}\"", channel, from_project);
+    let tag_end = body.find('>').unwrap_or(body.len());
+    let (opening, rest) = body.split_at(tag_end);
+    // Already qualified: to="#channel." present (any project suffix)
+    if opening.contains(&format!("to=\"#{channel}.")) || !opening.contains(&unqualified) {
+        return body.to_string();
+    }
+    format!("{}{}", opening.replacen(&unqualified, &qualified, 1), rest)
+}
+
+
 /// If already qualified, returns the body unchanged.
 /// Replacement is scoped to the opening tag only — body content is never rewritten.
 pub fn enrich_from(body: &str, from_agent: &str, from_project: &str) -> String {
@@ -214,6 +230,38 @@ mod tests {
         // "OtherAgent" authenticated as "Victoria" — name mismatch detectable
         let (name, _) = resolve_agent_name("OtherAgent", "my-project");
         assert_ne!(name, "Victoria");
+    }
+
+    // --- enrich_to_for_remote ---
+
+    #[test]
+    fn enrich_to_qualifies_unqualified_channel() {
+        let xml = r##"<message type="post" from="Alice.proj" to="#general"><body>Hi</body></message>"##;
+        let result = enrich_to_for_remote(xml, "general", "myproject");
+        assert!(result.contains(r###"to="#general.myproject""###),
+            "expected qualified to=; got: {result}");
+        assert!(!result.contains(r##"to="#general" "##) && !result.contains(r##"to="#general">"##),
+            "unqualified to= must be replaced; got: {result}");
+        assert!(result.contains("<body>Hi</body>"), "body not preserved; got: {result}");
+    }
+
+    #[test]
+    fn enrich_to_already_qualified_returns_unchanged() {
+        let xml = r##"<message type="post" from="Alice.proj" to="#general.other"><body>Hi</body></message>"##;
+        let result = enrich_to_for_remote(xml, "general", "myproject");
+        assert_eq!(result, xml, "already-qualified to= must not be changed");
+    }
+
+    #[test]
+    fn enrich_to_does_not_rewrite_body_content() {
+        let xml = r##"<message type="post" from="Alice.proj" to="#general"><body>reply to this channel</body></message>"##;
+        let result = enrich_to_for_remote(xml, "general", "myproject");
+        // Opening tag must be qualified
+        assert!(result.contains(r###"to="#general.myproject""###),
+            "opening tag not qualified; got: {result}");
+        // Body must be preserved verbatim
+        assert!(result.contains("<body>reply to this channel</body>"),
+            "body content must not be changed; got: {result}");
     }
 }
 
