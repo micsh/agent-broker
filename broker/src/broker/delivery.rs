@@ -126,7 +126,9 @@ impl DeliveryEngine {
                 && !self.state.repo.is_cross_project_allowed(from_project, mention_project)
             {
                 // ASSUMPTION: sender accepts silent skip on auth denial for implicitly-resolved
-                // cross-project mentions. IF INVALID: surface as a non-blocking warning instead.
+                // cross-project mentions. IF INVALID: replace with tracing::warn!(
+                //   "Cross-project mention to {}.{} from {}.{} denied by auth table",
+                //   mention_name, mention_project, from_agent, from_project) and continue.
                 tracing::debug!(
                     "Cross-project mention to {}.{} denied by auth table",
                     mention_name, mention_project

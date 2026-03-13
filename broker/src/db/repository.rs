@@ -91,13 +91,13 @@ impl Repository {
     /// Returns empty Vec if no agent has this name. Used for implicit cross-project mention resolution.
     pub fn find_agents_by_name(&self, name: &str) -> Vec<(String, String)> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT name, project FROM agents WHERE name = ?1")
-            .expect("find_agents_by_name query is static — compile-time valid");
+        let mut stmt = match conn.prepare("SELECT name, project FROM agents WHERE name = ?1") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
         stmt.query_map(params![name], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("find_agents_by_name query execution")
-            .filter_map(|r| r.ok())
-            .collect()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     // --- Channels ---

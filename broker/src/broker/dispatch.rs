@@ -28,7 +28,6 @@ pub async fn dispatch_stanza(
     match stanza {
         Stanza::Message(msg) => {
             let id = uuid::Uuid::new_v4().to_string();
-            let resolved_mentions = resolve_mentions(&msg.mentions, from_project, &broker.repo)?;
             match stanza::resolve_destination(&msg.to) {
                 Destination::Agent(ref agent) => {
                     if validate_target {
@@ -41,11 +40,12 @@ pub async fn dispatch_stanza(
                         }
                     }
                     delivery
-                        .deliver(&id, &msg.from, from_project, Some(agent), None, &msg.raw, None, &resolved_mentions)
+                        .deliver(&id, &msg.from, from_project, Some(agent), None, &msg.raw, None, &[])
                         .await
                         .map_err(DispatchError::DeliveryFailed)?;
                 }
                 Destination::Channel(ref channel) => {
+                    let resolved_mentions = resolve_mentions(&msg.mentions, from_project, &broker.repo)?;
                     delivery
                         .deliver(&id, &msg.from, from_project, None, Some(channel), &msg.raw, None, &resolved_mentions)
                         .await
@@ -66,6 +66,7 @@ pub async fn dispatch_stanza(
                             project: target_project,
                         });
                     }
+                    let resolved_mentions = resolve_mentions(&msg.mentions, from_project, &broker.repo)?;
                     delivery
                         .deliver_to_cross_project_channel(
                             &id, &msg.from, from_project, &channel, &target_project, &msg.raw, &resolved_mentions,
@@ -133,7 +134,10 @@ fn resolve_mentions(
         // Step 3–5: global lookup
         let global = repo.find_agents_by_name(mention);
         match global.len() {
-            0 => { /* Step 5: silent skip */ }
+            0 => {
+                    // Step 5: bare name not found locally or globally — silent skip
+                    tracing::debug!("Bare mention '{}' not found in any project — skipped", mention);
+                }
             1 => {
                 // Step 3: unambiguous cross-project resolution
                 let (name, project) = global.into_iter().next().unwrap();
@@ -237,7 +241,7 @@ mod tests {
         repo.register_agent("Ambiguous", "proj-a", "").unwrap();
         repo.register_agent("Ambiguous", "proj-b", "").unwrap();
         let mentions = vec!["Known".to_string(), "Ambiguous".to_string()];
-        // Known resolves fine (local hit), Ambiguous triggers Step 4 → entire batch fails
+        // Known resolves via Step 3 (global unique — not in proj-c), Ambiguous triggers Step 4 → entire batch fails
         let result = resolve_mentions(&mentions, "proj-c", &repo);
         assert!(result.is_err(), "ambiguous mention must abort all resolution");
     }
