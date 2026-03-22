@@ -101,6 +101,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 
     let broker = state.broker.clone();
     let delivery = state.delivery.clone();
+    let rate_limiter = state.rate_limiter.clone();
     let agent_name = name.clone();
     let agent_project = project.clone();
 
@@ -109,6 +110,14 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
+                    // Rate-limit per project — same bucket as HTTP write-path routes.
+                    // Drop the stanza and send an error frame; keep the connection alive.
+                    if !rate_limiter.check(&agent_project) {
+                        tracing::debug!("WS rate limit exceeded for project '{}'", agent_project);
+                        let msg = WsEnvelope::Error { message: "Rate limit exceeded".to_string() };
+                        let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
+                        continue;
+                    }
                     handle_stanza(&text, &agent_name, &agent_project, &broker, &delivery, &err_tx).await;
                 }
                 Message::Close(_) => break,
