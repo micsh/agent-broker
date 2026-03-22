@@ -1,0 +1,16 @@
+ARCH: 0.4
+CONT: mcp
+PATH: mcp/src
+DEP:
+DESC: MCP server (stdio) — exposes broker tools for AI agents (register, presence, send, peek, messages)
+
+MOD: tools
+  FILES: main.rs; tools.rs
+  OWN: BrokerTools; broker_register; broker_presence; broker_send; broker_send_stanza; broker_peek; broker_messages; xml_escape; send_raw
+  BND: MCP adapter only — constructs HTTP requests to broker, formats responses. No business logic.
+  DEP: mcp/session
+
+MOD: session
+  FILE: session.rs
+  OWN: SessionManager; load_key; lookup_identity; credential-persistence; identity-persistence
+  BND: Pure FS + in-memory state — no broker dependencies, no HTTP client logic

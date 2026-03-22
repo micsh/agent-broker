@@ -10,24 +10,46 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Startup configuration loaded from environment variables.
+pub struct BrokerConfig {
+    /// X-Admin-Key secret. None means admin API is disabled.
+    pub admin_key: Option<String>,
+    /// Max requests per second per project on write-path routes. Default: 100.
+    pub rate_limit_rps: u32,
+}
+
 /// Shared application state passed to all route handlers.
 pub struct AppState {
     pub broker: Arc<BrokerState>,
     pub delivery: Arc<DeliveryEngine>,
+    pub config: BrokerConfig,
+    pub rate_limiter: Arc<crate::api::middleware::ProjectRateLimiter>,
 }
 
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/projects/register", post(register_project))
-        .route("/agents/register", post(register_agent))
-        .route("/agents", get(list_agents))
-        .route("/presence", put(update_presence))
+pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    use axum::middleware::from_fn_with_state;
+
+    // Write-path routes — rate-limited per project
+    let write_routes = Router::new()
         .route("/send", post(send_message))
-        .route("/messages", get(get_messages))
-        .route("/messages/peek", get(peek_messages))
+        .route("/presence", put(update_presence))
         .route("/channels/{id}/subscribe", post(subscribe_channel))
         .route("/channels/{id}/unsubscribe", delete(unsubscribe_channel))
-        .route("/health", get(health))
+        .layer(from_fn_with_state(state, crate::api::middleware::rate_limit_middleware));
+
+    // Exempt routes — no rate limiting
+    let exempt_routes = Router::new()
+        .route("/projects/register", post(register_project))
+        .route("/projects/{name}/rotate-key", post(rotate_project_key))
+        .route("/agents/register", post(register_agent))
+        .route("/agents", get(list_agents))
+        .route("/messages", get(get_messages))
+        .route("/messages/peek", get(peek_messages))
+        .route("/health", get(health));
+
+    Router::new()
+        .merge(write_routes)
+        .merge(exempt_routes)
 }
 
 // --- Request/Response types ---
@@ -89,6 +111,16 @@ pub struct PeekResponse {
     pub senders: Vec<PeekSender>,
 }
 
+#[derive(Deserialize)]
+pub struct RotateKeyRequest {
+    pub project_key: String,
+}
+
+#[derive(Serialize)]
+pub struct RotateKeyResponse {
+    pub new_project_key: String,
+}
+
 // --- Handlers ---
 
 async fn health() -> &'static str {
@@ -105,6 +137,21 @@ async fn register_project(
 
     tracing::info!("Project registered: {}", req.name);
     Ok(Json(RegisterProjectResponse { project_key }))
+}
+
+/// POST /projects/{name}/rotate-key — body auth (caller presents current key).
+/// Rotation is atomic: verify-then-update in one repository call.
+/// Suspended projects can still rotate — the key check bypasses the suspend flag.
+/// WS sessions established with the old key remain active until they disconnect.
+async fn rotate_project_key(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(project_name): axum::extract::Path<String>,
+    Json(req): Json<RotateKeyRequest>,
+) -> Result<Json<RotateKeyResponse>, (StatusCode, String)> {
+    let new_key = uuid::Uuid::new_v4().to_string();
+    state.broker.repo.rotate_project_key(&project_name, &req.project_key, &new_key)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    Ok(Json(RotateKeyResponse { new_project_key: new_key }))
 }
 
 /// POST /agents/register -- body auth (first-contact route; caller has no session context yet).

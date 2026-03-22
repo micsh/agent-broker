@@ -1,0 +1,91 @@
+ARCH: 0.4
+SYS: agent-broker
+DESC: Lightweight agent message broker — identity, presence, and message routing for AI agents across projects.
+IGNORE: target/**; tests/**
+
+GUIDE:
+  The broker is a dumb pipe with state — it knows WHO is connected and WHERE
+  messages go, but has zero knowledge of prompts, LLMs, or what agents do.
+  Before editing any file: arch context --file <path>
+  After changes: arch validate && arch index
+  If you change ownership or dependencies: update the container .arch file.
+ENDGUIDE
+
+CONT: api
+CONT: broker
+CONT: db
+CONT: identity
+CONT: stanza
+CONT: mcp
+
+# --- Negative rules (no_dependency) ---
+
+RULE: db-independence
+  TYPE: no_dependency
+  FROM: db
+  TO: api; broker
+  WHY: Database layer must not depend on broker logic or API
+
+RULE: broker-no-api
+  TYPE: no_dependency
+  FROM: broker
+  TO: api
+  WHY: Broker logic must not depend on API layer — API calls broker, not the other way
+
+RULE: identity-independence
+  TYPE: no_dependency
+  FROM: identity
+  TO: api; broker; db; stanza
+  WHY: Identity is a leaf module — pure crypto, no dependencies on other layers
+
+RULE: stanza-independence
+  TYPE: no_dependency
+  FROM: stanza
+  TO: api; broker; db; identity
+  WHY: Stanza parser is a leaf module — pure parsing, no dependencies on other layers
+
+RULE: session-independence
+  TYPE: no_dependency
+  FROM: mcp/session
+  TO: api; broker; db; stanza; identity
+  WHY: SessionManager is a leaf — pure FS + in-memory state, no broker dependencies
+
+# --- Positive rules (restrict_callers_to) ---
+
+RULE: identity-callers
+  TYPE: restrict_callers_to
+  MODULE: identity
+  ALLOWED: db/db; db/repository
+  WHY: Crypto primitives accessed only by persistence layer — db/repository uses hash_key/verify_key_hash directly, db/db owns the connection
+
+RULE: stanza-callers
+  TYPE: restrict_callers_to
+  MODULE: stanza
+  ALLOWED: broker/state; broker/delivery; api/routes; api/ws
+  WHY: Stanza parsing contract used by broker routing layer and API handlers only
+
+RULE: db-callers
+  TYPE: restrict_callers_to
+  MODULE: db
+  ALLOWED: broker/state; broker/delivery; api/routes
+  WHY: Persistence accessed by broker core and API layer (PendingMessage response type)
+
+RULE: broker-callers
+  TYPE: restrict_callers_to
+  MODULE: broker
+  ALLOWED: api/routes; api/ws
+  WHY: Core broker logic exposed only through the API surface
+
+# --- Stories ---
+
+STORY: agent-connects
+  DESC: Agent connects via WebSocket, registers presence, receives pending messages
+  FLOW: api/ws; broker/state; broker/delivery
+
+STORY: agent-sends-message
+  DESC: Agent sends a message to another agent or channel, broker persists and routes
+  FLOW: api/ws; broker/delivery; broker/state
+
+STORY: discover-agents
+  DESC: Client queries which agents are online, filtered by project or state
+  FLOW: api/routes; broker/state

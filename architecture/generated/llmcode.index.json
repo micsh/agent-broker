@@ -1,0 +1,121 @@
+{
+  "files": [
+    {
+      "blocks": [
+        {
+          "file": "routes.rs",
+          "mod_id": "api/routes",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\api\\routes.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "ws.rs",
+          "mod_id": "api/ws",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\api\\ws.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "delivery.rs",
+          "mod_id": "broker/delivery",
+          "source_hash": null,
+          "used_by": [
+            "api/routes",
+            "api/ws"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\broker\\delivery.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "dispatch.rs",
+          "mod_id": "broker/state",
+          "source_hash": null,
+          "used_by": [
+            "api/auth",
+            "api/routes",
+            "api/ws"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\broker\\dispatch.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "repository.rs",
+          "mod_id": "db/repository",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\db\\repository.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "secret.rs",
+          "mod_id": "identity/secret",
+          "source_hash": null,
+          "used_by": [
+            "db/repository"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\identity\\secret.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "tools.rs",
+          "mod_id": "mcp/tools",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\mcp\\tools.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "parser.rs",
+          "mod_id": "stanza/parser",
+          "source_hash": null,
+          "used_by": [
+            "api/ws",
+            "broker/state"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\parser.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "types.rs",
+          "mod_id": "stanza/types",
+          "source_hash": null,
+          "used_by": [
+            "api/routes",
+            "api/ws",
+            "broker/delivery",
+            "broker/state"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\types.llm"
+    }
+  ],
+  "generated_at": "1774206231"
+}

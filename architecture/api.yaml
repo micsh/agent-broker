@@ -6,10 +6,25 @@ modules:
     file: mod.rs
     files:
       - routes.rs
-    owns: [http-endpoints, request-types, response-types]
+    owns: [http-endpoints, request-types, response-types, broker-config, rate-limiter-state]
     depends_on: [broker/state, broker/delivery]
 
   - id: ws
     file: ws.rs
     owns: [websocket-handler, connection-upgrade, live-streaming]
     depends_on: [broker/state, broker/delivery]
+
+  - id: auth
+    file: auth.rs
+    owns: [project-auth, agent-auth, admin-auth]
+    depends_on: []
+
+  - id: middleware
+    file: middleware.rs
+    owns: [rate-limiter, tower-middleware]
+    depends_on: []
+
+  - id: admin
+    file: admin.rs
+    owns: [admin-routes, project-lifecycle]
+    depends_on: [broker/state, db/repository]

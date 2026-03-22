@@ -1,0 +1,19 @@
+FILE: types.rs
+MOD: stanza/types
+ROLE: Stanza routing types and enrichment functions — the core contract layer for all message routing
+EP: resolve_destination; resolve_agent_name; enrich_from; enrich_to_for_remote
+STAB: stable
+INV:
+  - resolve_destination never modifies input — pure function, returns a Destination variant
+  - Destination::CrossProjectChannel only produced when '#' prefix + dot present: '#ch.Proj' → channel='ch', project='Proj'
+  - resolve_agent_name splits at FIRST dot only: 'Name.AITeam.Platform' → ('Name', 'AITeam.Platform')
+  - enrich_from and enrich_to_for_remote scope ALL replacements to the opening tag only (split at first '>')
+  - Body content (everything after first '>') is NEVER modified by any function in this file
+  - enrich_from is idempotent: already-qualified from= passes through unchanged
+  - enrich_to_for_remote is idempotent: already-qualified to= passes through unchanged
+  - ResolvedMention is produced by resolve_mentions (dispatch layer) — delivery layer must not re-resolve
+LOOK: enrich_from tests; enrich_to_for_remote tests; resolve_destination channel/cross-project split logic
+CHK: Run cargo test stanza after any change; verify body-content invariant tests still pass
+CNTR: stanza/types::enrich_from used_by broker/delivery::deliver
+CNTR: stanza/types::resolve_destination used_by broker/state::dispatch_stanza
+CNTR: stanza/types::ResolvedMention compatible_with broker/delivery::deliver_to_mentions

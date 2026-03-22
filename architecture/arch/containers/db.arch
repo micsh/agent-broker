@@ -1,0 +1,21 @@
+ARCH: 0.4
+CONT: db
+PATH: broker/src/db
+DEP: identity
+DESC: SQLite persistence — schema, migrations, repository pattern for all data access
+
+MOD: db
+  FILE: mod.rs
+  OWN: database-connection; sqlite-handle; open; open_memory; migrate
+  BND: Connection management and migration only — no queries beyond DDL
+
+MOD: schema
+  FILE: schema.rs
+  OWN: migrations; table-definitions; ensure_schema
+  BND: Schema DDL only — no DML queries
+
+MOD: repository
+  FILE: repository.rs
+  OWN: Repository; PendingMessage; register_project; register_agent; agent_exists; project_exists; ensure_channel; channel_exists; is_cross_project_allowed; seed_cross_project_default; get_subscribers; subscribe; unsubscribe; insert_message; record_pending; record_delivered; drain_pending; peek_pending; cleanup; find_agents_by_name
+  BND: Pure persistence — all SQL lives here, no business logic
+  DEP: db/db; identity/secret

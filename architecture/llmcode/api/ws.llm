@@ -1,0 +1,18 @@
+FILE: ws.rs
+MOD: api/ws
+ROLE: WebSocket connection handler — upgrade, authenticate, stream pending messages, dispatch incoming stanzas
+EP: handle_ws
+STAB: volatile
+INV:
+  - WS authentication: X-Project, X-Project-Key, X-Agent-Name headers on upgrade — same identity model as HTTP
+  - Qualified from="Name.Project" accepted at WS boundary (ARCH-04 fix): from= is validated by extracting name via resolve_agent_name
+  - On connect: drain_pending messages delivered immediately before live streaming begins
+  - Incoming stanzas dispatched via dispatch_stanza(validate_target=false) — target may not be registered yet
+  - Error frames sent to client on: parse failure, from= mismatch, AmbiguousMention, CrossProjectDenied
+  - On disconnect: broker.disconnect() called — session removed from in-memory map
+  - WS path accepts cross-project channel posts (#channel.Project) — dispatch_stanza handles routing
+LOOK: authentication block; error frame path; drain_pending on connect; handle_stanza from= check
+CHK: cargo test; verify error frame test cases
+CNTR: api/ws::handle_ws depends_on broker/state::authenticate
+CNTR: api/ws::handle_ws depends_on broker/state::dispatch_stanza
+DEPS-ON: broker/state; broker/delivery; stanza/types; stanza/parser

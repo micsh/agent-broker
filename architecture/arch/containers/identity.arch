@@ -1,0 +1,10 @@
+ARCH: 0.4
+CONT: identity
+PATH: broker/src/identity
+DEP:
+DESC: Authentication primitives — key hashing, hash verification
+
+MOD: secret
+  FILES: mod.rs; secret.rs
+  OWN: ensure_broker_secret; hash_key; verify_key_hash
+  BND: Pure crypto — no network, no DB, no stanza concerns

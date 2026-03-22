@@ -29,6 +29,10 @@ impl FromRequestParts<Arc<AppState>> for ProjectAuth {
         if !state.broker.repo.verify_project_key(project, key) {
             return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
         }
+        // F7-E: suspend check is a distinct gate from key verification — 403 not 401
+        if state.broker.repo.is_project_suspended(project) {
+            return Err((StatusCode::FORBIDDEN, "Project is suspended".to_string()));
+        }
         Ok(ProjectAuth {
             project: project.to_string(),
         })
@@ -69,5 +73,33 @@ impl FromRequestParts<Arc<AppState>> for AgentAuth {
             project,
             agent_name: agent_name.to_string(),
         })
+    }
+}
+
+/// Axum extractor for admin routes. Validates X-Admin-Key header against startup config.
+/// Returns 503 if admin API is disabled (BROKER_ADMIN_KEY not set).
+/// Returns 401 if key does not match.
+pub struct AdminAuth;
+
+impl FromRequestParts<Arc<AppState>> for AdminAuth {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let expected = state.config.admin_key.as_deref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Admin API is disabled (BROKER_ADMIN_KEY not configured)".to_string(),
+        ))?;
+        let provided = parts
+            .headers
+            .get("x-admin-key")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((StatusCode::BAD_REQUEST, "Missing X-Admin-Key header".to_string()))?;
+        if provided != expected {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid admin key".to_string()));
+        }
+        Ok(AdminAuth)
     }
 }

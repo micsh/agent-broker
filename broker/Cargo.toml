@@ -1,6 +1,6 @@
 [package]
 name = "agent-broker"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A lightweight agent message broker — identity, presence, and message routing for AI agents across projects."
 
@@ -20,3 +20,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
 dirs = "6"
+governor = { version = "0.6", features = ["dashmap"] }

@@ -118,6 +118,14 @@ impl BrokerState {
         tracing::info!("Agent disconnected: {}.{}", name, project);
     }
 
+    /// Remove all live WS sessions for agents in the given project.
+    /// Must be called BEFORE delete_project() to avoid ghost session delivery during the deletion window.
+    pub async fn disconnect_all_in_project(&self, project: &str) {
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|key, _| key.project != project);
+        tracing::info!("Disconnected all sessions for project '{}'", project);
+    }
+
     /// Update agent presence state.
     pub async fn set_state(&self, name: &str, project: &str, state: AgentState) {
         let key = AgentKey::new(name, project);

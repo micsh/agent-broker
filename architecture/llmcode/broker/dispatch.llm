@@ -1,0 +1,17 @@
+FILE: dispatch.rs
+MOD: broker/state
+ROLE: Stanza dispatch — resolves destination, resolves mentions, routes to delivery engine or updates presence
+EP: dispatch_stanza
+STAB: volatile
+INV:
+  - dispatch_stanza resolves ALL mentions before calling deliver() — fail-fast on AmbiguousMention
+  - If any mention is AmbiguousMention, the entire send is rejected — no partial delivery
+  - CrossProjectChannel path returns early after deliver_to_cross_project_channel — does NOT fall through to deliver()
+  - validate_target=true for HTTP path (agent must exist); validate_target=false for WS path (agent may not yet be registered)
+  - DispatchError variants: TargetNotFound, DeliveryFailed, CrossProjectDenied, CrossProjectNotFound, AmbiguousMention
+  - Cross-project channel auth check fires before channel existence check — 403 before 404
+LOOK: resolve_destination; resolve_mentions; Destination enum variants; DispatchError variants
+CHK: arch fitness after adding new DispatchError variants; cargo test dispatch
+CNTR: broker/state::dispatch_stanza depends_on stanza/types::resolve_destination
+CNTR: broker/state::dispatch_stanza depends_on stanza/types::resolve_mentions
+DEPS-ON: broker/state; broker/delivery; stanza/types; db/repository

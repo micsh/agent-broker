@@ -1,0 +1,19 @@
+FILE: repository.rs
+MOD: db/repository
+ROLE: Central SQL repository — all data access for agents, projects, channels, messages, delivery log, cross-project auth
+EP: Repository::new; register_project; register_agent; agent_exists; project_exists; ensure_channel; channel_exists; is_cross_project_allowed; find_agents_by_name; get_subscribers; drain_pending; peek_pending; insert_message; record_pending; record_delivered; cleanup
+STAB: volatile
+INV:
+  - ALL SQL lives in this file — no queries in any other module
+  - Agent key is always (name, project) composite — no lookup by name alone except find_agents_by_name
+  - find_agents_by_name returns ALL projects with that name — caller decides uniqueness
+  - is_cross_project_allowed: true if ('*', target) OR (source, target) row exists — wildcard-aware single query
+  - register_project calls seed_cross_project_default — new projects always get the '*' sentinel
+  - drain_pending: SELECT then UPDATE in separate Mutex acquisitions (REF-06 — not atomic, known debt)
+  - ensure_channel enforces no-dot constraint on channel names: [\w-]+ only
+  - cleanup: must delete delivery_log entries BEFORE messages (FK constraint)
+LOOK: drain_pending two-step; is_cross_project_allowed query; ensure_channel validation; seed_cross_project_default
+CHK: cargo test repository; verify project-isolation tests; check FK order in cleanup
+CNTR: db/repository::drain_pending must_not modify message body
+CNTR: db/repository::register_project used_by broker/state::register_project
+DEPS-ON: db/db; identity/secret

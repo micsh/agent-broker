@@ -1,0 +1,17 @@
+FILE: routes.rs
+MOD: api/routes
+ROLE: HTTP route handlers — project/agent registration, message send, presence, channel subscribe, message retrieval
+EP: router; register_project; register_agent; send_message; update_presence; get_messages; peek_messages; subscribe_channel; unsubscribe_channel; list_agents; health
+STAB: volatile
+INV:
+  - All auth-gated routes use AgentAuth extractor — agent identity comes from X-Agent-Name header, not request body
+  - send_message validates stanza from= matches authenticated agent (T8b) before dispatching
+  - register_agent enforces no-dot constraint on agent names before calling broker
+  - POST /agents/register is body-auth only (first-contact route — no X-Agent-Name header yet)
+  - AmbiguousMention dispatch error maps to 400 with disambiguation message listing conflicting projects
+  - CrossProjectNotFound maps to 404; CrossProjectDenied maps to 403
+  - PresenceRequest no longer has a name field — name comes from AgentAuth extractor
+LOOK: AgentAuth extractor; send_message T8b check; AmbiguousMention error arm; register_agent dot guard
+CHK: cargo test; arch fitness (api in allowed list for broker-callers, db-callers, stanza-callers)
+CNTR: api/routes::send_message depends_on broker/state::dispatch_stanza
+DEPS-ON: broker/state; broker/delivery; stanza/types

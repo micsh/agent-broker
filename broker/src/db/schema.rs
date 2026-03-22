@@ -73,7 +73,22 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
         );
         ",
     )
-    .map_err(|e| format!("Schema setup failed: {e}"))
+    .map_err(|e| format!("Schema setup failed: {e}"))?;
+
+    // Migration: add status column to projects if absent (idempotent)
+    let has_status: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name = 'status'")
+        .ok()
+        .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+        .is_some();
+    if !has_status {
+        conn.execute_batch(
+            "ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        )
+        .map_err(|e| format!("Migration failed (status column): {e}"))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,0 +1,383 @@
+{
+  "containers": [
+    {
+      "depends_on": [
+        "broker",
+        "db",
+        "identity",
+        "stanza"
+      ],
+      "description": "HTTP + WebSocket API layer — routes, request/response types, auth extractors, WS handlers",
+      "id": "api",
+      "modules": [
+        {
+          "boundary": "HTTP boundary only — no business logic, no SQL",
+          "depends_on": [
+            "broker/state",
+            "broker/delivery",
+            "stanza/types"
+          ],
+          "file": "",
+          "files": [
+            "mod.rs",
+            "routes.rs"
+          ],
+          "id": "api/routes",
+          "owns": [
+            "http-endpoints",
+            "request-types",
+            "response-types",
+            "AppState"
+          ]
+        },
+        {
+          "boundary": "Connection management only — no delivery decisions",
+          "depends_on": [
+            "broker/state",
+            "broker/delivery",
+            "stanza/types",
+            "stanza/parser"
+          ],
+          "file": "ws.rs",
+          "files": [],
+          "id": "api/ws",
+          "owns": [
+            "websocket-handler",
+            "connection-upgrade",
+            "live-streaming",
+            "WS-stanza-dispatch"
+          ]
+        },
+        {
+          "boundary": "Header extraction and credential validation only — no route logic",
+          "depends_on": [
+            "broker/state"
+          ],
+          "file": "auth.rs",
+          "files": [],
+          "id": "api/auth",
+          "owns": [
+            "ProjectAuth",
+            "AgentAuth",
+            "header-extraction",
+            "auth-extractors"
+          ]
+        }
+      ],
+      "path": "broker/src/api"
+    },
+    {
+      "depends_on": [
+        "db",
+        "stanza"
+      ],
+      "description": "Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing",
+      "id": "broker",
+      "modules": [
+        {
+          "boundary": "In-memory state + DB sync — no HTTP/WS concerns",
+          "depends_on": [
+            "db/db",
+            "stanza/types",
+            "stanza/parser"
+          ],
+          "file": "",
+          "files": [
+            "mod.rs",
+            "state.rs",
+            "dispatch.rs"
+          ],
+          "id": "broker/state",
+          "owns": [
+            "agent-sessions",
+            "presence-tracking",
+            "agent-discovery",
+            "channel-broadcast",
+            "stanza-dispatch",
+            "BrokerState",
+            "AgentKey",
+            "dispatch_stanza"
+          ]
+        },
+        {
+          "boundary": "Delivery decisions only — no connection management, no SQL construction",
+          "depends_on": [
+            "db/db",
+            "stanza/types"
+          ],
+          "file": "delivery.rs",
+          "files": [],
+          "id": "broker/delivery",
+          "owns": [
+            "message-delivery",
+            "store-and-forward",
+            "pending-drain",
+            "mention-fan-out",
+            "cross-project-channel-delivery",
+            "DeliveryEngine"
+          ]
+        }
+      ],
+      "path": "broker/src/broker"
+    },
+    {
+      "depends_on": [
+        "identity"
+      ],
+      "description": "SQLite persistence — schema, migrations, repository pattern for all data access",
+      "id": "db",
+      "modules": [
+        {
+          "boundary": "Connection management and migration only — no queries beyond DDL",
+          "depends_on": [],
+          "file": "mod.rs",
+          "files": [],
+          "id": "db/db",
+          "owns": [
+            "database-connection",
+            "sqlite-handle",
+            "open",
+            "open_memory",
+            "migrate"
+          ]
+        },
+        {
+          "boundary": "Schema DDL only — no DML queries",
+          "depends_on": [],
+          "file": "schema.rs",
+          "files": [],
+          "id": "db/schema",
+          "owns": [
+            "migrations",
+            "table-definitions",
+            "ensure_schema"
+          ]
+        },
+        {
+          "boundary": "Pure persistence — all SQL lives here, no business logic",
+          "depends_on": [
+            "db/db",
+            "identity/secret"
+          ],
+          "file": "repository.rs",
+          "files": [],
+          "id": "db/repository",
+          "owns": [
+            "Repository",
+            "PendingMessage",
+            "register_project",
+            "register_agent",
+            "agent_exists",
+            "project_exists",
+            "ensure_channel",
+            "channel_exists",
+            "is_cross_project_allowed",
+            "seed_cross_project_default",
+            "get_subscribers",
+            "subscribe",
+            "unsubscribe",
+            "insert_message",
+            "record_pending",
+            "record_delivered",
+            "drain_pending",
+            "peek_pending",
+            "cleanup",
+            "find_agents_by_name"
+          ]
+        }
+      ],
+      "path": "broker/src/db"
+    },
+    {
+      "depends_on": [],
+      "description": "Authentication primitives — key hashing, hash verification",
+      "id": "identity",
+      "modules": [
+        {
+          "boundary": "Pure crypto — no network, no DB, no stanza concerns",
+          "depends_on": [],
+          "file": "",
+          "files": [
+            "mod.rs",
+            "secret.rs"
+          ],
+          "id": "identity/secret",
+          "owns": [
+            "ensure_broker_secret",
+            "hash_key",
+            "verify_key_hash"
+          ]
+        }
+      ],
+      "path": "broker/src/identity"
+    },
+    {
+      "depends_on": [],
+      "description": "XML stanza parser — extracts routing headers (from, to, type, mentions), preserves raw XML for forwarding",
+      "id": "stanza",
+      "modules": [
+        {
+          "boundary": "Attribute extraction only — body content is opaque, never parsed or modified",
+          "depends_on": [],
+          "file": "",
+          "files": [
+            "mod.rs",
+            "parser.rs"
+          ],
+          "id": "stanza/parser",
+          "owns": [
+            "parse",
+            "parse_message",
+            "parse_presence",
+            "ParseError"
+          ]
+        },
+        {
+          "boundary": "Pure types and routing functions — no I/O, no state, no side effects",
+          "depends_on": [],
+          "file": "types.rs",
+          "files": [],
+          "id": "stanza/types",
+          "owns": [
+            "Stanza",
+            "MessageStanza",
+            "PresenceStanza",
+            "MessageType",
+            "PresenceStatus",
+            "Destination",
+            "ResolvedMention",
+            "resolve_destination",
+            "resolve_agent_name",
+            "enrich_from",
+            "enrich_to_for_remote"
+          ]
+        }
+      ],
+      "path": "broker/src/stanza"
+    },
+    {
+      "depends_on": [],
+      "description": "MCP server (stdio) — exposes broker tools for AI agents (register, presence, send, peek, messages)",
+      "id": "mcp",
+      "modules": [
+        {
+          "boundary": "MCP adapter only — constructs HTTP requests to broker, formats responses. No business logic.",
+          "depends_on": [
+            "mcp/session"
+          ],
+          "file": "",
+          "files": [
+            "main.rs",
+            "tools.rs"
+          ],
+          "id": "mcp/tools",
+          "owns": [
+            "BrokerTools",
+            "broker_register",
+            "broker_presence",
+            "broker_send",
+            "broker_send_stanza",
+            "broker_peek",
+            "broker_messages",
+            "xml_escape",
+            "send_raw"
+          ]
+        },
+        {
+          "boundary": "Pure FS + in-memory state — no broker dependencies, no HTTP client logic",
+          "depends_on": [],
+          "file": "session.rs",
+          "files": [],
+          "id": "mcp/session",
+          "owns": [
+            "SessionManager",
+            "load_key",
+            "lookup_identity",
+            "credential-persistence",
+            "identity-persistence"
+          ]
+        }
+      ],
+      "path": "mcp/src"
+    }
+  ],
+  "rules": [
+    {
+      "id": "db-independence",
+      "reason": "Database layer must not depend on broker logic or API",
+      "type": "no_dependency"
+    },
+    {
+      "id": "broker-no-api",
+      "reason": "Broker logic must not depend on API layer — API calls broker, not the other way",
+      "type": "no_dependency"
+    },
+    {
+      "id": "identity-independence",
+      "reason": "Identity is a leaf module — pure crypto, no dependencies on other layers",
+      "type": "no_dependency"
+    },
+    {
+      "id": "stanza-independence",
+      "reason": "Stanza parser is a leaf module — pure parsing, no dependencies on other layers",
+      "type": "no_dependency"
+    },
+    {
+      "id": "session-independence",
+      "reason": "SessionManager is a leaf — pure FS + in-memory state, no broker dependencies",
+      "type": "no_dependency"
+    },
+    {
+      "id": "identity-callers",
+      "reason": "Crypto primitives accessed only by persistence layer — db/repository uses hash_key/verify_key_hash directly, db/db owns the connection",
+      "type": "restrict_callers_to"
+    },
+    {
+      "id": "stanza-callers",
+      "reason": "Stanza parsing contract used by broker routing layer and API handlers only",
+      "type": "restrict_callers_to"
+    },
+    {
+      "id": "db-callers",
+      "reason": "Persistence accessed by broker core and API layer (PendingMessage response type)",
+      "type": "restrict_callers_to"
+    },
+    {
+      "id": "broker-callers",
+      "reason": "Core broker logic exposed only through the API surface",
+      "type": "restrict_callers_to"
+    }
+  ],
+  "stories": [
+    {
+      "description": "Agent connects via WebSocket, registers presence, receives pending messages",
+      "flow": [
+        "api/ws",
+        "broker/state",
+        "broker/delivery"
+      ],
+      "id": "agent-connects"
+    },
+    {
+      "description": "Agent sends a message to another agent or channel, broker persists and routes",
+      "flow": [
+        "api/ws",
+        "broker/delivery",
+        "broker/state"
+      ],
+      "id": "agent-sends-message"
+    },
+    {
+      "description": "Client queries which agents are online, filtered by project or state",
+      "flow": [
+        "api/routes",
+        "broker/state"
+      ],
+      "id": "discover-agents"
+    }
+  ],
+  "system": {
+    "description": "Lightweight agent message broker — identity, presence, and message routing for AI agents across projects.",
+    "name": "agent-broker"
+  }
+}

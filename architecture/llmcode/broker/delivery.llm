@@ -1,0 +1,20 @@
+FILE: delivery.rs
+MOD: broker/delivery
+ROLE: Message delivery engine — store-and-forward, mention fan-out, cross-project channel delivery
+EP: DeliveryEngine::deliver; DeliveryEngine::deliver_to_cross_project_channel; DeliveryEngine::drain_pending; DeliveryEngine::cleanup
+STAB: volatile
+INV:
+  - deliver() calls enrich_from FIRST, then uses enriched body for all subsequent operations
+  - deliver() stores the message before any fan-out — message is persisted even if all delivery fails
+  - deliver_to_mentions receives Vec<ResolvedMention> — it does NOT call resolve_agent_name
+  - Subscriber exclusion set is HashSet<(String, String)> keyed by (name, project) — bare-name exclusion is a bug
+  - Cross-project mention auth check: silent skip (not error) if denied — consistent with qualified cross-project behaviour
+  - enrich_to_for_remote fires ONLY for CrossProject mentions when mention_project != from_project
+  - drain_pending: SELECT and UPDATE are NOT in a single transaction (known debt REF-06) — not atomic
+  - cleanup: delete delivery_log BEFORE messages — foreign key constraint requires this order
+LOOK: deliver_to_mentions; drain_pending SQL order; cross_project_allowed_sources check
+CHK: cargo test delivery; verify body preservation tests; check enrich_from not applied twice
+UW: None — all Results propagated
+CNTR: broker/delivery::deliver depends_on stanza/types::enrich_from
+CNTR: broker/delivery::deliver_to_mentions depends_on stanza/types::enrich_to_for_remote
+DEPS-ON: broker/state; stanza/types; db/db

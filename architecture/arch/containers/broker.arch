@@ -1,0 +1,17 @@
+ARCH: 0.4
+CONT: broker
+PATH: broker/src/broker
+DEP: db; stanza
+DESC: Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing
+
+MOD: state
+  FILES: mod.rs; state.rs; dispatch.rs
+  OWN: agent-sessions; presence-tracking; agent-discovery; channel-broadcast; stanza-dispatch; BrokerState; AgentKey; dispatch_stanza
+  BND: In-memory state + DB sync — no HTTP/WS concerns
+  DEP: db/db; stanza/types; stanza/parser
+
+MOD: delivery
+  FILE: delivery.rs
+  OWN: message-delivery; store-and-forward; pending-drain; mention-fan-out; cross-project-channel-delivery; DeliveryEngine
+  BND: Delivery decisions only — no connection management, no SQL construction
+  DEP: db/db; stanza/types

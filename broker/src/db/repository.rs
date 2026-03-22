@@ -20,6 +20,32 @@ pub struct PendingMessage {
     pub created_utc: String,
 }
 
+/// Project summary for admin listing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub status: String,
+    pub created_utc: String,
+    pub agent_count: i64,
+    pub pending_count: i64,
+}
+
+/// Per-project statistics for admin inspection.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectStats {
+    pub agent_count: i64,
+    pub message_count: i64,
+    pub pending_count: i64,
+}
+
+/// Broker-wide statistics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrokerStats {
+    pub project_count: i64,
+    pub agent_count: i64,
+    pub pending_count: i64,
+}
+
 impl Repository {
     pub fn new(conn: rusqlite::Connection) -> Self {
         Self { conn: Mutex::new(conn) }
@@ -66,7 +92,191 @@ impl Repository {
             .is_some()
     }
 
-    // --- Agents ---
+    // --- Admin: project status ---
+
+    /// Returns true if the project exists and its status is not 'active'.
+    /// Returns false if the project is not found (caller already checked existence via verify_project_key).
+    pub fn is_project_suspended(&self, name: &str) -> bool {
+        let conn = self.conn();
+        let status: Option<String> = conn
+            .prepare("SELECT status FROM projects WHERE name = ?1")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row(params![name], |row| row.get(0)).ok());
+        match status {
+            Some(s) => s != "active",
+            None => false,
+        }
+    }
+
+    /// Set the status of a project ('active' or 'suspended').
+    /// Returns Err if the project does not exist (0 rows affected).
+    pub fn set_project_status(&self, name: &str, status: &str) -> Result<(), String> {
+        let rows = self.conn().execute(
+            "UPDATE projects SET status = ?1 WHERE name = ?2",
+            params![status, name],
+        ).map_err(|e| format!("Failed to set project status: {e}"))?;
+        if rows == 0 {
+            return Err(format!("Project '{}' not found", name));
+        }
+        Ok(())
+    }
+
+    /// Rotate the project key atomically.
+    /// Verifies the old key via raw hash comparison (bypasses suspend check — suspended projects
+    /// must still be rotatable). Returns Err if the old key is wrong or the project is not found.
+    pub fn rotate_project_key(&self, name: &str, old_key: &str, new_key: &str) -> Result<(), String> {
+        // Raw hash comparison — intentionally does NOT call verify_project_key, which would
+        // return false for suspended projects after the suspend check was added.
+        let stored_hash: Option<String> = {
+            let conn = self.conn();
+            conn.prepare("SELECT key_hash FROM projects WHERE name = ?1")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row(params![name], |row| row.get(0)).ok())
+        };
+        match stored_hash {
+            None => return Err(format!("Project '{}' not found", name)),
+            Some(hash) if !identity::verify_key_hash(old_key, &hash) => {
+                return Err("Invalid current key".to_string());
+            }
+            _ => {}
+        }
+        let new_hash = identity::hash_key(new_key);
+        let rows = self.conn().execute(
+            "UPDATE projects SET key_hash = ?1 WHERE name = ?2",
+            params![new_hash, name],
+        ).map_err(|e| format!("Failed to rotate key: {e}"))?;
+        if rows == 0 {
+            return Err(format!("Project '{}' not found", name));
+        }
+        Ok(())
+    }
+
+    // --- Admin: queries ---
+
+    /// List all projects with summary statistics.
+    pub fn list_projects(&self) -> Vec<ProjectInfo> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT p.name, p.status, p.created_utc,
+                    COUNT(DISTINCT a.name) as agent_count,
+                    COUNT(DISTINCT CASE WHEN dl.status='pending' THEN dl.message_id END) as pending_count
+             FROM projects p
+             LEFT JOIN agents a ON a.project = p.name
+             LEFT JOIN delivery_log dl ON dl.project = p.name
+             GROUP BY p.name
+             ORDER BY p.created_utc ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok(ProjectInfo {
+                name: row.get(0)?,
+                status: row.get(1)?,
+                created_utc: row.get(2)?,
+                agent_count: row.get(3)?,
+                pending_count: row.get(4)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Return statistics for a single project.
+    pub fn project_stats(&self, project: &str) -> ProjectStats {
+        let conn = self.conn();
+        let agent_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM agents WHERE project = ?1")
+            .ok()
+            .and_then(|mut s| s.query_row(params![project], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        let message_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM messages WHERE from_project = ?1")
+            .ok()
+            .and_then(|mut s| s.query_row(params![project], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        let pending_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM delivery_log WHERE project = ?1 AND status = 'pending'")
+            .ok()
+            .and_then(|mut s| s.query_row(params![project], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        ProjectStats { agent_count, message_count, pending_count }
+    }
+
+    /// Return broker-wide aggregate statistics.
+    pub fn get_broker_stats(&self) -> BrokerStats {
+        let conn = self.conn();
+        let project_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM projects")
+            .ok()
+            .and_then(|mut s| s.query_row([], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        let agent_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM agents")
+            .ok()
+            .and_then(|mut s| s.query_row([], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        let pending_count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM delivery_log WHERE status = 'pending'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |r| r.get(0)).ok())
+            .unwrap_or(0);
+        BrokerStats { project_count, agent_count, pending_count }
+    }
+
+    /// Delete a project and all its associated data in a single transaction.
+    /// Cascade order respects FK constraints: delivery_log → messages → subscriptions
+    /// → channels → cross_project_allowed_sources → agents → projects.
+    /// Returns Err if the project is not found.
+    pub fn delete_project(&self, name: &str) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {e}"))?;
+
+        // Remove delivery_log rows referencing messages sent by this project,
+        // plus delivery_log rows for agents within this project.
+        tx.execute(
+            "DELETE FROM delivery_log WHERE project = ?1
+             OR message_id IN (SELECT id FROM messages WHERE from_project = ?1)",
+            params![name],
+        ).map_err(|e| format!("delete_project delivery_log: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM subscriptions WHERE project = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project subscriptions: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM messages WHERE from_project = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project messages: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM channels WHERE project = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project channels: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM cross_project_allowed_sources WHERE source_project = ?1 OR target_project = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project cross_project_allowed_sources: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM agents WHERE project = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project agents: {e}"))?;
+
+        let rows = tx.execute(
+            "DELETE FROM projects WHERE name = ?1",
+            params![name],
+        ).map_err(|e| format!("delete_project projects: {e}"))?;
+
+        tx.commit().map_err(|e| format!("delete_project commit: {e}"))?;
+
+        if rows == 0 {
+            return Err(format!("Project '{}' not found", name));
+        }
+        Ok(())
+    }
 
     /// Register or update an agent within a project.
     pub fn register_agent(&self, name: &str, project: &str, role: &str) -> Result<(), String> {
@@ -476,5 +686,93 @@ mod tests {
         repo.register_agent("Alice", "proj-b", "").unwrap();
         let result = repo.find_agents_by_name("Alice");
         assert_eq!(result.len(), 2, "same name in two projects should return 2 entries; got: {:?}", result);
+    }
+
+    #[test]
+    fn is_project_suspended_returns_false_for_active() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        assert!(!repo.is_project_suspended("proj"), "newly registered project must not be suspended");
+    }
+
+    #[test]
+    fn is_project_suspended_returns_true_after_suspend() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.set_project_status("proj", "suspended").unwrap();
+        assert!(repo.is_project_suspended("proj"), "project must be suspended after set_project_status");
+    }
+
+    #[test]
+    fn set_project_status_returns_err_for_unknown_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        let result = repo.set_project_status("nonexistent", "suspended");
+        assert!(result.is_err(), "set_project_status on unknown project must return Err");
+    }
+
+    #[test]
+    fn rotate_project_key_rejects_wrong_old_key() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "correct-key").unwrap();
+        let result = repo.rotate_project_key("proj", "wrong-key", "new-key");
+        assert!(result.is_err(), "rotate_project_key with wrong old key must return Err");
+        assert!(result.unwrap_err().contains("Invalid current key"));
+    }
+
+    #[test]
+    fn rotate_project_key_succeeds_and_invalidates_old_key() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "old-key").unwrap();
+        repo.rotate_project_key("proj", "old-key", "new-key").unwrap();
+        assert!(!repo.verify_project_key("proj", "old-key"), "old key must be rejected after rotation");
+        assert!(repo.verify_project_key("proj", "new-key"), "new key must be accepted after rotation");
+    }
+
+    #[test]
+    fn rotate_project_key_works_on_suspended_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "old-key").unwrap();
+        repo.set_project_status("proj", "suspended").unwrap();
+        // Suspended project must still allow key rotation
+        let result = repo.rotate_project_key("proj", "old-key", "new-key");
+        assert!(result.is_ok(), "key rotation must succeed on suspended project; got: {:?}", result);
+    }
+
+    #[test]
+    fn delete_project_cascade_removes_all_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "").unwrap();
+        repo.ensure_channel("general", "proj").unwrap();
+        repo.subscribe("Alice", "proj", "general");
+
+        repo.delete_project("proj").unwrap();
+
+        assert!(!repo.project_exists("proj"), "project row must be deleted");
+        assert!(!repo.agent_exists("Alice", "proj"), "agent row must be deleted");
+        assert!(!repo.channel_exists("general", "proj"), "channel row must be deleted");
+    }
+
+    #[test]
+    fn delete_project_returns_err_for_unknown_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        let result = repo.delete_project("nonexistent");
+        assert!(result.is_err(), "delete_project on unknown project must return Err");
     }
 }

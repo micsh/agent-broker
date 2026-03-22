@@ -50,12 +50,24 @@ async fn main() {
         }
     });
 
+    let config = api::routes::BrokerConfig {
+        admin_key: std::env::var("BROKER_ADMIN_KEY").ok(),
+        rate_limit_rps: std::env::var("RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+    };
+    let rate_limiter = Arc::new(api::middleware::ProjectRateLimiter::new(config.rate_limit_rps));
+
     let app_state = Arc::new(AppState {
         broker: broker_state,
         delivery,
+        config,
+        rate_limiter,
     });
 
-    let app = api::http_router()
+    let app = api::http_router(app_state.clone())
+        .nest("/admin", api::admin_router())
         .route("/ws", axum::routing::get(api::handle_ws))
         .with_state(app_state);
 

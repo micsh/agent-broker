@@ -1,0 +1,15 @@
+FILE: parser.rs
+MOD: stanza/parser
+ROLE: Single-stanza XML parser — extracts routing headers from opening tag, preserves raw XML verbatim
+EP: parse
+STAB: stable
+INV:
+  - parse() extracts only from=, to=, type=, status=, mentions= attributes
+  - The 'raw' field in MessageStanza/PresenceStanza is the ORIGINAL input string — never modified
+  - Attribute values are captured by [^"]* — handles dots, hyphens, any non-quote char including qualified addresses
+  - Malformed body content (unclosed tags, angle brackets, XML snippets) does not cause parse failure — body is opaque
+  - ATTR_RE uses LazyLock — compiled once, thread-safe
+  - mentions= is comma-split; empty elements filtered; empty string → empty Vec
+LOOK: ATTR_RE pattern; parse_attrs; require_attr
+CHK: cargo test parser; verify raw preservation tests pass
+UW: Regex::new(...).unwrap() — pattern is a compile-time constant, safe to unwrap
