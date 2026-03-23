@@ -3,10 +3,34 @@
     {
       "blocks": [
         {
+          "file": "admin.rs",
+          "mod_id": "api/admin",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\api\\admin.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "middleware.rs",
+          "mod_id": "api/middleware",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\api\\middleware.llm"
+    },
+    {
+      "blocks": [
+        {
           "file": "routes.rs",
           "mod_id": "api/routes",
           "source_hash": null,
-          "used_by": []
+          "used_by": [
+            "api/middleware"
+          ]
         }
       ],
       "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\api\\routes.llm"
@@ -43,6 +67,7 @@
           "mod_id": "broker/state",
           "source_hash": null,
           "used_by": [
+            "api/admin",
             "api/auth",
             "api/routes",
             "api/ws"
@@ -117,5 +142,5 @@
       "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\types.llm"
     }
   ],
-  "generated_at": "1774206231"
+  "generated_at": "1774246766"
 }

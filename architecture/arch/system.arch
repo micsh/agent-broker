@@ -67,8 +67,8 @@ RULE: stanza-callers
 RULE: db-callers
   TYPE: restrict_callers_to
   MODULE: db
-  ALLOWED: broker/state; broker/delivery; api/routes
-  WHY: Persistence accessed by broker core and API layer (PendingMessage response type)
+  ALLOWED: broker/state; broker/delivery; api/routes; api/admin
+  WHY: Persistence accessed by broker core and API layer (PendingMessage, ProjectInfo, BrokerStats response types). NOTE: aspirational direction is broker-only — direct db type imports in api/* are a known boundary smell (REF-04)
 
 RULE: broker-callers
   TYPE: restrict_callers_to

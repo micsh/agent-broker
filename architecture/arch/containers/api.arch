@@ -19,6 +19,18 @@ MOD: ws
 
 MOD: auth
   FILE: auth.rs
-  OWN: ProjectAuth; AgentAuth; header-extraction; auth-extractors
+  OWN: ProjectAuth; AgentAuth; AdminAuth; header-extraction; auth-extractors
   BND: Header extraction and credential validation only — no route logic
   DEP: broker/state
+
+MOD: admin
+  FILE: admin.rs
+  OWN: admin_router; list_projects; get_stats; project_stats; delete_project; suspend_project; unsuspend_project
+  BND: Operator-level management only — no tenant routing or delivery logic
+  DEP: broker/state; api/auth
+
+MOD: middleware
+  FILE: middleware.rs
+  OWN: ProjectRateLimiter; rate_limit_middleware
+  BND: Rate limiting only — reads X-Project header, no broker or DB calls
+  DEP: api/routes
