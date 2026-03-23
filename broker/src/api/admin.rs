@@ -1,6 +1,6 @@
 use crate::api::auth::AdminAuth;
 use crate::api::routes::AppState;
-use crate::db::repository::{BrokerStats, ProjectInfo, ProjectStats};
+use crate::db::repository::{BrokerStats, ProjectInfo, ProjectStats, ProjectStatus};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -50,7 +50,7 @@ async fn suspend_project(
     _auth: AdminAuth,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.repo.set_project_status(&name, "suspended")
+    state.broker.repo.set_project_status(&name, ProjectStatus::Suspended)
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     Ok(StatusCode::OK)
 }
@@ -60,7 +60,7 @@ async fn unsuspend_project(
     _auth: AdminAuth,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.repo.set_project_status(&name, "active")
+    state.broker.repo.set_project_status(&name, ProjectStatus::Active)
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     Ok(StatusCode::OK)
 }

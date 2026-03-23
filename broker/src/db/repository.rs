@@ -46,6 +46,22 @@ pub struct BrokerStats {
     pub pending_count: i64,
 }
 
+/// Project lifecycle status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectStatus {
+    Active,
+    Suspended,
+}
+
+impl ProjectStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProjectStatus::Active => "active",
+            ProjectStatus::Suspended => "suspended",
+        }
+    }
+}
+
 impl Repository {
     pub fn new(conn: rusqlite::Connection) -> Self {
         Self { conn: Mutex::new(conn) }
@@ -94,8 +110,8 @@ impl Repository {
 
     // --- Admin: project status ---
 
-    /// Returns true if the project exists and its status is not 'active'.
-    /// Returns false if the project is not found (caller already checked existence via verify_project_key).
+    /// Returns true if the project exists and its status is `Suspended`.
+    /// Returns false if the project is not found.
     pub fn is_project_suspended(&self, name: &str) -> bool {
         let conn = self.conn();
         let status: Option<String> = conn
@@ -103,17 +119,17 @@ impl Repository {
             .ok()
             .and_then(|mut stmt| stmt.query_row(params![name], |row| row.get(0)).ok());
         match status {
-            Some(s) => s != "active",
+            Some(s) => s == ProjectStatus::Suspended.as_str(),
             None => false,
         }
     }
 
-    /// Set the status of a project ('active' or 'suspended').
+    /// Set the status of a project.
     /// Returns Err if the project does not exist (0 rows affected).
-    pub fn set_project_status(&self, name: &str, status: &str) -> Result<(), String> {
+    pub fn set_project_status(&self, name: &str, status: ProjectStatus) -> Result<(), String> {
         let rows = self.conn().execute(
             "UPDATE projects SET status = ?1 WHERE name = ?2",
-            params![status, name],
+            params![status.as_str(), name],
         ).map_err(|e| format!("Failed to set project status: {e}"))?;
         if rows == 0 {
             return Err(format!("Project '{}' not found", name));
@@ -229,6 +245,11 @@ impl Repository {
     /// → channels → cross_project_allowed_sources → agents → projects.
     /// Returns Err if the project is not found.
     pub fn delete_project(&self, name: &str) -> Result<(), String> {
+        // Check existence before opening a transaction — no transaction needed for a missing project.
+        if !self.project_exists(name) {
+            return Err(format!("Project '{}' not found", name));
+        }
+
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {e}"))?;
 
@@ -265,16 +286,12 @@ impl Repository {
             params![name],
         ).map_err(|e| format!("delete_project agents: {e}"))?;
 
-        let rows = tx.execute(
+        let _ = tx.execute(
             "DELETE FROM projects WHERE name = ?1",
             params![name],
         ).map_err(|e| format!("delete_project projects: {e}"))?;
 
         tx.commit().map_err(|e| format!("delete_project commit: {e}"))?;
-
-        if rows == 0 {
-            return Err(format!("Project '{}' not found", name));
-        }
         Ok(())
     }
 
@@ -703,7 +720,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
         repo.register_project("proj", "key").unwrap();
-        repo.set_project_status("proj", "suspended").unwrap();
+        repo.set_project_status("proj", ProjectStatus::Suspended).unwrap();
         assert!(repo.is_project_suspended("proj"), "project must be suspended after set_project_status");
     }
 
@@ -712,7 +729,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
-        let result = repo.set_project_status("nonexistent", "suspended");
+        let result = repo.set_project_status("nonexistent", ProjectStatus::Suspended);
         assert!(result.is_err(), "set_project_status on unknown project must return Err");
     }
 
@@ -744,7 +761,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
         repo.register_project("proj", "old-key").unwrap();
-        repo.set_project_status("proj", "suspended").unwrap();
+        repo.set_project_status("proj", ProjectStatus::Suspended).unwrap();
         // Suspended project must still allow key rotation
         let result = repo.rotate_project_key("proj", "old-key", "new-key");
         assert!(result.is_ok(), "key rotation must succeed on suspended project; got: {:?}", result);

@@ -167,6 +167,11 @@ async fn register_agent(
         return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", req.project)));
     }
 
+    // Suspended projects cannot register new agents — consistent with ProjectAuth gate
+    if state.broker.repo.is_project_suspended(&req.project) {
+        return Err((StatusCode::FORBIDDEN, "Project is suspended".to_string()));
+    }
+
     // Reject names containing '.' to prevent resolve_agent_name misrouting
     if req.name.contains('.') {
         return Err((
