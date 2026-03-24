@@ -1,8 +1,8 @@
 ARCH: 0.4
 CONT: broker
 PATH: broker/src/broker
-DEP: db; stanza
-DESC: Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing
+DEP: db; stanza; identity
+DESC: Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing, nonce store
 
 MOD: state
   FILES: mod.rs; state.rs; dispatch.rs
@@ -15,3 +15,9 @@ MOD: delivery
   OWN: message-delivery; store-and-forward; pending-drain; mention-fan-out; cross-project-channel-delivery; DeliveryEngine
   BND: Delivery decisions only — no connection management, no SQL construction
   DEP: db/db; stanza/types
+
+MOD: nonce
+  FILE: nonce.rs
+  OWN: NonceStore; nonce-issuance; nonce-consumption; nonce-eviction
+  BND: In-memory challenge nonce management — stateful, belongs in broker layer not identity layer
+  DEP: identity/ed25519

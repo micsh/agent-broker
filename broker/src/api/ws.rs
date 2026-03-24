@@ -18,37 +18,59 @@ pub async fn handle_ws(
 }
 
 /// JSON envelopes for the WebSocket control plane.
-/// After Connect/Connected handshake, all data is raw stanza XML.
+/// After Connected handshake, all data is raw stanza XML.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsEnvelope {
-    /// Client → Broker: authenticate with project key
+    /// Legacy: Client → Broker: authenticate with project key.
+    /// Deprecated — agents should register a public key and use Hello.
     Connect {
         name: String,
         project: String,
         project_key: String,
     },
-    /// Broker → Client: auth success + pending count
+    /// New: Client → Broker: initiate Ed25519 challenge-response handshake.
+    Hello {
+        name: String,
+        project: String,
+    },
+    /// Broker → Client: challenge bytes for Ed25519 signing.
+    Challenge {
+        /// 32-byte nonce as lowercase hex string.
+        nonce: String,
+        /// Unix timestamp (seconds) when challenge was issued. Client includes in signed payload.
+        timestamp: u64,
+        /// Connection-scoped session UUID. Included in signed payload.
+        session_id: String,
+    },
+    /// New: Client → Broker: signed challenge response.
+    Auth {
+        /// Ed25519 signature over canonical payload as lowercase hex string.
+        signature: String,
+    },
+    /// Broker → Client: auth success + pending count.
     Connected {
         session_id: String,
         pending_count: usize,
     },
-    /// Broker → Client: error notification
+    /// Broker → Client: error notification.
     Error {
         message: String,
+        /// Structured error code for machine-readable handling. None for non-auth errors.
+        /// AUTH_WRONG_KEY  — wrong private key (config error).
+        /// AUTH_STALE      — nonce expired or clock skew (retry).
+        /// AUTH_INVALID_CREDS — project key wrong or agent not found.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
     },
 }
 
 async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
-    let (name, project, session_id) = match wait_for_connect(&mut receiver, &state).await {
+    let (name, project, session_id) = match wait_for_connect(&mut sender, &mut receiver, &state).await {
         Some(info) => info,
-        None => {
-            let err = WsEnvelope::Error { message: "Authentication failed".to_string() };
-            let _ = sender.send(Message::Text(serde_json::to_string(&err).unwrap().into())).await;
-            return;
-        }
+        None => return, // error already sent inside auth helpers
     };
 
     // Register live connection FIRST — so messages arriving during pending drain are buffered in rx
@@ -114,7 +136,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
                     // Drop the stanza and send an error frame; keep the connection alive.
                     if !rate_limiter.check(&agent_project) {
                         tracing::debug!("WS rate limit exceeded for project '{}'", agent_project);
-                        let msg = WsEnvelope::Error { message: "Rate limit exceeded".to_string() };
+                        let msg = WsEnvelope::Error { message: "Rate limit exceeded".to_string(), error_code: None };
                         let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
                         continue;
                     }
@@ -135,27 +157,156 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket closed: {}.{}", name, project);
 }
 
+/// Authenticate the WebSocket client. Handles both Ed25519 (Hello→Challenge→Auth) and
+/// legacy project-key (Connect) flows. Returns (name, project, session_id) on success.
+/// Sends Challenge (Ed25519 path) or Error frames directly via sender.
 async fn wait_for_connect(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures::stream::SplitStream<WebSocket>,
     state: &Arc<AppState>,
 ) -> Option<(String, String, String)> {
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(text) = msg {
-            if let Ok(WsEnvelope::Connect { name, project, project_key }) =
-                serde_json::from_str::<WsEnvelope>(&text)
-            {
-                if let Err(reason) = state.broker.authenticate(&name, &project, &project_key) {
-                    tracing::warn!("WS auth failed for {}.{}: {}", name, project, reason);
-                    return None;
-                }
+    let text = recv_text(receiver).await?;
+    match serde_json::from_str::<WsEnvelope>(&text).ok()? {
+        WsEnvelope::Hello { name, project } => {
+            handle_hello_auth(sender, receiver, state, name, project).await
+        }
+        WsEnvelope::Connect { name, project, project_key } => {
+            handle_legacy_auth(sender, state, name, project, project_key).await
+        }
+        _ => None, // unexpected envelope type — drop connection
+    }
+}
 
-                let session_id = uuid::Uuid::new_v4().to_string();
-                tracing::info!("WS connected: {}.{}", name, project);
-                return Some((name, project, session_id));
-            }
+/// Receive a single Text message from the WS stream. Returns None on close or non-text.
+async fn recv_text(receiver: &mut futures::stream::SplitStream<WebSocket>) -> Option<String> {
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(t) => return Some(t.to_string()),
+            Message::Close(_) => return None,
+            _ => continue,
         }
     }
     None
+}
+
+/// Send a WsEnvelope frame via the sender. Returns false if serialization or send failed.
+async fn send_envelope(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    env: &WsEnvelope,
+) -> bool {
+    match serde_json::to_string(env) {
+        Ok(json) => sender.send(Message::Text(json.into())).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Ed25519 challenge-response path. Called when client sends Hello.
+async fn handle_hello_auth(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+    state: &Arc<AppState>,
+    name: String,
+    project: String,
+) -> Option<(String, String, String)> {
+    // Agent must exist
+    if !state.broker.repo.agent_exists(&name, &project) {
+        tracing::warn!("Hello from unregistered agent {}.{}", name, project);
+        let _ = send_envelope(sender, &WsEnvelope::Error {
+            message: "Agent not registered".to_string(),
+            error_code: Some("AUTH_INVALID_CREDS".to_string()),
+        }).await;
+        return None;
+    }
+
+    // Must have a public key — no silent fallback within the Hello path
+    let pubkey_hex = match state.broker.repo.get_agent_public_key(&name, &project) {
+        Some(k) => k,
+        None => {
+            tracing::warn!(
+                "Hello from {}.{} — no public key registered. Use Connect for project-key auth.",
+                name, project
+            );
+            let _ = send_envelope(sender, &WsEnvelope::Error {
+                message: "No public key registered — use project-key auth (Connect)".to_string(),
+                error_code: Some("AUTH_INVALID_CREDS".to_string()),
+            }).await;
+            return None;
+        }
+    };
+
+    // Issue challenge
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (nonce_bytes, _payload, timestamp) = state.broker.nonce_store.issue(&session_id, &name, &project);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    if !send_envelope(sender, &WsEnvelope::Challenge {
+        nonce: nonce_hex.clone(),
+        timestamp,
+        session_id: session_id.clone(),
+    }).await {
+        return None;
+    }
+
+    // Receive Auth response
+    let auth_text = recv_text(receiver).await?;
+    let signature_hex = match serde_json::from_str::<WsEnvelope>(&auth_text).ok()? {
+        WsEnvelope::Auth { signature } => signature,
+        _ => return None,
+    };
+
+    // Consume nonce — retrieves stored canonical payload; None means expired
+    let payload = match state.broker.nonce_store.consume(&nonce_hex) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("Stale nonce from {}.{}", name, project);
+            let _ = send_envelope(sender, &WsEnvelope::Error {
+                message: "Challenge expired — reconnect and retry".to_string(),
+                error_code: Some("AUTH_STALE".to_string()),
+            }).await;
+            return None;
+        }
+    };
+
+    // Verify signature
+    match crate::identity::verify_agent_signature(&pubkey_hex, &payload, &signature_hex) {
+        Ok(()) => {
+            tracing::info!("Ed25519 auth: {}.{} authenticated", name, project);
+            Some((name, project, session_id))
+        }
+        Err(_) => {
+            tracing::warn!("Bad signature from {}.{}", name, project);
+            let _ = send_envelope(sender, &WsEnvelope::Error {
+                message: "Signature verification failed — wrong private key".to_string(),
+                error_code: Some("AUTH_WRONG_KEY".to_string()),
+            }).await;
+            None
+        }
+    }
+}
+
+/// Legacy project-key path. Called when client sends Connect.
+async fn handle_legacy_auth(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    state: &Arc<AppState>,
+    name: String,
+    project: String,
+    project_key: String,
+) -> Option<(String, String, String)> {
+    tracing::warn!(
+        "Deprecated project-key WS auth for {}.{} — register a public key via POST /agents/register",
+        name, project
+    );
+    if let Err(reason) = state.broker.authenticate(&name, &project, &project_key) {
+        tracing::warn!("Legacy auth failed for {}.{}: {}", name, project, reason);
+        let _ = send_envelope(sender, &WsEnvelope::Error {
+            message: reason,
+            error_code: Some("AUTH_INVALID_CREDS".to_string()),
+        }).await;
+        return None;
+    }
+    let session_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!("WS connected (legacy auth): {}.{}", name, project);
+    Some((name, project, session_id))
 }
 
 /// Handle an incoming stanza from an authenticated WebSocket client.
@@ -172,7 +323,7 @@ async fn handle_stanza(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("Invalid stanza from {}.{}: {}", agent_name, agent_project, e);
-            let msg = WsEnvelope::Error { message: format!("Invalid stanza: {e}") };
+            let msg = WsEnvelope::Error { message: format!("Invalid stanza: {e}"), error_code: None };
             let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
             return;
         }
@@ -191,6 +342,7 @@ async fn handle_stanza(
         );
         let msg = WsEnvelope::Error {
             message: "Stanza 'from' does not match authenticated identity".to_string(),
+            error_code: None,
         };
         let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
         return;
@@ -209,6 +361,7 @@ async fn handle_stanza(
                         name,
                         projects.join(", ")
                     ),
+                    error_code: None,
                 };
                 let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
             }

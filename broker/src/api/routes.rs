@@ -42,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/projects/register", post(register_project))
         .route("/projects/{name}/rotate-key", post(rotate_project_key))
         .route("/agents/register", post(register_agent))
+        .route("/agents/{name}/rekey", post(rekey_agent))
         .route("/agents", get(list_agents))
         .route("/messages", get(get_messages))
         .route("/messages/peek", get(peek_messages))
@@ -71,11 +72,18 @@ pub struct RegisterAgentRequest {
     pub project_key: String,
     #[serde(default)]
     pub role: String,
+    /// Optional Ed25519 public key (64 hex chars = 32 bytes) for challenge-response WS auth.
+    /// If provided, the agent will be enrolled at registration time (TOFU: first registration wins).
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct RegisterAgentResponse {
     pub session_id: String,
+    /// Present when no public key was provided — encourages Ed25519 enrollment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecation_notice: Option<String>,
 }
 
 /// Presence update payload -- agent identity comes from AgentAuth extractor.
@@ -121,6 +129,20 @@ pub struct RotateKeyResponse {
     pub new_project_key: String,
 }
 
+/// POST /agents/{name}/rekey — body auth (project key proves project ownership).
+/// Replaces the agent's registered Ed25519 public key.
+#[derive(Deserialize)]
+pub struct RekeyRequest {
+    pub project: String,
+    pub project_key: String,
+    pub public_key: String,
+}
+
+#[derive(Serialize)]
+pub struct RekeyResponse {
+    pub enrolled: bool,
+}
+
 // --- Handlers ---
 
 async fn health() -> &'static str {
@@ -154,6 +176,31 @@ async fn rotate_project_key(
     Ok(Json(RotateKeyResponse { new_project_key: new_key }))
 }
 
+/// POST /agents/{name}/rekey — body auth (project key proves project ownership).
+/// Replaces the agent's registered Ed25519 public key.
+/// IMPORTANT: The project key holder can re-enroll any agent in the project.
+/// Agent-level self-authorization (signing with old key) is a v2 consideration.
+async fn rekey_agent(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(agent_name): axum::extract::Path<String>,
+    Json(req): Json<RekeyRequest>,
+) -> Result<Json<RekeyResponse>, (StatusCode, String)> {
+    // Body auth — verify project key (includes suspend check)
+    if !state.broker.repo.verify_project_key(&req.project, &req.project_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
+    }
+    // Validate public key format: must decode as exactly 32 bytes
+    hex::decode(&req.public_key)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .ok_or((StatusCode::BAD_REQUEST, "public_key must be 64-hex-char Ed25519 public key".to_string()))?;
+    // Set key
+    state.broker.repo.set_agent_public_key(&agent_name, &req.project, &req.public_key)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    tracing::info!("Public key rekeyed for {}.{}", agent_name, req.project);
+    Ok(Json(RekeyResponse { enrolled: true }))
+}
+
 /// POST /agents/register -- body auth (first-contact route; caller has no session context yet).
 async fn register_agent(
     State(state): State<Arc<AppState>>,
@@ -183,11 +230,29 @@ async fn register_agent(
     state.broker.repo.register_agent(&req.name, &req.project, &req.role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Enroll Ed25519 public key if provided (TOFU: first registration wins on INSERT OR REPLACE)
+    if let Some(ref pk) = req.public_key {
+        // Validate: must decode as exactly 32 bytes
+        hex::decode(pk)
+            .ok()
+            .filter(|b| b.len() == 32)
+            .ok_or((StatusCode::BAD_REQUEST, "public_key must be 64-hex-char Ed25519 public key".to_string()))?;
+        state.broker.repo.set_agent_public_key(&req.name, &req.project, pk)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        tracing::info!("Ed25519 public key enrolled for {}.{}", req.name, req.project);
+    }
+
     // NOTE: this is a correlation ID only -- live sessions are created exclusively on WS handshake.
     let session_id = uuid::Uuid::new_v4().to_string();
 
+    let deprecation_notice = if req.public_key.is_none() {
+        Some("Ed25519 public key auth is available. Register a public key to use challenge-response WS auth.".to_string())
+    } else {
+        None
+    };
+
     tracing::info!("Agent registered: {}.{}", req.name, req.project);
-    Ok(Json(RegisterAgentResponse { session_id }))
+    Ok(Json(RegisterAgentResponse { session_id, deprecation_notice }))
 }
 
 async fn list_agents(

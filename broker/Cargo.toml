@@ -21,3 +21,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
 dirs = "6"
 governor = { version = "0.6", features = ["dashmap"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+rand = "0.8"

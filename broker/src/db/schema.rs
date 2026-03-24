@@ -88,6 +88,18 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("Migration failed (status column): {e}"))?;
     }
 
+    // Migration: add public_key column to agents if absent (idempotent).
+    // NULL means no public key registered — project-key-only agent.
+    let has_pubkey: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'public_key'")
+        .ok()
+        .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+        .is_some();
+    if !has_pubkey {
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN public_key TEXT")
+            .map_err(|e| format!("Migration failed (public_key column): {e}"))?;
+    }
+
     Ok(())
 }
 

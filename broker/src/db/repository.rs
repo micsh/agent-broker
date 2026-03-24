@@ -314,6 +314,33 @@ impl Repository {
             .is_some()
     }
 
+    /// Get the registered Ed25519 public key (hex) for an agent.
+    /// Returns None if the agent is not found or has no public key registered.
+    pub fn get_agent_public_key(&self, name: &str, project: &str) -> Option<String> {
+        let conn = self.conn();
+        conn.prepare("SELECT public_key FROM agents WHERE name = ?1 AND project = ?2")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row(params![name, project], |row| row.get::<_, Option<String>>(0))
+                    .ok()
+                    .flatten()
+            })
+    }
+
+    /// Set (or replace) the registered Ed25519 public key (hex) for an agent.
+    /// Returns Err if the agent is not found (0 rows affected).
+    pub fn set_agent_public_key(&self, name: &str, project: &str, public_key_hex: &str) -> Result<(), String> {
+        let rows = self.conn().execute(
+            "UPDATE agents SET public_key = ?1 WHERE name = ?2 AND project = ?3",
+            params![public_key_hex, name, project],
+        ).map_err(|e| format!("Failed to set public key: {e}"))?;
+        if rows == 0 {
+            Err(format!("Agent '{}' not found in project '{}'", name, project))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Find all (name, project) pairs with the given name across all projects.
     /// Returns empty Vec if no agent has this name. Used for implicit cross-project mention resolution.
     pub fn find_agents_by_name(&self, name: &str) -> Vec<(String, String)> {

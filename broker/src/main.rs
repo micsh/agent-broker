@@ -37,8 +37,9 @@ async fn main() {
     let broker_state = Arc::new(BrokerState::new(repo));
     let delivery = Arc::new(DeliveryEngine::new(broker_state.clone()));
 
-    // Periodic cleanup: delivered messages after 6h, pending after 7 days
+    // Periodic cleanup: delivered messages after 6h, pending after 7 days; expired nonces hourly
     let cleanup_delivery = delivery.clone();
+    let broker_state_for_cleanup = broker_state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
@@ -47,6 +48,7 @@ async fn main() {
             if delivered > 0 || pending > 0 {
                 tracing::info!("Cleanup: removed {delivered} delivered, {pending} expired pending messages");
             }
+            broker_state_for_cleanup.nonce_store.evict_expired();
         }
     });
 

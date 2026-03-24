@@ -102,9 +102,10 @@
     {
       "depends_on": [
         "db",
-        "stanza"
+        "stanza",
+        "identity"
       ],
-      "description": "Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing",
+      "description": "Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing, nonce store",
       "id": "broker",
       "modules": [
         {
@@ -148,6 +149,21 @@
             "mention-fan-out",
             "cross-project-channel-delivery",
             "DeliveryEngine"
+          ]
+        },
+        {
+          "boundary": "In-memory challenge nonce management — stateful, belongs in broker layer not identity layer",
+          "depends_on": [
+            "identity/ed25519"
+          ],
+          "file": "nonce.rs",
+          "files": [],
+          "id": "broker/nonce",
+          "owns": [
+            "NonceStore",
+            "nonce-issuance",
+            "nonce-consumption",
+            "nonce-eviction"
           ]
         }
       ],
@@ -223,7 +239,7 @@
     },
     {
       "depends_on": [],
-      "description": "Authentication primitives — key hashing, hash verification",
+      "description": "Authentication primitives — key hashing, hash verification, Ed25519 signature verification",
       "id": "identity",
       "modules": [
         {
@@ -239,6 +255,18 @@
             "ensure_broker_secret",
             "hash_key",
             "verify_key_hash"
+          ]
+        },
+        {
+          "boundary": "Pure crypto — deterministic, no state, no randomness, no DB",
+          "depends_on": [],
+          "file": "ed25519.rs",
+          "files": [],
+          "id": "identity/ed25519",
+          "owns": [
+            "build_challenge_payload",
+            "verify_agent_signature",
+            "VerifyError"
           ]
         }
       ],
@@ -362,7 +390,7 @@
     },
     {
       "id": "identity-callers",
-      "reason": "Crypto primitives accessed only by persistence layer — db/repository uses hash_key/verify_key_hash directly, db/db owns the connection",
+      "reason": "Crypto primitives used by persistence layer (hash_key/verify_key_hash), nonce store (build_challenge_payload), and WS auth handler (verify_agent_signature)",
       "type": "restrict_callers_to"
     },
     {

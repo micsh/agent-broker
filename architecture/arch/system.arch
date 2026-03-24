@@ -55,8 +55,8 @@ RULE: session-independence
 RULE: identity-callers
   TYPE: restrict_callers_to
   MODULE: identity
-  ALLOWED: db/db; db/repository
-  WHY: Crypto primitives accessed only by persistence layer — db/repository uses hash_key/verify_key_hash directly, db/db owns the connection
+  ALLOWED: db/db; db/repository; broker/nonce; api/ws
+  WHY: Crypto primitives used by persistence layer (hash_key/verify_key_hash), nonce store (build_challenge_payload), and WS auth handler (verify_agent_signature)
 
 RULE: stanza-callers
   TYPE: restrict_callers_to

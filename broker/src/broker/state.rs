@@ -1,3 +1,4 @@
+use crate::broker::nonce::NonceStore;
 use crate::db::Repository;
 use crate::stanza::PresenceStatus;
 use std::collections::HashMap;
@@ -63,6 +64,8 @@ impl AgentKey {
 pub struct BrokerState {
     pub(crate) repo: Arc<Repository>,
     pub sessions: RwLock<HashMap<AgentKey, AgentSession>>,
+    /// In-memory nonce store for Ed25519 challenge-response handshakes.
+    pub nonce_store: NonceStore,
 }
 
 impl BrokerState {
@@ -70,6 +73,7 @@ impl BrokerState {
         Self {
             repo,
             sessions: RwLock::new(HashMap::new()),
+            nonce_store: NonceStore::new(),
         }
     }
 
