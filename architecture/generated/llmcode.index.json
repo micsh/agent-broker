@@ -79,6 +79,17 @@
     {
       "blocks": [
         {
+          "file": "nonce.rs",
+          "mod_id": "broker/nonce",
+          "source_hash": null,
+          "used_by": []
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\broker\\nonce.llm"
+    },
+    {
+      "blocks": [
+        {
           "file": "repository.rs",
           "mod_id": "db/repository",
           "source_hash": null,
@@ -86,6 +97,19 @@
         }
       ],
       "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\db\\repository.llm"
+    },
+    {
+      "blocks": [
+        {
+          "file": "ed25519.rs",
+          "mod_id": "identity/ed25519",
+          "source_hash": null,
+          "used_by": [
+            "broker/nonce"
+          ]
+        }
+      ],
+      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\identity\\ed25519.llm"
     },
     {
       "blocks": [
@@ -142,5 +166,5 @@
       "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\types.llm"
     }
   ],
-  "generated_at": "1774352748"
+  "generated_at": "1774353364"
 }

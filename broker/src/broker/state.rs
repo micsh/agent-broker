@@ -92,6 +92,10 @@ impl BrokerState {
     // --- Session management ---
 
     /// Register an agent connection. Returns a broadcast receiver for live messages.
+    ///
+    /// Last-writer-wins: if the agent reconnects while a prior session is still active,
+    /// the new session replaces the old one (old receiver stops receiving). This is intentional —
+    /// the broker treats reconnect as a session refresh rather than an error.
     pub async fn connect(
         &self,
         name: &str,

@@ -1,0 +1,20 @@
+FILE: nonce.rs
+MOD: broker/nonce
+ROLE: In-memory nonce store for Ed25519 challenge-response handshakes — issue, consume, evict
+EP: NonceStore::new; NonceStore::issue; NonceStore::consume; NonceStore::evict_expired
+STAB: stable
+INV:
+  - issue() generates a fresh 32-byte random nonce via OsRng, calls build_challenge_payload, stores (canonical_payload, expires_at) keyed by nonce_hex
+  - issue() returns (nonce_bytes[32], canonical_payload_bytes, timestamp_u64) — caller sends nonce_hex + timestamp + session_id in the Challenge envelope
+  - consume() removes the nonce entry regardless of expiry — expired nonces return None but are still evicted (prevents memory leak)
+  - consume() is destructive on first call — nonce is removed from the store immediately, regardless of whether the caller's subsequent verify_agent_signature succeeds or fails (prevents oracle attacks: caller cannot probe the same nonce twice)
+  - TTL is 60 seconds from issuance — nonces older than 60s are expired and consume() returns None
+  - evict_expired() is called from the periodic cleanup loop — not from issue/consume hot paths
+  - Inner lock is RwLock; both issue and consume take write locks — concurrent handshakes are serialized on the lock
+  - Stateful session management belongs in the broker layer — this module must NOT be moved to identity
+LOOK: consume() expiry check; evict_expired() retain predicate; lock-poisoning expect() calls
+CHK: cargo test nonce; verify consume-after-expire returns None; verify consume-removes-on-expiry
+UW: None — lock panics on poison (expect); consume returns Option
+CNTR: broker/nonce must_not depend_on api, db, stanza
+CNTR: broker/nonce must_not be called from identity layer
+DEPS-ON: identity/ed25519

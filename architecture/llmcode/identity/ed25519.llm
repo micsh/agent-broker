@@ -1,0 +1,18 @@
+FILE: ed25519.rs
+MOD: identity/ed25519
+ROLE: Pure Ed25519 crypto — canonical challenge payload construction and signature verification
+EP: build_challenge_payload; verify_agent_signature; VerifyError
+STAB: stable
+INV:
+  - build_challenge_payload is pure and deterministic — same inputs always produce identical bytes
+  - Canonical payload format (big-endian): nonce[32] ++ timestamp_u64_be[8] ++ u16_be_len(session_id) ++ session_id ++ u16_be_len(name) ++ name ++ u16_be_len(project) ++ project
+  - Both issuance (broker/nonce::NonceStore::issue) and verification call build_challenge_payload — canonical form guaranteed by shared call, not by protocol
+  - verify_agent_signature uses verify_strict() — malleable Ed25519 signatures (cofactor variants) are rejected
+  - public_key_hex must be exactly 64 hex chars (32 bytes); signature_hex must be exactly 128 hex chars (64 bytes) — wrong lengths → InvalidPublicKey or InvalidSignature respectively
+  - No state, no randomness, no network, no DB — pure functions only
+  - Nonce is NOT consumed here — nonce lifecycle is broker/nonce::NonceStore's responsibility
+LOOK: build_challenge_payload field ordering (must match client SDK exactly); verify_strict vs verify distinction
+CHK: cargo test identity; verify canonical payload bytes match client test vectors
+UW: None — returns Result<(), VerifyError>
+CNTR: identity/ed25519 must_not depend_on broker, api, db, stanza
+DEPS-ON: (none — leaf module)

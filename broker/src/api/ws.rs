@@ -173,7 +173,15 @@ async fn wait_for_connect(
         WsEnvelope::Connect { name, project, project_key } => {
             handle_legacy_auth(sender, state, name, project, project_key).await
         }
-        _ => None, // unexpected envelope type — drop connection
+        _ => {
+            // Unexpected envelope type — client sent something that isn't Hello or Connect.
+            // Send a structured error so the client can distinguish protocol violations from drops.
+            let _ = send_envelope(sender, &WsEnvelope::Error {
+                message: "Expected Hello or Connect envelope to initiate connection".to_string(),
+                error_code: Some("PROTOCOL_ERROR".to_string()),
+            }).await;
+            None
+        }
     }
 }
 

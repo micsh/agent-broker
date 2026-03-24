@@ -303,6 +303,81 @@ fn boundary_timestamp_exactly_at_limit_accepted() {
     assert_eq!(result, AuthResult::Ok, "timestamp exactly at 30s boundary must be accepted");
 }
 
+/// Deterministic test vector for AITeam.Libraries byte-compatibility check.
+///
+/// Fixed seed → fixed key pair → fixed inputs → canonical payload → signature.
+/// All values are stable across runs (no randomness). Print with --nocapture.
+///
+/// Expected output is pinned in this test — if ed25519-dalek changes its
+/// serialization, this test will fail, alerting the team to re-publish the vector.
+#[test]
+fn test_vector_deterministic() {
+    use ed25519_dalek::Signer;
+
+    // Fixed 32-byte seed (all zeros except last byte = 1)
+    let seed: [u8; 32] = [
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1,
+    ];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_hex = hex::encode(verifying_key.to_bytes());
+
+    // Fixed inputs
+    let nonce_hex = "a".repeat(64); // 32 bytes of 0xaa
+    let timestamp: u64 = 1_711_234_567;
+    let session_id = "sess-test-001";
+    let agent_name = "Alice";
+    let project = "test-proj";
+
+    // Build canonical payload using the same function as production code
+    let payload = build_signed_payload(&nonce_hex, timestamp, session_id, agent_name, project);
+    let payload_hex = hex::encode(&payload);
+
+    // Sign
+    let signature = signing_key.sign(&payload);
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    // Verify round-trips
+    let sig_arr: [u8; 64] = hex::decode(&signature_hex).unwrap().try_into().unwrap();
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    verifying_key.verify_strict(&payload, &sig).expect("vector must self-verify");
+
+    println!("\n=== Ed25519 Deterministic Test Vector ===");
+    println!("private_key_seed_hex : {}", hex::encode(seed));
+    println!("public_key_hex       : {}", public_key_hex);
+    println!("nonce_hex            : {}", nonce_hex);
+    println!("timestamp            : {}", timestamp);
+    println!("session_id           : {}", session_id);
+    println!("agent_name           : {}", agent_name);
+    println!("project              : {}", project);
+    println!("canonical_payload_hex: {}", payload_hex);
+    println!("signature_hex        : {}", signature_hex);
+    println!("=========================================");
+
+    // Pin exact values so any change to payload construction is detected
+    assert_eq!(public_key_hex, "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
+        "public key derivation changed");
+    // Payload: 32 nonce bytes + 8 timestamp bytes + len-prefixed session_id + name + project
+    // nonce = aa*32 (32 bytes)
+    // timestamp = 1711234567 = 0x00000000660A9907 (8 bytes BE)
+    // session_id len=13, "sess-test-001" (2+13=15 bytes)
+    // agent_name len=5, "Alice" (2+5=7 bytes)
+    // project len=9, "test-proj" (2+9=11 bytes)
+    // total = 32+8+15+7+11 = 73 bytes
+    assert_eq!(payload.len(), 73, "canonical payload length must be 73 bytes");
+    assert_eq!(&payload_hex[..64], "a".repeat(64), "payload must start with nonce bytes");
+
+    // Signature is deterministic for ed25519-dalek (RFC 8032 deterministic signing — no randomness).
+    // Pinned: any change to payload construction or signing will break this assertion.
+    assert_eq!(
+        signature_hex,
+        "a1627a5416fc08c0990ee97385d33d9e3320b6ade3b59307a87f7e9199de68d177bf8fcbfd6fffc03b2f3ca9dddb4783c9bf7df1d96840939b6f21b728b73c07",
+        "signature changed — payload construction or signing algorithm may have changed"
+    );
+    println!("PINNED signature_hex : {}", signature_hex);
+}
+
 /// Timestamp 31s old is rejected
 #[test]
 fn boundary_timestamp_31s_old_rejected() {

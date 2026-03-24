@@ -185,7 +185,8 @@ async fn rekey_agent(
     axum::extract::Path(agent_name): axum::extract::Path<String>,
     Json(req): Json<RekeyRequest>,
 ) -> Result<Json<RekeyResponse>, (StatusCode, String)> {
-    // Body auth — verify project key (includes suspend check)
+    // Body auth — verify project key only (does NOT check suspended status,
+    // consistent with rotate_project_key — key rotation/rekey allowed for suspended projects)
     if !state.broker.repo.verify_project_key(&req.project, &req.project_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
     }
