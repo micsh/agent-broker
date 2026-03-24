@@ -135,6 +135,44 @@ pub fn enrich_to_for_remote(body: &str, channel: &str, from_project: &str) -> St
 }
 
 
+/// Rewrite the `mentions=` attribute in the opening tag of a stanza.
+/// CrossProject resolved mentions are qualified to `Name.Project` form.
+/// SameProject mentions stay as bare names.
+/// If no CrossProject mentions are present, returns the body unchanged (zero allocation).
+/// Operates on the opening tag only — body content is never modified.
+/// If the stanza has no `mentions=` attribute, returns unchanged.
+pub fn rewrite_mentions(body: &str, resolved: &[ResolvedMention]) -> String {
+    // Fast path: nothing to qualify
+    if !resolved.iter().any(|m| matches!(m, ResolvedMention::CrossProject { .. })) {
+        return body.to_string();
+    }
+    // Scope to opening tag only
+    let tag_end = body.find('>').unwrap_or(body.len());
+    let (opening, rest) = body.split_at(tag_end);
+    // Find mentions= attribute — double-quote form only (broker always produces double-quoted XML)
+    let attr_prefix = "mentions=\"";
+    let attr_start = match opening.find(attr_prefix) {
+        Some(pos) => pos,
+        None => return body.to_string(), // no mentions= attribute — nothing to rewrite
+    };
+    let value_start = attr_start + attr_prefix.len();
+    let value_end = match opening[value_start..].find('"') {
+        Some(pos) => value_start + pos,
+        None => return body.to_string(), // malformed attribute — leave unchanged
+    };
+    // Rebuild mentions string from resolved list
+    let new_value: String = resolved
+        .iter()
+        .map(|m| match m {
+            ResolvedMention::SameProject { name } => name.clone(),
+            ResolvedMention::CrossProject { name, project } => format!("{}.{}", name, project),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    // value_end is the index of the closing '"' — opening[value_end..] starts with it
+    format!("{}{}{}{}", &opening[..value_start], new_value, &opening[value_end..], rest)
+}
+
 /// Qualify the `from` attribute in raw stanza XML to fully-qualified form (name.project).
 /// If already qualified, returns the body unchanged.
 /// Replacement is scoped to the opening tag only — body content is never rewritten.
@@ -242,7 +280,72 @@ mod tests {
         assert_ne!(name, "Victoria");
     }
 
-    // --- enrich_to_for_remote ---
+    // --- rewrite_mentions ---
+
+    #[test]
+    fn rewrite_mentions_no_cross_project_returns_unchanged() {
+        let body = r##"<message type="post" from="Alice" to="#general" mentions="Alice"><body>Hi</body></message>"##;
+        let resolved = vec![ResolvedMention::SameProject { name: "Alice".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert_eq!(result, body, "same-project only: body must be returned unchanged");
+    }
+
+    #[test]
+    fn rewrite_mentions_cross_project_qualified() {
+        let body = r##"<message type="post" from="Alice" to="#general" mentions="Bob"><body>Hi</body></message>"##;
+        let resolved = vec![ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert!(result.contains(r#"mentions="Bob.proj-b""#), "cross-project mention must be qualified; got: {result}");
+        assert!(!result.contains(r#"mentions="Bob""#), "bare mention must be replaced; got: {result}");
+        assert!(result.contains("<body>Hi</body>"), "body content must be preserved; got: {result}");
+    }
+
+    #[test]
+    fn rewrite_mentions_mixed_same_and_cross() {
+        let body = r##"<message type="post" from="Alice" to="#general" mentions="Alice,Bob"><body>Hi</body></message>"##;
+        let resolved = vec![
+            ResolvedMention::SameProject { name: "Alice".into() },
+            ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() },
+        ];
+        let result = rewrite_mentions(body, &resolved);
+        assert!(result.contains(r#"mentions="Alice,Bob.proj-b""#),
+            "same-project stays bare, cross-project qualified; got: {result}");
+    }
+
+    #[test]
+    fn rewrite_mentions_already_qualified_cross_stays_qualified() {
+        // Sender already wrote Bob.proj-b; resolved list has the same CrossProject entry
+        let body = r##"<message type="post" from="Alice" to="#general" mentions="Bob.proj-b"><body>Hi</body></message>"##;
+        let resolved = vec![ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert!(result.contains(r#"mentions="Bob.proj-b""#), "already-qualified must not be double-qualified; got: {result}");
+        assert!(!result.contains("Bob.proj-b.proj-b"), "must not double-qualify; got: {result}");
+    }
+
+    #[test]
+    fn rewrite_mentions_no_attribute_returns_unchanged() {
+        let body = r##"<message type="post" from="Alice" to="#general"><body>No mentions attr</body></message>"##;
+        let resolved = vec![ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert_eq!(result, body, "no mentions= attribute — must return unchanged");
+    }
+
+    #[test]
+    fn rewrite_mentions_does_not_touch_body_content() {
+        // Body text contains mentions="Bob" — only the opening tag attribute must be rewritten
+        let body = r##"<message from="Alice" to="#gen" mentions="Bob"><body>mentions="Bob" in body</body></message>"##;
+        let resolved = vec![ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert!(result.contains(r#"mentions="Bob.proj-b""#), "opening tag must be qualified; got: {result}");
+        assert!(result.contains(r#"mentions="Bob" in body"#), "body content must be preserved verbatim; got: {result}");
+    }
+
+    #[test]
+    fn rewrite_mentions_empty_resolved_list_returns_unchanged() {
+        let body = r##"<message type="post" from="Alice" to="#general" mentions="Bob"><body>Hi</body></message>"##;
+        let result = rewrite_mentions(body, &[]);
+        assert_eq!(result, body, "empty resolved list — fast path, must return unchanged");
+    }
 
     #[test]
     fn enrich_to_qualifies_unqualified_channel() {

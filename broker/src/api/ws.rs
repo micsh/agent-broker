@@ -377,3 +377,7 @@ async fn handle_stanza(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ws_auth_tests.rs"]
+mod ws_auth_tests;

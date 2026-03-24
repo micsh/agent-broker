@@ -29,6 +29,7 @@ impl DeliveryEngine {
         mentions: &[ResolvedMention],
     ) -> Result<(), String> {
         let enriched_body = stanza::enrich_from(body, from_agent, from_project);
+        let enriched_body = stanza::rewrite_mentions(&enriched_body, mentions);
         let enriched_body = enriched_body.as_str();
 
         self.state.repo.insert_message(id, from_agent, from_project, to_agent, to_channel, enriched_body, metadata)?;
@@ -69,6 +70,7 @@ impl DeliveryEngine {
         mentions: &[ResolvedMention],
     ) -> Result<(), String> {
         let enriched_body = stanza::enrich_from(body, from_agent, from_project);
+        let enriched_body = stanza::rewrite_mentions(&enriched_body, mentions);
         let enriched_body = enriched_body.as_str();
 
         self.state.repo.insert_message(id, from_agent, from_project, None, Some(channel), enriched_body, None)?;
@@ -457,5 +459,38 @@ mod tests {
 
         let pending = state.repo.drain_pending("Mentioned", "target-proj");
         assert_eq!(pending.len(), 1, "mentioned agent should receive the message");
+    }
+
+    #[tokio::test]
+    async fn rewrite_mentions_visible_in_pending_message() {
+        let (state, delivery) = setup();
+
+        state.repo.register_project("proj-a", "key1").unwrap();
+        state.repo.register_project("proj-b", "key2").unwrap();
+        state.repo.register_agent("Alice", "proj-a", "").unwrap();
+        state.repo.register_agent("Bob", "proj-b", "").unwrap();
+
+        state.repo.ensure_channel("general", "proj-a").unwrap();
+        state.repo.subscribe("Bob", "proj-b", "general"); // cross-project sub (pending, offline)
+
+        let body = r##"<message from="Alice" to="#general" mentions="Bob"><body>Hi Bob</body></message>"##;
+        delivery.deliver(
+            "t4-1", "Alice", "proj-a", None, Some("general"), body, None,
+            &[ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }],
+        ).await.unwrap();
+
+        let pending = state.repo.drain_pending("Bob", "proj-b");
+        assert_eq!(pending.len(), 1, "Bob should have 1 pending message");
+        // Qualified form must appear in the stored body
+        assert!(pending[0].body.contains(r#"mentions="Bob.proj-b""#),
+            "stored body must have qualified mention; got: {}", pending[0].body);
+        // Bare form must NOT appear in the opening tag (body content check is separate)
+        let tag_end = pending[0].body.find('>').unwrap_or(pending[0].body.len());
+        let opening = &pending[0].body[..tag_end];
+        assert!(!opening.contains(r#"mentions="Bob""#),
+            "bare mention must be gone from opening tag; got opening: {opening}");
+        // Body content must be preserved
+        assert!(pending[0].body.contains("<body>Hi Bob</body>"),
+            "body content must be untouched; got: {}", pending[0].body);
     }
 }
