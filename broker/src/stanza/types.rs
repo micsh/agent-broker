@@ -348,6 +348,15 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_mentions_malformed_attribute_no_closing_quote_returns_unchanged() {
+        // mentions= has no closing quote — defensive path must return body unchanged
+        let body = r#"<message mentions="Bob><body>text</body></message>"#;
+        let resolved = vec![ResolvedMention::CrossProject { name: "Bob".into(), project: "proj-b".into() }];
+        let result = rewrite_mentions(body, &resolved);
+        assert_eq!(result, body, "malformed mentions= (no closing quote) must return body unchanged");
+    }
+
+    #[test]
     fn enrich_to_qualifies_unqualified_channel() {
         let xml = r##"<message type="post" from="Alice.proj" to="#general"><body>Hi</body></message>"##;
         let result = enrich_to_for_remote(xml, "general", "myproject");

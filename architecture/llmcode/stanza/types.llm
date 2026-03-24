@@ -1,7 +1,7 @@
 FILE: types.rs
 MOD: stanza/types
 ROLE: Stanza routing types and enrichment functions — the core contract layer for all message routing
-EP: resolve_destination; resolve_agent_name; enrich_from; enrich_to_for_remote
+EP: resolve_destination; resolve_agent_name; enrich_from; enrich_to_for_remote; rewrite_mentions
 STAB: stable
 INV:
   - resolve_destination never modifies input — pure function, returns a Destination variant
@@ -12,8 +12,15 @@ INV:
   - enrich_from is idempotent: already-qualified from= passes through unchanged
   - enrich_to_for_remote is idempotent: already-qualified to= passes through unchanged
   - ResolvedMention is produced by resolve_mentions (dispatch layer) — delivery layer must not re-resolve
-LOOK: enrich_from tests; enrich_to_for_remote tests; resolve_destination channel/cross-project split logic
+  - rewrite_mentions: pure function — rewrites mentions= attribute value in opening tag only; body after '>' never touched
+  - rewrite_mentions fast path: returns body unchanged (zero allocation) when resolved list has no CrossProject entries
+  - rewrite_mentions: missing mentions= attribute → returns body unchanged; malformed attribute → returns body unchanged
+  - rewrite_mentions: rebuilds entire attribute value from resolved list — SameProject stays bare, CrossProject gets 'Name.project' qualification
+  - rewrite_mentions: already-qualified CrossProject entries are NOT double-qualified (qualification comes from ResolvedMention variant, not from inspecting existing attribute value)
+  - rewrite_mentions: expects double-quoted attribute form only (mentions="...") — broker always produces double-quoted XML
+LOOK: enrich_from tests; enrich_to_for_remote tests; resolve_destination channel/cross-project split logic; rewrite_mentions body-preservation test
 CHK: Run cargo test stanza after any change; verify body-content invariant tests still pass
 CNTR: stanza/types::enrich_from used_by broker/delivery::deliver
 CNTR: stanza/types::resolve_destination used_by broker/state::dispatch_stanza
 CNTR: stanza/types::ResolvedMention compatible_with broker/delivery::deliver_to_mentions
+CNTR: stanza/types::rewrite_mentions used_by broker/delivery::deliver (applied after mention fan-out, before cross-project forward)
