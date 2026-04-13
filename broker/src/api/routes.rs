@@ -241,6 +241,11 @@ async fn register_agent(
         ));
     }
 
+    // Description limit: max 500 Unicode scalar values
+    if req.description.chars().count() > 500 {
+        return Err((StatusCode::BAD_REQUEST, "description exceeds 500 characters".to_string()));
+    }
+
     state.broker.repo.register_agent(&req.name, &req.project, &req.role, &req.description)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -278,7 +283,7 @@ async fn list_agents(
 }
 
 /// PATCH /agents/{name} — self-update only (AgentAuth enforces identity).
-/// Updates the agent's description. Max 500 characters.
+/// Updates the agent's description. Max 500 Unicode scalar values.
 async fn update_agent_description(
     State(state): State<Arc<AppState>>,
     auth: AgentAuth,
@@ -289,7 +294,7 @@ async fn update_agent_description(
     if name != auth.agent_name {
         return Err((StatusCode::FORBIDDEN, "Cannot update another agent's description".to_string()));
     }
-    if req.description.len() > 500 {
+    if req.description.chars().count() > 500 {
         return Err((StatusCode::BAD_REQUEST, "description exceeds 500 characters".to_string()));
     }
     state.broker.repo.set_agent_description(&auth.agent_name, &auth.project, &req.description)
@@ -599,7 +604,8 @@ mod tests {
         let state = make_state();
         let app = test_app(state.clone());
         let key = register_project_and_agent(&app, "proj", "Alice", "").await;
-        let long = "x".repeat(501);
+        // 501 multibyte chars — each is >1 byte, so len() > chars().count(). Must still be rejected.
+        let long = "é".repeat(501);
 
         let resp: Response = app.oneshot(
             Request::builder()
@@ -609,6 +615,37 @@ mod tests {
                 .header("x-project-key", &key)
                 .header("x-agent-name", "Alice")
                 .body(Body::from(serde_json::json!({"description": long}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_description_too_long_returns_400() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        // Register project first
+        let resp: Response = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/projects/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"name": "proj"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        let body = body_text(resp).await;
+        let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["project_key"]
+            .as_str().unwrap().to_string();
+
+        let long = "é".repeat(501);
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/agents/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "name": "Alice", "project": "proj",
+                    "project_key": key, "role": "assistant",
+                    "description": long
+                }).to_string()))
                 .unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

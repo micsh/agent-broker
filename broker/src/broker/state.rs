@@ -159,6 +159,8 @@ impl BrokerState {
                 name: s.name.clone(),
                 project: s.project.clone(),
                 state: s.state,
+                // N DB reads (one per connected agent) — acceptable at broker scale.
+                // Batch with WHERE name IN (...) if contention becomes an issue.
                 description: self.repo.get_agent_description(&s.name, &s.project),
             })
             .collect();
