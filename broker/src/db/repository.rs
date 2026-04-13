@@ -296,13 +296,82 @@ impl Repository {
     }
 
     /// Register or update an agent within a project.
-    pub fn register_agent(&self, name: &str, project: &str, role: &str) -> Result<(), String> {
+    /// Re-registration with blank description preserves the existing description (COALESCE upsert).
+    /// Re-registration with a non-blank description overwrites it.
+    pub fn register_agent(&self, name: &str, project: &str, role: &str, description: &str) -> Result<(), String> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO agents (name, project, role, created_utc)
-             VALUES (?1, ?2, ?3, datetime('now'))",
-            params![name, project, role],
+            "INSERT INTO agents (name, project, role, description, created_utc)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(name, project) DO UPDATE SET
+               role = excluded.role,
+               description = CASE WHEN excluded.description = ''
+                                  THEN agents.description
+                                  ELSE excluded.description END",
+            params![name, project, role, description],
         ).map_err(|e| format!("Failed to register agent: {e}"))?;
         Ok(())
+    }
+
+    /// Get the stored description for an agent. Returns "" if not found or unset.
+    pub fn get_agent_description(&self, name: &str, project: &str) -> String {
+        let conn = self.conn();
+        conn.prepare("SELECT description FROM agents WHERE name = ?1 AND project = ?2")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row(params![name, project], |row| row.get::<_, String>(0)).ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Update an agent's description.
+    /// Returns Err if the agent is not found (0 rows affected).
+    pub fn set_agent_description(&self, name: &str, project: &str, description: &str) -> Result<(), String> {
+        let rows = self.conn().execute(
+            "UPDATE agents SET description = ?1 WHERE name = ?2 AND project = ?3",
+            params![description, name, project],
+        ).map_err(|e| format!("Failed to set description: {e}"))?;
+        if rows == 0 {
+            Err(format!("Agent '{}' not found in project '{}'", name, project))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// List all registered agents (DB), regardless of connection state.
+    /// Returns (name, project, description) tuples, ordered by project then name.
+    /// Used by list_agents(include_offline=true) to synthesise offline entries.
+    pub fn list_registered_agents(&self, project_filter: Option<&str>) -> Vec<(String, String, String)> {
+        let conn = self.conn();
+        let (sql, param): (&str, Option<&str>) = match project_filter {
+            Some(p) => (
+                "SELECT name, project, description FROM agents WHERE project = ?1 ORDER BY project ASC, name ASC",
+                Some(p),
+            ),
+            None => (
+                "SELECT name, project, description FROM agents ORDER BY project ASC, name ASC",
+                None,
+            ),
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        // Use query() instead of query_map() to avoid closure-type mismatch between branches.
+        let mut rows = match if let Some(p) = param { stmt.query(params![p]) } else { stmt.query([]) } {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            if let (Ok(name), Ok(project), Ok(desc)) = (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+            ) {
+                result.push((name, project, desc));
+            }
+        }
+        result
     }
 
     /// Check if an agent is registered.
@@ -600,8 +669,8 @@ mod tests {
 
         repo.register_project("alpha", "key1").unwrap();
         repo.register_project("beta", "key2").unwrap();
-        repo.register_agent("AgentA", "alpha", "").unwrap();
-        repo.register_agent("AgentB", "beta", "").unwrap();
+        repo.register_agent("AgentA", "alpha", "", "").unwrap();
+        repo.register_agent("AgentB", "beta", "", "").unwrap();
 
         // Both projects use a channel with the same logical name.
         // Each (channel_id, project) pair is an independent row — channels in different projects
@@ -702,7 +771,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
         repo.register_project("proj-a", "key").unwrap();
-        repo.register_agent("Alice", "proj-a", "").unwrap();
+        repo.register_agent("Alice", "proj-a", "", "").unwrap();
         let result = repo.find_agents_by_name("Bob");
         assert!(result.is_empty(), "unknown name should return empty Vec; got: {:?}", result);
     }
@@ -713,7 +782,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
         repo.register_project("proj-a", "key").unwrap();
-        repo.register_agent("Alice", "proj-a", "").unwrap();
+        repo.register_agent("Alice", "proj-a", "", "").unwrap();
         let result = repo.find_agents_by_name("Alice");
         assert_eq!(result, vec![("Alice".to_string(), "proj-a".to_string())],
             "unique name should return exactly one entry");
@@ -726,8 +795,8 @@ mod tests {
         let repo = Repository::new(conn);
         repo.register_project("proj-a", "key1").unwrap();
         repo.register_project("proj-b", "key2").unwrap();
-        repo.register_agent("Alice", "proj-a", "").unwrap();
-        repo.register_agent("Alice", "proj-b", "").unwrap();
+        repo.register_agent("Alice", "proj-a", "", "").unwrap();
+        repo.register_agent("Alice", "proj-b", "", "").unwrap();
         let result = repo.find_agents_by_name("Alice");
         assert_eq!(result.len(), 2, "same name in two projects should return 2 entries; got: {:?}", result);
     }
@@ -800,7 +869,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let repo = Repository::new(conn);
         repo.register_project("proj", "key").unwrap();
-        repo.register_agent("Alice", "proj", "").unwrap();
+        repo.register_agent("Alice", "proj", "", "").unwrap();
         repo.ensure_channel("general", "proj").unwrap();
         repo.subscribe("Alice", "proj", "general");
 
@@ -818,5 +887,110 @@ mod tests {
         let repo = Repository::new(conn);
         let result = repo.delete_project("nonexistent");
         assert!(result.is_err(), "delete_project on unknown project must return Err");
+    }
+
+    // --- Description tests ---
+
+    #[test]
+    fn agent_description_stored_at_registration() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "Helpful assistant").unwrap();
+        assert_eq!(repo.get_agent_description("Alice", "proj"), "Helpful assistant");
+    }
+
+    #[test]
+    fn agent_description_default_empty() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "").unwrap();
+        assert_eq!(repo.get_agent_description("Alice", "proj"), "");
+    }
+
+    #[test]
+    fn get_agent_description_unknown_agent_returns_empty() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        assert_eq!(repo.get_agent_description("Nobody", "proj"), "");
+    }
+
+    #[test]
+    fn register_agent_preserves_description_when_blank_re_registered() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "Original description").unwrap();
+        // Re-register with blank description — should preserve existing
+        repo.register_agent("Alice", "proj", "assistant", "").unwrap();
+        assert_eq!(repo.get_agent_description("Alice", "proj"), "Original description",
+            "blank re-registration must preserve existing description");
+    }
+
+    #[test]
+    fn register_agent_overwrites_description_when_non_blank() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "Old description").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "New description").unwrap();
+        assert_eq!(repo.get_agent_description("Alice", "proj"), "New description",
+            "non-blank re-registration must overwrite description");
+    }
+
+    #[test]
+    fn set_agent_description_updates() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "").unwrap();
+        repo.set_agent_description("Alice", "proj", "Updated description").unwrap();
+        assert_eq!(repo.get_agent_description("Alice", "proj"), "Updated description");
+    }
+
+    #[test]
+    fn set_agent_description_unknown_agent_returns_err() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        let result = repo.set_agent_description("Nobody", "proj", "desc");
+        assert!(result.is_err(), "set_agent_description on unknown agent must return Err");
+    }
+
+    #[test]
+    fn list_registered_agents_returns_all() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj", "key").unwrap();
+        repo.register_agent("Alice", "proj", "assistant", "Alice desc").unwrap();
+        repo.register_agent("Bob", "proj", "assistant", "").unwrap();
+        let agents = repo.list_registered_agents(None);
+        assert_eq!(agents.len(), 2);
+        let alice = agents.iter().find(|(n, _, _)| n == "Alice").expect("Alice missing");
+        assert_eq!(alice.2, "Alice desc");
+        let bob = agents.iter().find(|(n, _, _)| n == "Bob").expect("Bob missing");
+        assert_eq!(bob.2, "");
+    }
+
+    #[test]
+    fn list_registered_agents_filtered_by_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        repo.register_project("proj-a", "key1").unwrap();
+        repo.register_project("proj-b", "key2").unwrap();
+        repo.register_agent("Alice", "proj-a", "assistant", "").unwrap();
+        repo.register_agent("Bob", "proj-b", "assistant", "").unwrap();
+        let agents = repo.list_registered_agents(Some("proj-a"));
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].0, "Alice");
     }
 }

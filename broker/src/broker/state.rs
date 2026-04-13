@@ -143,21 +143,44 @@ impl BrokerState {
         }
     }
 
-    /// Get all connected agents, optionally filtered by project.
-    pub async fn list_agents(&self, project_filter: Option<&str>) -> Vec<AgentInfo> {
+    /// Get all agents, optionally filtered by project.
+    /// Connected agents are always included; offline (DB-registered) agents included when include_offline=true.
+    /// Description is always enriched from the DB.
+    ///
+    /// Last-writer-wins: if the agent reconnects while a prior session is still active,
+    /// the new session replaces the old one (old receiver stops receiving). This is intentional —
+    /// the broker treats reconnect as a session refresh rather than an error.
+    pub async fn list_agents(&self, project_filter: Option<&str>, include_offline: bool) -> Vec<AgentInfo> {
         let sessions = self.sessions.read().await;
-        sessions
+        let mut result: Vec<AgentInfo> = sessions
             .values()
-            .filter(|s| match project_filter {
-                Some(p) => s.project == p,
-                None => true,
-            })
+            .filter(|s| project_filter.map_or(true, |p| s.project == p))
             .map(|s| AgentInfo {
                 name: s.name.clone(),
                 project: s.project.clone(),
                 state: s.state,
+                description: self.repo.get_agent_description(&s.name, &s.project),
             })
-            .collect()
+            .collect();
+
+        if include_offline {
+            // Build set of connected (name, project) keys to avoid duplicates
+            let connected: std::collections::HashSet<(String, String)> =
+                result.iter().map(|a| (a.name.clone(), a.project.clone())).collect();
+            // Synthesise offline entries for agents in DB but not in sessions
+            let registered = self.repo.list_registered_agents(project_filter);
+            for (name, project, description) in registered {
+                if !connected.contains(&(name.clone(), project.clone())) {
+                    result.push(AgentInfo {
+                        name,
+                        project,
+                        state: AgentState::Offline,
+                        description,
+                    });
+                }
+            }
+        }
+        result
     }
 
     /// Send a message to a specific agent. Returns true if delivered live.
@@ -204,4 +227,5 @@ pub struct AgentInfo {
     pub name: String,
     pub project: String,
     pub state: AgentState,
+    pub description: String,
 }

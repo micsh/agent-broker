@@ -28,6 +28,9 @@ pub struct RegisterArgs {
     pub name: Option<String>,
     /// Project name (e.g. "CopilotCLI")
     pub project: String,
+    /// Optional description of what this agent does. Shown in agent listings.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Broker URL override. Defaults to http://127.0.0.1:4200
     #[serde(default)]
     pub broker_url: Option<String>,
@@ -59,7 +62,7 @@ struct RegProjResp { project_key: String }
 #[derive(Deserialize)]
 struct SendResp { message_id: String }
 #[derive(Deserialize)]
-struct AgentInfo { name: String, project: String, state: String }
+struct AgentInfo { name: String, project: String, state: String, #[serde(default)] description: String }
 #[derive(Deserialize)]
 struct PendingMsg { from_agent: String, from_project: String, body: String, created_utc: String }
 #[derive(Deserialize)]
@@ -121,7 +124,8 @@ impl BrokerTools {
         let resp = self.client.post(format!("{}/agents/register", broker_url))
             .json(&serde_json::json!({
                 "name": agent_name, "project": args.project,
-                "project_key": project_key, "role": "assistant"
+                "project_key": project_key, "role": "assistant",
+                "description": args.description.unwrap_or_default()
             }))
             .send().await.map_err(|e| mcp_err(format!("Agent reg failed: {e}")))?;
 
@@ -148,7 +152,10 @@ impl BrokerTools {
             .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
 
         if agents.is_empty() { return Ok(CallToolResult::success(vec![Content::text("No agents online.")])); }
-        let lines: Vec<String> = agents.iter().map(|a| format!("{}.{} -- {}", a.name, a.project, a.state)).collect();
+        let lines: Vec<String> = agents.iter().map(|a| {
+            let desc = if a.description.is_empty() { String::new() } else { format!(" — {}", a.description) };
+            format!("{}.{} -- {}{}", a.name, a.project, a.state, desc)
+        }).collect();
         Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
     }
 

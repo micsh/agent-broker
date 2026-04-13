@@ -9,6 +9,8 @@ INV:
   - All three network tools (broker_peek, broker_messages, send_raw) include X-Agent-Name header
   - SessionManager holds all credential state — BrokerTools is stateless except for the session Arc
   - broker_register handles 409 (project exists) by loading key from disk — graceful re-registration
+  - broker_register accepts optional description param — forwarded to /agents/register; omitted defaults to ""
+  - broker_presence includes description suffix " — {desc}" when non-empty; omits when blank
   - send_raw is the single HTTP send path — both broker_send and broker_send_stanza route through it
 LOOK: xml_escape; send_raw header set; broker_register 409 path
 CHK: cargo build -p mcp after changes

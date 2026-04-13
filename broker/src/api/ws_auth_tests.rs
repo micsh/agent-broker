@@ -102,7 +102,7 @@ fn setup_agent(state: &Arc<AppState>, project: &str, project_key: &str, agent: &
     state
         .broker
         .repo
-        .register_agent(agent, project, "agent")
+        .register_agent(agent, project, "agent", "")
         .expect("register_agent");
     state
         .broker

@@ -1,0 +1,137 @@
+broker/src/main.rs	api::AppState
+broker/src/main.rs	broker::BrokerState
+broker/src/main.rs	broker::DeliveryEngine
+broker/src/main.rs	std::path::PathBuf
+broker/src/main.rs	std::sync::Arc
+broker/tests/ed25519_handshake_poc.rs	ed25519_dalek::{Signer, SigningKey, VerifyingKey}
+broker/tests/ed25519_handshake_poc.rs	rand::rngs::OsRng
+broker/tests/ed25519_handshake_poc.rs	std::collections::HashSet
+broker/tests/ed25519_handshake_poc.rs	std::time::{SystemTime, UNIX_EPOCH}
+broker/tests/ed25519_handshake_poc.rs	rand::RngCore
+broker/tests/ed25519_handshake_poc.rs	ed25519_dalek::Signer
+mcp/src/main.rs	anyhow::Result
+mcp/src/main.rs	rmcp::{ServiceExt, transport::stdio}
+mcp/src/main.rs	tracing_subscriber::{self, EnvFilter}
+mcp/src/session.rs	std::path::PathBuf
+mcp/src/session.rs	std::sync::{Arc, Mutex}
+mcp/src/tools.rs	crate::session::{SessionManager, load_key, lookup_identity}
+mcp/src/tools.rs	rmcp::{     ServerHandler,     handler::server::{         router::tool::ToolRouter,         wrapper::Parameters,     },     model::*,     schemars, tool, tool_router, tool_handler, }
+mcp/src/tools.rs	reqwest::Client
+mcp/src/tools.rs	serde::Deserialize
+mcp/src/tools.rs	std::sync::Arc
+.agents/pocs/ed25519-handshake/poc.rs	ed25519_dalek::{Signer, SigningKey, VerifyingKey}
+.agents/pocs/ed25519-handshake/poc.rs	rand::rngs::OsRng
+.agents/pocs/ed25519-handshake/poc.rs	std::collections::HashSet
+.agents/pocs/ed25519-handshake/poc.rs	std::time::{SystemTime, UNIX_EPOCH}
+.agents/pocs/ed25519-handshake/poc.rs	rand::RngCore
+.agents/pocs/ed25519-handshake/poc.rs	super::*
+.agents/pocs/ed25519-handshake/poc.rs	ed25519_dalek::SigningKey
+.agents/pocs/ed25519-handshake/poc.rs	rand::rngs::OsRng
+broker/src/api/admin.rs	crate::api::auth::AdminAuth
+broker/src/api/admin.rs	crate::api::routes::AppState
+broker/src/api/admin.rs	crate::db::repository::{BrokerStats, ProjectInfo, ProjectStats, ProjectStatus}
+broker/src/api/admin.rs	axum::extract::{Path, State}
+broker/src/api/admin.rs	axum::http::StatusCode
+broker/src/api/admin.rs	axum::routing::{delete, get, post}
+broker/src/api/admin.rs	axum::{Json, Router}
+broker/src/api/admin.rs	std::sync::Arc
+broker/src/api/auth.rs	crate::api::routes::AppState
+broker/src/api/auth.rs	axum::extract::FromRequestParts
+broker/src/api/auth.rs	axum::http::{request::Parts, StatusCode}
+broker/src/api/auth.rs	std::sync::Arc
+broker/src/api/middleware.rs	axum::http::StatusCode
+broker/src/api/middleware.rs	axum::middleware::Next
+broker/src/api/middleware.rs	axum::response::{IntoResponse, Response}
+broker/src/api/middleware.rs	governor::{DefaultKeyedRateLimiter, Quota, RateLimiter}
+broker/src/api/middleware.rs	std::num::NonZeroU32
+broker/src/api/middleware.rs	std::sync::Arc
+broker/src/api/middleware.rs	super::*
+broker/src/api/mod.rs	pub use routes::{router as http_router, AppState}
+broker/src/api/mod.rs	ws::handle_ws
+broker/src/api/mod.rs	admin::admin_router
+broker/src/api/routes.rs	crate::api::auth::AgentAuth
+broker/src/api/routes.rs	crate::broker::state::{AgentState, BrokerState}
+broker/src/api/routes.rs	crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError}
+broker/src/api/routes.rs	crate::db::repository::PendingMessage
+broker/src/api/routes.rs	crate::stanza
+broker/src/api/routes.rs	axum::extract::{Path, Query, State}
+broker/src/api/routes.rs	axum::http::StatusCode
+broker/src/api/routes.rs	axum::routing::{get, post, put, delete, patch}
+broker/src/api/routes.rs	axum::{Json, Router}
+broker/src/api/routes.rs	serde::{Deserialize, Serialize}
+broker/src/api/routes.rs	std::sync::Arc
+broker/src/api/routes.rs	axum::middleware::from_fn_with_state
+broker/src/api/ws.rs	crate::broker::state::BrokerState
+broker/src/api/ws.rs	crate::broker::{DeliveryEngine, dispatch_stanza}
+broker/src/api/ws.rs	crate::api::routes::AppState
+broker/src/api/ws.rs	crate::stanza
+broker/src/api/ws.rs	axum::extract::ws::{Message, WebSocket}
+broker/src/api/ws.rs	axum::extract::{State, WebSocketUpgrade}
+broker/src/api/ws.rs	axum::response::IntoResponse
+broker/src/api/ws.rs	futures::stream::StreamExt
+broker/src/api/ws.rs	futures::SinkExt
+broker/src/api/ws.rs	serde::{Deserialize, Serialize}
+broker/src/api/ws.rs	std::sync::Arc
+broker/src/api/ws_auth_tests.rs	crate::api
+broker/src/api/ws_auth_tests.rs	crate::api::middleware::ProjectRateLimiter
+broker/src/api/ws_auth_tests.rs	crate::api::routes::{AppState, BrokerConfig}
+broker/src/api/ws_auth_tests.rs	crate::broker::{BrokerState, DeliveryEngine}
+broker/src/api/ws_auth_tests.rs	crate::db
+broker/src/api/ws_auth_tests.rs	ed25519_dalek::Signer
+broker/src/api/ws_auth_tests.rs	ed25519_dalek::SigningKey
+broker/src/api/ws_auth_tests.rs	futures::{SinkExt, StreamExt}
+broker/src/api/ws_auth_tests.rs	rand::rngs::OsRng
+broker/src/api/ws_auth_tests.rs	serde_json::{json, Value}
+broker/src/api/ws_auth_tests.rs	std::net::SocketAddr
+broker/src/api/ws_auth_tests.rs	std::sync::Arc
+broker/src/api/ws_auth_tests.rs	tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg}
+broker/src/broker/delivery.rs	crate::broker::state::BrokerState
+broker/src/broker/delivery.rs	crate::db::repository::PendingMessage
+broker/src/broker/delivery.rs	crate::stanza::{self, ResolvedMention}
+broker/src/broker/delivery.rs	std::sync::Arc
+broker/src/broker/delivery.rs	super::*
+broker/src/broker/delivery.rs	crate::broker::state::BrokerState
+broker/src/broker/delivery.rs	crate::db
+broker/src/broker/dispatch.rs	crate::broker::state::BrokerState
+broker/src/broker/dispatch.rs	crate::broker::DeliveryEngine
+broker/src/broker/dispatch.rs	crate::db::repository::Repository
+broker/src/broker/dispatch.rs	crate::stanza::{self, Destination, ResolvedMention, Stanza}
+broker/src/broker/dispatch.rs	std::sync::Arc
+broker/src/broker/dispatch.rs	super::*
+broker/src/broker/dispatch.rs	crate::db
+broker/src/broker/mod.rs	state::BrokerState
+broker/src/broker/mod.rs	delivery::DeliveryEngine
+broker/src/broker/mod.rs	pub use dispatch::{dispatch_stanza, DispatchResult, DispatchError}
+broker/src/broker/nonce.rs	rand_core::{OsRng, RngCore}
+broker/src/broker/nonce.rs	std::collections::HashMap
+broker/src/broker/nonce.rs	std::sync::RwLock
+broker/src/broker/nonce.rs	std::time::{Duration, Instant}
+broker/src/broker/nonce.rs	super::*
+broker/src/broker/state.rs	crate::broker::nonce::NonceStore
+broker/src/broker/state.rs	crate::db::Repository
+broker/src/broker/state.rs	crate::stanza::PresenceStatus
+broker/src/broker/state.rs	std::collections::HashMap
+broker/src/broker/state.rs	std::sync::Arc
+broker/src/broker/state.rs	tokio::sync::{broadcast, RwLock}
+broker/src/db/mod.rs	repository::Repository
+broker/src/db/mod.rs	rusqlite::Connection
+broker/src/db/mod.rs	std::path::Path
+broker/src/db/repository.rs	rusqlite::params
+broker/src/db/repository.rs	crate::identity
+broker/src/db/repository.rs	std::sync::Mutex
+broker/src/db/repository.rs	super::*
+broker/src/db/repository.rs	crate::db::schema::ensure_schema
+broker/src/db/schema.rs	rusqlite::Connection
+broker/src/db/schema.rs	super::*
+broker/src/identity/ed25519.rs	ed25519_dalek::{Signature, VerifyingKey}
+broker/src/identity/mod.rs	pub use secret::{hash_key, verify_key_hash}
+broker/src/identity/mod.rs	pub use ed25519::{build_challenge_payload, verify_agent_signature}
+broker/src/identity/secret.rs	sha2::{Digest, Sha256}
+broker/src/stanza/mod.rs	parser::parse
+broker/src/stanza/mod.rs	pub use types::*
+broker/src/stanza/parser.rs	regex::Regex
+broker/src/stanza/parser.rs	std::sync::LazyLock
+broker/src/stanza/parser.rs	super::types::*
+broker/src/stanza/parser.rs	super::*
+broker/src/stanza/types.rs	serde::{Deserialize, Serialize}
+broker/src/stanza/types.rs	super::*

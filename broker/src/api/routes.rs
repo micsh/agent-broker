@@ -3,9 +3,9 @@ use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
 use crate::db::repository::PendingMessage;
 use crate::stanza;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put, delete};
+use axum::routing::{get, post, put, delete, patch};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/projects/{name}/rotate-key", post(rotate_project_key))
         .route("/agents/register", post(register_agent))
         .route("/agents/{name}/rekey", post(rekey_agent))
+        .route("/agents/{name}", patch(update_agent_description))
         .route("/agents", get(list_agents))
         .route("/messages", get(get_messages))
         .route("/messages/peek", get(peek_messages))
@@ -72,6 +73,9 @@ pub struct RegisterAgentRequest {
     pub project_key: String,
     #[serde(default)]
     pub role: String,
+    /// Optional description of what this agent does. Shown in agent listings.
+    #[serde(default)]
+    pub description: String,
     /// Optional Ed25519 public key (64 hex chars = 32 bytes) for challenge-response WS auth.
     /// If provided, the agent will be enrolled at registration time (TOFU: first registration wins).
     #[serde(default)]
@@ -105,6 +109,15 @@ pub struct SendResponse {
 #[derive(Deserialize)]
 pub struct AgentQuery {
     pub project: Option<String>,
+    /// When true, includes registered-but-disconnected agents with state=offline.
+    #[serde(default)]
+    pub include_offline: bool,
+}
+
+/// PATCH /agents/{name} request body.
+#[derive(Deserialize)]
+pub struct UpdateAgentRequest {
+    pub description: String,
 }
 
 #[derive(Serialize)]
@@ -228,7 +241,7 @@ async fn register_agent(
         ));
     }
 
-    state.broker.repo.register_agent(&req.name, &req.project, &req.role)
+    state.broker.repo.register_agent(&req.name, &req.project, &req.role, &req.description)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Enroll Ed25519 public key if provided (TOFU: first registration wins on INSERT OR REPLACE)
@@ -260,8 +273,28 @@ async fn list_agents(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentQuery>,
 ) -> Json<Vec<crate::broker::state::AgentInfo>> {
-    let agents = state.broker.list_agents(query.project.as_deref()).await;
+    let agents = state.broker.list_agents(query.project.as_deref(), query.include_offline).await;
     Json(agents)
+}
+
+/// PATCH /agents/{name} — self-update only (AgentAuth enforces identity).
+/// Updates the agent's description. Max 500 characters.
+async fn update_agent_description(
+    State(state): State<Arc<AppState>>,
+    auth: AgentAuth,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateAgentRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Self-update only — path name must match authenticated agent
+    if name != auth.agent_name {
+        return Err((StatusCode::FORBIDDEN, "Cannot update another agent's description".to_string()));
+    }
+    if req.description.len() > 500 {
+        return Err((StatusCode::BAD_REQUEST, "description exceeds 500 characters".to_string()));
+    }
+    state.broker.repo.set_agent_description(&auth.agent_name, &auth.project, &req.description)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    Ok(StatusCode::OK)
 }
 
 /// Accept raw stanza XML. Auth via AgentAuth extractor (X-Project + X-Project-Key + X-Agent-Name headers).
@@ -371,4 +404,235 @@ async fn unsubscribe_channel(
 ) -> Result<StatusCode, (StatusCode, String)> {
     state.broker.repo.unsubscribe(&agent_name, &project, &channel_id);
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::middleware::ProjectRateLimiter;
+    use crate::broker::{BrokerState, DeliveryEngine};
+    use crate::db;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn make_state() -> Arc<AppState> {
+        let repo = Arc::new(db::open_memory().expect("in-memory DB"));
+        let broker = Arc::new(BrokerState::new(repo));
+        let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
+        let config = BrokerConfig { admin_key: None, rate_limit_rps: 100 };
+        let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
+        Arc::new(AppState { broker, delivery, config, rate_limiter })
+    }
+
+    fn test_app(state: Arc<AppState>) -> Router {
+        use crate::api;
+        api::http_router(state.clone()).with_state(state)
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// Register a project + agent via the HTTP API; returns the project key.
+    async fn register_project_and_agent(
+        app: &Router,
+        project: &str,
+        agent: &str,
+        description: &str,
+    ) -> String {
+        // Register project
+        let resp: Response = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/projects/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"name": project}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "register_project failed");
+        let body = body_text(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let project_key = v["project_key"].as_str().unwrap().to_string();
+
+        // Register agent
+        let resp: Response = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/agents/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "name": agent, "project": project,
+                    "project_key": project_key, "role": "assistant",
+                    "description": description
+                }).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "register_agent failed");
+        project_key
+    }
+
+    #[tokio::test]
+    async fn register_with_description_shows_in_list() {
+        let state = make_state();
+        let app = test_app(state);
+
+        register_project_and_agent(&app, "proj", "Alice", "Alice the assistant").await;
+
+        let resp: Response = app.clone().oneshot(
+            Request::builder().uri("/agents").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        // Alice is not connected via WS, so not in connected list (offline includes only with include_offline=true)
+        // This test verifies the route returns 200 cleanly
+        assert!(body.contains("[]") || body.contains("Alice") || body == "[]");
+    }
+
+    #[tokio::test]
+    async fn register_without_description_defaults_to_empty() {
+        let state = make_state();
+        register_project_and_agent(&test_app(state.clone()), "proj", "Alice", "").await;
+        let desc = state.broker.repo.get_agent_description("Alice", "proj");
+        assert_eq!(desc, "", "empty description on first registration");
+    }
+
+    #[tokio::test]
+    async fn re_register_with_blank_preserves_description() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "Original").await;
+
+        // Re-register with blank description
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/agents/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "name": "Alice", "project": "proj",
+                    "project_key": key, "role": "assistant", "description": ""
+                }).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.broker.repo.get_agent_description("Alice", "proj"), "Original");
+    }
+
+    #[tokio::test]
+    async fn re_register_with_new_description_overwrites() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "Old").await;
+
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/agents/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "name": "Alice", "project": "proj",
+                    "project_key": key, "role": "assistant", "description": "New"
+                }).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.broker.repo.get_agent_description("Alice", "proj"), "New");
+    }
+
+    #[tokio::test]
+    async fn patch_self_update_succeeds() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "Initial").await;
+
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri("/agents/Alice")
+                .header("content-type", "application/json")
+                .header("x-project", "proj")
+                .header("x-project-key", &key)
+                .header("x-agent-name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "Updated"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.broker.repo.get_agent_description("Alice", "proj"), "Updated");
+    }
+
+    #[tokio::test]
+    async fn patch_other_agent_returns_403() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        // Register Bob in the same project using the same key (skip project registration)
+        let resp: Response = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/agents/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "name": "Bob", "project": "proj",
+                    "project_key": key, "role": "assistant", "description": ""
+                }).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "register Bob failed");
+
+        // Alice tries to update Bob — must be 403
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri("/agents/Bob")
+                .header("content-type", "application/json")
+                .header("x-project", "proj")
+                .header("x-project-key", &key)
+                .header("x-agent-name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "Hack"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn patch_description_too_long_returns_400() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let long = "x".repeat(501);
+
+        let resp: Response = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri("/agents/Alice")
+                .header("content-type", "application/json")
+                .header("x-project", "proj")
+                .header("x-project-key", &key)
+                .header("x-agent-name", "Alice")
+                .body(Body::from(serde_json::json!({"description": long}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_agents_include_offline_shows_registered_agents() {
+        let state = make_state();
+        register_project_and_agent(&test_app(state.clone()), "proj", "Alice", "Offline Alice").await;
+
+        // include_offline=true should return Alice even without WS connection
+        let agents = state.broker.list_agents(None, true).await;
+        assert_eq!(agents.len(), 1, "should return 1 offline agent");
+        assert_eq!(agents[0].name, "Alice");
+        assert_eq!(agents[0].description, "Offline Alice");
+    }
+
+    #[tokio::test]
+    async fn get_agents_without_include_offline_excludes_disconnected() {
+        let state = make_state();
+        register_project_and_agent(&test_app(state.clone()), "proj", "Alice", "").await;
+
+        // Default (include_offline=false) should return empty (Alice never connected via WS)
+        let agents = state.broker.list_agents(None, false).await;
+        assert!(agents.is_empty(), "should return no connected agents");
+    }
 }

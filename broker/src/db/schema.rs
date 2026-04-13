@@ -100,6 +100,20 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("Migration failed (public_key column): {e}"))?;
     }
 
+    // Migration: add description column to agents if absent (idempotent).
+    // Empty string means no description set.
+    let has_description: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'description'")
+        .ok()
+        .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+        .is_some();
+    if !has_description {
+        conn.execute_batch(
+            "ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        )
+        .map_err(|e| format!("Migration failed (description column): {e}"))?;
+    }
+
     Ok(())
 }
 

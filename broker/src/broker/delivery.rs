@@ -198,8 +198,8 @@ mod tests {
 
         // Register project and agents
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Sender", "proj", "").unwrap();
-        state.repo.register_agent("Subscriber", "proj", "").unwrap();
+        state.repo.register_agent("Sender", "proj", "", "").unwrap();
+        state.repo.register_agent("Subscriber", "proj", "", "").unwrap();
 
         // Subscribe Subscriber to the channel (Subscriber is offline — no WS session)
         state.repo.ensure_channel("general", "proj").unwrap();
@@ -220,8 +220,8 @@ mod tests {
         let (state, delivery) = setup();
 
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Sender", "proj", "").unwrap();
-        state.repo.register_agent("Receiver", "proj", "").unwrap();
+        state.repo.register_agent("Sender", "proj", "", "").unwrap();
+        state.repo.register_agent("Receiver", "proj", "", "").unwrap();
 
         state.repo.ensure_channel("general", "proj").unwrap();
         state.repo.subscribe("Receiver", "proj", "general");
@@ -243,8 +243,8 @@ mod tests {
     async fn dm_plain_body_preserved_through_pending_drain() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         let body = r##"<message type="dm" from="Alice" to="Bob"><body>hello world</body></message>"##;
         delivery.deliver("m1", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
@@ -260,8 +260,8 @@ mod tests {
     async fn dm_xml_entities_in_body_preserved_through_pending_drain() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // Body containing XML special characters — broker must not escape or transform them
         let body = r##"<message type="dm" from="Alice" to="Bob"><body>a &lt; b &gt; c &amp; d</body></message>"##;
@@ -277,8 +277,8 @@ mod tests {
     async fn dm_nested_xml_in_body_preserved_through_pending_drain() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // Body containing nested XML fragment — opaque to broker, must pass through unchanged
         let body = r##"<message type="dm" from="Alice" to="Bob"><body><thread id="t-123" /><inner>nested content</inner></body></message>"##;
@@ -294,8 +294,8 @@ mod tests {
     async fn dm_empty_body_element_preserved_through_pending_drain() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // A stanza with an empty <body></body> — broker must accept and preserve as-is
         let body = r##"<message type="dm" from="Alice" to="Bob"><body></body></message>"##;
@@ -311,8 +311,8 @@ mod tests {
     async fn dm_no_body_element_preserved_through_pending_drain() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // A stanza with no body element at all — broker must accept and deliver unchanged
         let body = r##"<message type="dm" from="Alice" to="Bob"></message>"##;
@@ -331,8 +331,8 @@ mod tests {
     async fn enrich_from_does_not_touch_body_content() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // Body text contains from="Alice" — must NOT be rewritten by enrich_from
         let body = r##"<message type="dm" from="Alice" to="Bob"><body>Sent from="Alice" directly.</body></message>"##;
@@ -354,8 +354,8 @@ mod tests {
     async fn dm_plain_body_preserved_via_live_delivery() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // Bob connects live
         let mut rx = state.connect("Bob", "proj").await;
@@ -373,8 +373,8 @@ mod tests {
     async fn dm_xml_entities_preserved_via_live_delivery() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         let mut rx = state.connect("Bob", "proj").await;
 
@@ -390,8 +390,8 @@ mod tests {
     async fn dm_nested_xml_preserved_via_live_delivery() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Alice", "proj", "").unwrap();
-        state.repo.register_agent("Bob", "proj", "").unwrap();
+        state.repo.register_agent("Alice", "proj", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         let mut rx = state.connect("Bob", "proj").await;
 
@@ -407,7 +407,7 @@ mod tests {
     async fn channel_message_with_no_subscribers_does_not_error() {
         let (state, delivery) = setup();
         state.repo.register_project("proj", "key").unwrap();
-        state.repo.register_agent("Sender", "proj", "").unwrap();
+        state.repo.register_agent("Sender", "proj", "", "").unwrap();
         state.repo.ensure_channel("empty-channel", "proj").unwrap();
         // No subscriptions added
 
@@ -422,8 +422,8 @@ mod tests {
 
         state.repo.register_project("source-proj", "key1").unwrap();
         state.repo.register_project("target-proj", "key2").unwrap();
-        state.repo.register_agent("Sender", "source-proj", "").unwrap();
-        state.repo.register_agent("Sub", "target-proj", "").unwrap();
+        state.repo.register_agent("Sender", "source-proj", "", "").unwrap();
+        state.repo.register_agent("Sub", "target-proj", "", "").unwrap();
 
         state.repo.ensure_channel("shared", "target-proj").unwrap();
         state.repo.subscribe("Sub", "target-proj", "shared");
@@ -445,8 +445,8 @@ mod tests {
 
         state.repo.register_project("source-proj", "key1").unwrap();
         state.repo.register_project("target-proj", "key2").unwrap();
-        state.repo.register_agent("Sender", "source-proj", "").unwrap();
-        state.repo.register_agent("Mentioned", "target-proj", "").unwrap();
+        state.repo.register_agent("Sender", "source-proj", "", "").unwrap();
+        state.repo.register_agent("Mentioned", "target-proj", "", "").unwrap();
 
         state.repo.ensure_channel("general", "target-proj").unwrap();
         // No subscribers — but Mentioned is in the mentions list
@@ -467,8 +467,8 @@ mod tests {
 
         state.repo.register_project("proj-a", "key1").unwrap();
         state.repo.register_project("proj-b", "key2").unwrap();
-        state.repo.register_agent("Alice", "proj-a", "").unwrap();
-        state.repo.register_agent("Bob", "proj-b", "").unwrap();
+        state.repo.register_agent("Alice", "proj-a", "", "").unwrap();
+        state.repo.register_agent("Bob", "proj-b", "", "").unwrap();
 
         state.repo.ensure_channel("general", "proj-a").unwrap();
         state.repo.subscribe("Bob", "proj-b", "general"); // cross-project sub (pending, offline)

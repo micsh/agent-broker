@@ -185,7 +185,7 @@ mod tests {
     fn resolve_mentions_bare_local_hit() {
         let repo = make_repo();
         repo.register_project("proj-a", "key").unwrap();
-        repo.register_agent("Alice", "proj-a", "").unwrap();
+        repo.register_agent("Alice", "proj-a", "", "").unwrap();
         let mentions = vec!["Alice".to_string()];
         let result = resolve_mentions(&mentions, "proj-a", &repo).unwrap();
         assert_eq!(result, vec![ResolvedMention::SameProject { name: "Alice".to_string() }]);
@@ -196,7 +196,7 @@ mod tests {
         let repo = make_repo();
         repo.register_project("proj-a", "key1").unwrap();
         repo.register_project("proj-b", "key2").unwrap();
-        repo.register_agent("Alice", "proj-b", "").unwrap();
+        repo.register_agent("Alice", "proj-b", "", "").unwrap();
         // Alice is NOT in proj-a, but exists uniquely in proj-b
         let mentions = vec!["Alice".to_string()];
         let result = resolve_mentions(&mentions, "proj-a", &repo).unwrap();
@@ -209,8 +209,8 @@ mod tests {
         repo.register_project("proj-a", "key1").unwrap();
         repo.register_project("proj-b", "key2").unwrap();
         repo.register_project("proj-c", "key3").unwrap();
-        repo.register_agent("Alice", "proj-a", "").unwrap();
-        repo.register_agent("Alice", "proj-b", "").unwrap();
+        repo.register_agent("Alice", "proj-a", "", "").unwrap();
+        repo.register_agent("Alice", "proj-b", "", "").unwrap();
         let mentions = vec!["Alice".to_string()];
         let err = resolve_mentions(&mentions, "proj-c", &repo).unwrap_err();
         match err {
@@ -237,9 +237,9 @@ mod tests {
         repo.register_project("proj-a", "key1").unwrap();
         repo.register_project("proj-b", "key2").unwrap();
         repo.register_project("proj-c", "key3").unwrap();
-        repo.register_agent("Known", "proj-a", "").unwrap();
-        repo.register_agent("Ambiguous", "proj-a", "").unwrap();
-        repo.register_agent("Ambiguous", "proj-b", "").unwrap();
+        repo.register_agent("Known", "proj-a", "", "").unwrap();
+        repo.register_agent("Ambiguous", "proj-a", "", "").unwrap();
+        repo.register_agent("Ambiguous", "proj-b", "", "").unwrap();
         let mentions = vec!["Known".to_string(), "Ambiguous".to_string()];
         // Known resolves via Step 3 (global unique — not in proj-c), Ambiguous triggers Step 4 → entire batch fails
         let result = resolve_mentions(&mentions, "proj-c", &repo);
