@@ -196,6 +196,12 @@ async fn register_tool_entry(
         return Err((StatusCode::BAD_REQUEST,
             "tool name may only contain alphanumeric characters, hyphens, underscores, and dots".to_string()));
     }
+    // Explicit reject for path-traversal sequences: "." and ".." pass the char whitelist above
+    // but parsers normalize /tools/. → /tools/ and /tools/.. → /. Round-trip would be broken.
+    if name == "." || name == ".." {
+        return Err((StatusCode::BAD_REQUEST,
+            "tool name must not be a URL path segment (. or ..)".to_string()));
+    }
     // Description is required and non-empty
     if req.description.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "description must not be empty".to_string()));
@@ -924,6 +930,33 @@ mod tests {
                 .unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT /tools/{name} with "." or ".." returns 400 — path-traversal guard.
+    #[tokio::test]
+    async fn put_tool_dot_name_returns_400() {
+        // Both "." and ".." pass the char whitelist but are URL path-traversal sequences.
+        // Parsers normalize /tools/. → /tools/ and /tools/.. → /, breaking round-trips.
+        for dot_name in &[".", ".."] {
+            let state = make_state();
+            let app = test_app(state);
+            let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+            let resp = app.oneshot(
+                Request::builder()
+                    .method("PUT").uri(format!("/tools/{dot_name}"))
+                    .header("content-type", "application/json")
+                    .header("X-Project", "proj")
+                    .header("X-Project-Key", &key)
+                    .header("X-Agent-Name", "Alice")
+                    .body(Body::from(serde_json::json!({"description": "desc"}).to_string()))
+                    .unwrap()
+            ).await.unwrap();
+            assert_eq!(
+                resp.status(), StatusCode::BAD_REQUEST,
+                "expected 400 for tool name {:?}", dot_name
+            );
+        }
     }
 
     /// GET /tools returns 200 + empty array when no tools registered.
