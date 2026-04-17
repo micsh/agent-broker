@@ -189,6 +189,13 @@ async fn register_tool_entry(
     if name.chars().count() > 128 {
         return Err((StatusCode::BAD_REQUEST, "tool name exceeds 128 characters".to_string()));
     }
+    // Name must be URL-safe: alphanumeric, hyphens, underscores, dots only.
+    // Dots are allowed for namespace prefixes (e.g. knowledge-sight.CopilotCli).
+    // This guarantees every valid name round-trips safely through MCP URL paths.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err((StatusCode::BAD_REQUEST,
+            "tool name may only contain alphanumeric characters, hyphens, underscores, and dots".to_string()));
+    }
     // Description is required and non-empty
     if req.description.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "description must not be empty".to_string()));
@@ -879,9 +886,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// PUT without auth headers returns 400 (missing X-Project header).
+    /// PUT without auth headers returns 401 (missing credentials).
+    /// Note: missing X-Project/X-Project-Key → 401 UNAUTHORIZED (credentials absent).
+    /// Wrong credentials (present but invalid key) also return 401. Only payload errors return 400.
     #[tokio::test]
-    async fn put_tool_unauthenticated_returns_400() {
+    async fn put_tool_missing_auth_returns_401() {
         let state = make_state();
         let app = test_app(state);
 
@@ -892,7 +901,28 @@ mod tests {
                 .body(Body::from(serde_json::json!({"description": "desc"}).to_string()))
                 .unwrap()
         ).await.unwrap();
-        // AgentAuth extractor returns 400 for missing X-Project header
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// PUT with URL-unsafe name (contains chars outside [a-zA-Z0-9._-]) returns 400.
+    /// This ensures every valid name is safely round-trippable through MCP URL paths.
+    #[tokio::test]
+    async fn put_tool_url_unsafe_name_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        // '!' is a URL sub-delimiter — reaches the handler unmangled but fails the validator
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/bad!name")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj")
+                .header("X-Project-Key", &key)
+                .header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "desc"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 

@@ -20,12 +20,12 @@ impl FromRequestParts<Arc<AppState>> for ProjectAuth {
             .headers
             .get("x-project")
             .and_then(|v| v.to_str().ok())
-            .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project header".to_string()))?;
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project header".to_string()))?;
         let key = parts
             .headers
             .get("x-project-key")
             .and_then(|v| v.to_str().ok())
-            .ok_or((StatusCode::BAD_REQUEST, "Missing X-Project-Key header".to_string()))?;
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Project-Key header".to_string()))?;
         if !state.broker.repo.verify_project_key(project, key) {
             return Err((StatusCode::UNAUTHORIZED, "Invalid project key".to_string()));
         }
@@ -60,7 +60,7 @@ impl FromRequestParts<Arc<AppState>> for AgentAuth {
             .headers
             .get("x-agent-name")
             .and_then(|v| v.to_str().ok())
-            .ok_or((StatusCode::BAD_REQUEST, "Missing X-Agent-Name header".to_string()))?;
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Agent-Name header".to_string()))?;
 
         if !state.broker.repo.agent_exists(agent_name, &project) {
             return Err((

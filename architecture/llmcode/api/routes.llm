@@ -16,9 +16,10 @@ INV:
   - PresenceRequest no longer has a name field — name comes from AgentAuth extractor
   - PUT /tools/{name} requires AgentAuth; GET /tools and GET /tools/{name} are open (no auth)
   - DELETE /tools/{name} requires AgentAuth; any authenticated agent can deregister (no ownership enforcement)
-  - Tool name validation: reject leading/trailing whitespace → 400; empty → 400; > 128 chars → 400
+  - Tool name validation: reject leading/trailing whitespace → 400; empty → 400; > 128 chars → 400; chars outside [a-zA-Z0-9._-] → 400 (URL-safe invariant; dots allowed for namespacing)
   - Tool description must be non-empty and non-whitespace → 400 if blank; > 2000 chars → 400
   - Tool routes are in exempt_routes (no rate limiting) — consistent with agent registration
+  - Auth contract: missing X-Project or X-Project-Key → 401 UNAUTHORIZED; wrong key → 401; missing X-Agent-Name → 401; suspended project → 403; agent not registered → 403
 LOOK: AgentAuth extractor; send_message T8b check; AmbiguousMention error arm; register_agent dot guard; update_agent_description self-check; register_tool_entry validation block
 CHK: cargo test; arch fitness (api in allowed list for broker-callers, db-callers, stanza-callers)
 CNTR: api/routes::send_message depends_on broker/state::dispatch_stanza
