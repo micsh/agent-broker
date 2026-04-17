@@ -9,6 +9,24 @@ broker/tests/ed25519_handshake_poc.rs	std::collections::HashSet
 broker/tests/ed25519_handshake_poc.rs	std::time::{SystemTime, UNIX_EPOCH}
 broker/tests/ed25519_handshake_poc.rs	rand::RngCore
 broker/tests/ed25519_handshake_poc.rs	ed25519_dalek::Signer
+cli/src/identity.rs	anyhow::{Context, Result, anyhow, bail}
+cli/src/identity.rs	serde::{Deserialize, Serialize}
+cli/src/identity.rs	std::path::PathBuf
+cli/src/listen.rs	crate::identity::Identity
+cli/src/listen.rs	anyhow::{Context, Result, anyhow}
+cli/src/listen.rs	futures_util::{SinkExt, StreamExt}
+cli/src/listen.rs	regex::Regex
+cli/src/listen.rs	serde_json::{Value, json}
+cli/src/listen.rs	std::io::Write
+cli/src/listen.rs	std::sync::OnceLock
+cli/src/listen.rs	tokio_tungstenite::tungstenite::Message
+cli/src/main.rs	anyhow::{Result, bail}
+cli/src/main.rs	clap::{Parser, Subcommand}
+cli/src/main.rs	identity::{parse_as, resolve, resolve_url}
+cli/src/main.rs	std::io::Read
+cli/src/send.rs	crate::identity::Identity
+cli/src/send.rs	anyhow::{Result, bail}
+cli/src/send.rs	serde::Deserialize
 mcp/src/main.rs	anyhow::Result
 mcp/src/main.rs	rmcp::{ServiceExt, transport::stdio}
 mcp/src/main.rs	tracing_subscriber::{self, EnvFilter}
@@ -61,6 +79,18 @@ broker/src/api/routes.rs	axum::{Json, Router}
 broker/src/api/routes.rs	serde::{Deserialize, Serialize}
 broker/src/api/routes.rs	std::sync::Arc
 broker/src/api/routes.rs	axum::middleware::from_fn_with_state
+broker/src/api/routes.rs	super::*
+broker/src/api/routes.rs	crate::api::middleware::ProjectRateLimiter
+broker/src/api/routes.rs	crate::broker::{BrokerState, DeliveryEngine}
+broker/src/api/routes.rs	crate::db
+broker/src/api/routes.rs	axum::body::Body
+broker/src/api/routes.rs	axum::http::Request
+broker/src/api/routes.rs	axum::http::StatusCode
+broker/src/api/routes.rs	axum::response::Response
+broker/src/api/routes.rs	http_body_util::BodyExt
+broker/src/api/routes.rs	std::sync::Arc
+broker/src/api/routes.rs	tower::ServiceExt
+broker/src/api/routes.rs	crate::api
 broker/src/api/ws.rs	crate::broker::state::BrokerState
 broker/src/api/ws.rs	crate::broker::{DeliveryEngine, dispatch_stanza}
 broker/src/api/ws.rs	crate::api::routes::AppState

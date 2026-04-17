@@ -44,12 +44,14 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/agent-broker agent-broker-${{ matrix.suffix }}
           cp target/${{ matrix.target }}/release/broker-mcp broker-mcp-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/broker broker-${{ matrix.suffix }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/agent-broker.exe agent-broker-${{ matrix.suffix }}.exe
           cp target/${{ matrix.target }}/release/broker-mcp.exe broker-mcp-${{ matrix.suffix }}.exe
+          cp target/${{ matrix.target }}/release/broker.exe broker-${{ matrix.suffix }}.exe
 
       - name: Upload agent-broker
         uses: actions/upload-artifact@v4
@@ -62,6 +64,12 @@ jobs:
         with:
           name: broker-mcp-${{ matrix.suffix }}
           path: broker-mcp-${{ matrix.suffix }}*
+
+      - name: Upload broker
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-${{ matrix.suffix }}
+          path: broker-${{ matrix.suffix }}*
 
   release:
     needs: build
@@ -83,3 +91,7 @@ jobs:
             broker-mcp-macos-arm64/broker-mcp-macos-arm64
             broker-mcp-macos-x64/broker-mcp-macos-x64
             broker-mcp-windows-x64/broker-mcp-windows-x64.exe
+            broker-linux-x64/broker-linux-x64
+            broker-macos-arm64/broker-macos-arm64
+            broker-macos-x64/broker-macos-x64
+            broker-windows-x64/broker-windows-x64.exe

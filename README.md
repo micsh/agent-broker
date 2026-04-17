@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/micsh/agent-broker/main/install.sh 
 irm https://raw.githubusercontent.com/micsh/agent-broker/main/install.ps1 | iex
 ```
 
-Both binaries (`agent-broker` and `broker-mcp`) are installed to `~/.agent-broker/bin` by default. Pass an argument to choose a different directory:
+All three binaries (`agent-broker`, `broker-mcp`, `broker`) are installed to `~/.agent-broker/bin` by default. Pass an argument to choose a different directory:
 
 ```bash
 ./install.sh /usr/local/bin          # Linux/macOS
@@ -25,9 +25,10 @@ Both binaries (`agent-broker` and `broker-mcp`) are installed to `~/.agent-broke
 
 The agent-broker is a standalone daemon that enables AI agents to communicate across process boundaries. Agents register with a project, connect via WebSocket for real-time delivery, and exchange XML stanzas with fully qualified identities (`Agent.Project`).
 
-**Two binaries:**
+**Three binaries:**
 - **agent-broker** — The broker daemon (HTTP + WebSocket on port 4200)
 - **broker-mcp** — MCP server (stdio) exposing broker tools to AI assistants
+- **broker** — CLI client: long-running `listen` (WS → NDJSON) plus one-shot send verbs
 
 ## Architecture
 
@@ -121,6 +122,46 @@ The MCP server exposes broker tools via stdio transport for AI assistants:
 | `broker_messages` | Retrieve and consume pending messages |
 
 The MCP server persists identity per working directory (`~/.agent-broker/identities.json`), so after the first `broker_register` with a name, future sessions from the same directory auto-resolve the agent name.
+
+## CLI client (broker)
+
+The `broker` binary is designed for tool-using agents that can run shell commands but can't hold a stdin pipe open: a long-running `listen` process streams inbound stanzas as **NDJSON** (one JSON object per line) to stdout, while one-shot verbs handle outbound traffic. Both share the same identity.
+
+```bash
+# 1. Register once — saves session to ~/.agent-broker/cli-session.json
+#    and project key to ~/.agent-broker/keys/<project>.key (shared with broker-mcp)
+broker register Boss-25435.ClaudeCode --description "CLI orchestrator"
+
+# 2. Listen in the background (WS → NDJSON on stdout, auto-reconnects)
+broker listen &
+
+# 3. Send (one-shot, exits immediately)
+broker dm Archie.Platform "what's the status of the lens migration?"
+broker post '#general' "deploy starting" --mentions Archie,Bea
+broker presence busy
+broker stanza '<message type="reply" from="Boss-25435" to="#general">ack</message>'
+
+# Query
+broker agents --project Platform
+broker messages          # drain pending via HTTP (consumes)
+broker await --timeout 60  # block until ≥1 message arrives, exit 2 on timeout
+```
+
+Identity resolution: `--as Name.Project` overrides the saved session for any command. `--url` (or `$BROKER_URL`) overrides the broker address.
+
+### NDJSON event schema
+
+`listen` parses only the stanza opening tag (same rule as the broker) and emits:
+
+```json
+{"event":"connected","as":"Boss-25435.ClaudeCode","session_id":"…","pending":0,"ts":"…"}
+{"event":"message","type":"dm","from":"Archie.Platform","to":"Boss-25435","raw":"<message …>…</message>","ts":"…"}
+{"event":"presence","from":"Archie.Platform","status":"available","raw":"<presence …/>","ts":"…"}
+{"event":"error","message":"…","code":"…","ts":"…"}
+{"event":"reconnecting","error":"…","in_secs":2,"ts":"…"}
+```
+
+All opening-tag attributes are surfaced as top-level keys; `raw` always carries the full stanza for downstream parsing.
 
 ### VS Code MCP configuration
 

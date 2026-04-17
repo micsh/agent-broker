@@ -1,6 +1,10 @@
 .agents/automation/on-session-start.js	Boolean,JSON,String
 broker/src/main.rs	AppState,BrokerState,DeliveryEngine,Duration,EnvFilter,PathBuf,ProjectRateLimiter,TcpListener
 broker/tests/ed25519_handshake_poc.rs	AuthResult,Debug,HashSet,None,OsRng,PartialEq,RngCore,Signature,Signer,SigningKey,Stale,SystemTime,TIMESTAMP_SKEW_SECS,UNIX_EPOCH,VerifyingKey,WrongKey
+cli/src/identity.rs	Clone,Context,DEFAULT_BROKER_URL,Debug,Deserialize,PathBuf,Result,Serialize,Some
+cli/src/listen.rs	Binary,Close,Context,Duration,Frame,Identity,Message,Millis,Object,OnceLock,Ping,Pong,Regex,Result,SecondsFormat,SinkExt,Some,StreamExt,Text,Value,Write
+cli/src/main.rs	Agents,Await,Client,Duration,Listen,Messages,None,Parser,Post,Presence,Read,Register,Result,Some,Stanza,String,Subcommand
+cli/src/send.rs	Deserialize,Duration,Identity,Instant,Result,Some
 mcp/src/main.rs	BrokerTools,EnvFilter,INFO,Level,Result,ServiceExt
 mcp/src/session.rs	Clone,ErrorData,Mutex,None,PathBuf,Some
 mcp/src/tools.rs	CallToolResult,Client,Clone,Content,DEFAULT_BROKER_URL,Debug,Deserialize,Duration,ErrorData,Implementation,JsonSchema,None,Parameters,Self,ServerCapabilities,ServerHandler,ServerInfo,SessionManager,Some,String,ToolRouter
@@ -9,7 +13,7 @@ broker/src/api/admin.rs	Active,AdminAuth,AppState,BrokerStats,Json,NOT_FOUND,NO_
 broker/src/api/auth.rs	AdminAuth,AppState,BAD_REQUEST,FORBIDDEN,FromRequestParts,Parts,ProjectAuth,SERVICE_UNAVAILABLE,Self,StatusCode,UNAUTHORIZED
 broker/src/api/middleware.rs	DefaultKeyedRateLimiter,IntoResponse,Next,NonZeroU32,ProjectRateLimiter,Quota,RETRY_AFTER,RateLimiter,Response,State,StatusCode,TOO_MANY_REQUESTS
 broker/src/api/mod.rs	AppState
-broker/src/api/routes.rs	AgentAuth,AgentState,BAD_REQUEST,BrokerState,CONFLICT,DeliveryEngine,DeliveryFailed,Deserialize,DispatchError,DispatchResult,FORBIDDEN,INTERNAL_SERVER_ERROR,Json,Message,MessageSent,NOT_FOUND,None,Path,PendingMessage,PresenceUpdated,Query,Router,Serialize,Some,Stanza,State,StatusCode,String,UNAUTHORIZED,Uuid
+broker/src/api/routes.rs	AgentAuth,AgentState,BAD_REQUEST,Body,BodyExt,BrokerState,CONFLICT,DeliveryEngine,DeliveryFailed,Deserialize,DispatchError,DispatchResult,FORBIDDEN,INTERNAL_SERVER_ERROR,Json,Message,MessageSent,NOT_FOUND,None,Path,PendingMessage,PresenceUpdated,ProjectRateLimiter,Query,Request,Response,Router,Serialize,ServiceExt,Some,Stanza,State,StatusCode,String,UNAUTHORIZED,Uuid
 broker/src/api/ws.rs	AppState,Auth,BrokerState,Challenge,Close,Connect,Connected,Debug,DeliveryEngine,DeliveryFailed,Deserialize,DispatchError,Error,Hello,IntoResponse,Message,None,Presence,Serialize,SinkExt,Some,Stanza,State,StreamExt,Text,Uuid,WebSocket,WebSocketUpgrade,WsEnvelope
 broker/src/api/ws_auth_tests.rs	AppState,BrokerConfig,BrokerState,Close,DeliveryEngine,Message,None,OsRng,ProjectRateLimiter,Signer,SigningKey,SinkExt,SocketAddr,StreamExt,TcpListener,Text,Value,WsMsg
 broker/src/broker/delivery.rs	Borrowed,BrokerState,DeliveryEngine,None,Owned,PendingMessage,ResolvedMention,Some

@@ -1,0 +1,22 @@
+[package]
+name = "broker-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line client for agent-broker: listen on WS (NDJSON to stdout) + one-shot send verbs."
+
+[[bin]]
+name = "broker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

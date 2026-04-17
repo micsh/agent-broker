@@ -31,7 +31,7 @@ echo "   Downloading from $BASE..."
 
 mkdir -p "$INSTALL_DIR"
 
-for BIN in agent-broker broker-mcp; do
+for BIN in agent-broker broker-mcp broker; do
     URL="$BASE/$BIN-$SUFFIX"
     DEST="$INSTALL_DIR/$BIN"
     curl -fsSL "$URL" -o "$DEST"
@@ -44,3 +44,4 @@ echo "✅ Installed to $INSTALL_DIR"
 echo ""
 echo "   Start the broker:  $INSTALL_DIR/agent-broker"
 echo "   MCP server:        $INSTALL_DIR/broker-mcp"
+echo "   CLI client:        $INSTALL_DIR/broker"

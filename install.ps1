@@ -16,7 +16,7 @@ Write-Host "   Release: $($release.tag_name)"
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
-foreach ($bin in @("agent-broker", "broker-mcp")) {
+foreach ($bin in @("agent-broker", "broker-mcp", "broker")) {
     $asset = "$bin-windows-x64.exe"
     $url = ($release.assets | Where-Object { $_.name -eq $asset }).browser_download_url
 
@@ -35,3 +35,4 @@ Write-Host "✅ Installed to $InstallDir" -ForegroundColor Green
 Write-Host ""
 Write-Host "   Start the broker:  $InstallDir\agent-broker.exe" -ForegroundColor Yellow
 Write-Host "   MCP server:        $InstallDir\broker-mcp.exe" -ForegroundColor Yellow
+Write-Host "   CLI client:        $InstallDir\broker.exe" -ForegroundColor Yellow
