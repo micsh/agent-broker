@@ -57,6 +57,26 @@ pub struct StanzaArgs {
     pub stanza: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ToolRegisterArgs {
+    /// Tool name (globally unique, max 128 chars, no leading/trailing whitespace)
+    pub name: String,
+    /// Prose description of what the tool does and when to use it (required, max 2000 chars)
+    pub description: String,
+    /// Freeform responsible party text (e.g. "Operator project CopilotCli"). Optional.
+    #[serde(default)]
+    pub maintainer: Option<String>,
+    /// Routing hint — DM target, channel address, or URL. Optional.
+    #[serde(default)]
+    pub contact: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ToolNameArgs {
+    /// Tool name to look up or deregister
+    pub name: String,
+}
+
 #[derive(Deserialize)]
 struct RegProjResp { project_key: String }
 #[derive(Deserialize)]
@@ -69,6 +89,15 @@ struct PendingMsg { from_agent: String, from_project: String, body: String, crea
 struct PeekSender { from: String, at: String }
 #[derive(Deserialize)]
 struct PeekResp { count: usize, senders: Vec<PeekSender> }
+#[derive(Deserialize)]
+struct McpToolEntry {
+    name: String,
+    description: String,
+    maintainer: String,
+    contact: String,
+    registered_by: String,
+    last_updated: String,
+}
 
 fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
@@ -227,6 +256,88 @@ impl BrokerTools {
             .collect();
         Ok(CallToolResult::success(vec![Content::text(format!("{} message(s):\n\n{}", messages.len(), lines.join("\n\n")))]))
     }
+
+    #[tool(description = "Register or update a tool entry in the broker registry. Any agent can claim any name (last write wins). Requires active session.")]
+    async fn broker_tool_register(&self, Parameters(args): Parameters<ToolRegisterArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (agent_name, project, key, url) = self.session.get()?;
+        let resp = self.client
+            .put(format!("{}/tools/{}", url, args.name))
+            .header("X-Project", &project)
+            .header("X-Project-Key", &key)
+            .header("X-Agent-Name", &agent_name)
+            .json(&serde_json::json!({
+                "description": args.description,
+                "maintainer": args.maintainer,
+                "contact": args.contact,
+            }))
+            .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?;
+        if resp.status().is_success() {
+            let entry: McpToolEntry = resp.json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                format!("Registered tool '{}' (last updated {})", entry.name, entry.last_updated))]))
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(mcp_err(format!("Tool registration failed: {body}")))
+        }
+    }
+
+    #[tool(description = "Look up a tool by name. Returns its description, maintainer, and contact info. Returns null-equivalent text if not registered.")]
+    async fn broker_tool_get(&self, Parameters(args): Parameters<ToolNameArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_, _, _, url) = self.session.get()?;
+        let resp = self.client
+            .get(format!("{}/tools/{}", url, args.name))
+            .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(CallToolResult::success(vec![Content::text(format!("Tool '{}' is not registered.", args.name))]));
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(mcp_err(format!("Tool lookup failed: {body}")));
+        }
+        let entry: McpToolEntry = resp.json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
+        let maintainer = if entry.maintainer.is_empty() { "unspecified".to_string() } else { entry.maintainer };
+        let contact = if entry.contact.is_empty() { "unspecified".to_string() } else { entry.contact };
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} — {}\n  maintainer: {}\n  contact: {}\n  registered_by: {}\n  last_updated: {}",
+            entry.name, entry.description, maintainer, contact, entry.registered_by, entry.last_updated
+        ))]))
+    }
+
+    #[tool(description = "Browse all registered tools. Useful for discovering available capabilities and their maintainers.")]
+    async fn broker_tool_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_, _, _, url) = self.session.get()?;
+        let tools: Vec<McpToolEntry> = self.client
+            .get(format!("{}/tools", url))
+            .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?
+            .json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
+        if tools.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text("No tools registered.")]));
+        }
+        let lines: Vec<String> = tools.iter().map(|t| {
+            let maintainer = if t.maintainer.is_empty() { "unspecified".to_string() } else { t.maintainer.clone() };
+            format!("{} — {}\n  maintainer: {}\n  registered_by: {}", t.name, t.description, maintainer, t.registered_by)
+        }).collect();
+        Ok(CallToolResult::success(vec![Content::text(lines.join("\n\n"))]))
+    }
+
+    #[tool(description = "Deregister a tool entry. Use when a tool is decommissioned. Requires active session.")]
+    async fn broker_tool_deregister(&self, Parameters(args): Parameters<ToolNameArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (agent_name, project, key, url) = self.session.get()?;
+        let resp = self.client
+            .delete(format!("{}/tools/{}", url, args.name))
+            .header("X-Project", &project)
+            .header("X-Project-Key", &key)
+            .header("X-Agent-Name", &agent_name)
+            .send().await.map_err(|e| mcp_err(format!("Broker unreachable: {e}")))?;
+        match resp.status().as_u16() {
+            204 => Ok(CallToolResult::success(vec![Content::text(format!("Tool '{}' deregistered.", args.name))])),
+            404 => Ok(CallToolResult::success(vec![Content::text(format!("Tool '{}' is not registered.", args.name))])),
+            _ => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(mcp_err(format!("Deregister failed: {body}")))
+            }
+        }
+    }
 }
 
 #[tool_handler]
@@ -236,6 +347,6 @@ impl ServerHandler for BrokerTools {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send, broker_send_stanza, broker_peek, broker_messages.".to_string())
+        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send, broker_send_stanza, broker_peek, broker_messages. Tool registry: broker_tool_register, broker_tool_list, broker_tool_get, broker_tool_deregister.".to_string())
     }
 }

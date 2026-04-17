@@ -1,7 +1,7 @@
 FILE: repository.rs
 MOD: db/repository
-ROLE: Central SQL repository — all data access for agents, projects, channels, messages, delivery log, cross-project auth
-EP: Repository::new; register_project; register_agent; agent_exists; project_exists; ensure_channel; channel_exists; is_cross_project_allowed; find_agents_by_name; get_subscribers; drain_pending; peek_pending; insert_message; record_pending; record_delivered; cleanup; get_agent_description; set_agent_description; list_registered_agents
+ROLE: Central SQL repository — all data access for agents, projects, channels, messages, delivery log, cross-project auth, tool registry
+EP: Repository::new; register_project; register_agent; agent_exists; project_exists; ensure_channel; channel_exists; is_cross_project_allowed; find_agents_by_name; get_subscribers; drain_pending; peek_pending; insert_message; record_pending; record_delivered; cleanup; get_agent_description; set_agent_description; list_registered_agents; register_tool; get_tool; list_tools; delete_tool
 STAB: volatile
 INV:
   - ALL SQL lives in this file — no queries in any other module
@@ -15,6 +15,11 @@ INV:
   - drain_pending: SELECT then UPDATE in separate Mutex acquisitions (REF-06 — not atomic, known debt)
   - ensure_channel enforces no-dot constraint on channel names: [\w-]+ only
   - cleanup: must delete delivery_log entries BEFORE messages (FK constraint)
+  - register_tool uses INSERT...ON CONFLICT DO UPDATE — full replace on conflict (last write wins; no COALESCE)
+  - tools table has NO FK to agents or projects — tool entries survive agent/project deletion; registered_by_* are advisory
+  - get_tool returns None if not registered; list_tools returns empty Vec (not error) — callers treat missing as unregistered
+  - delete_tool returns Err if name not found (0 rows affected)
+  - ToolEntry.registered_by is "Name.Project" — formatted from registered_by_name + registered_by_project at query time
 CHK: cargo test repository; verify project-isolation tests; check FK order in cleanup
 CNTR: db/repository::drain_pending must_not modify message body
 CNTR: db/repository::register_project used_by broker/state::register_project

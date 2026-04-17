@@ -46,6 +46,18 @@ pub struct BrokerStats {
     pub pending_count: i64,
 }
 
+/// A registered tool entry — global service-discovery record.
+/// `registered_by` is the qualified agent address ("Name.Project") of the last writer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolEntry {
+    pub name: String,
+    pub description: String,
+    pub maintainer: String,
+    pub contact: String,
+    pub registered_by: String,
+    pub last_updated: String,
+}
+
 /// Project lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectStatus {
@@ -421,6 +433,109 @@ impl Repository {
         stmt.query_map(params![name], |row| Ok((row.get(0)?, row.get(1)?)))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    // --- Tools ---
+
+    /// Register or replace a tool entry (global service-discovery record).
+    /// On conflict, replaces all fields including registered_by and last_updated.
+    /// Returns the persisted entry.
+    pub fn register_tool(
+        &self,
+        name: &str,
+        description: &str,
+        maintainer: &str,
+        contact: &str,
+        agent_name: &str,
+        agent_project: &str,
+    ) -> Result<ToolEntry, String> {
+        self.conn().execute(
+            "INSERT INTO tools (name, description, maintainer, contact, registered_by_name, registered_by_project, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+               description           = excluded.description,
+               maintainer            = excluded.maintainer,
+               contact               = excluded.contact,
+               registered_by_name    = excluded.registered_by_name,
+               registered_by_project = excluded.registered_by_project,
+               last_updated          = datetime('now')",
+            params![name, description, maintainer, contact, agent_name, agent_project],
+        ).map_err(|e| format!("Failed to register tool: {e}"))?;
+        self.get_tool(name).ok_or_else(|| "Tool not found after upsert".to_string())
+    }
+
+    /// Get a single tool entry by exact name. Returns None if not registered.
+    pub fn get_tool(&self, name: &str) -> Option<ToolEntry> {
+        let conn = self.conn();
+        conn.prepare(
+            "SELECT name, description, maintainer, contact, registered_by_name, registered_by_project, last_updated
+             FROM tools WHERE name = ?1",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_row(params![name], |row| {
+                Ok(ToolEntry {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    maintainer: row.get(2)?,
+                    contact: row.get(3)?,
+                    registered_by: format!("{}.{}", row.get::<_, String>(4)?, row.get::<_, String>(5)?),
+                    last_updated: row.get(6)?,
+                })
+            })
+            .ok()
+        })
+    }
+
+    /// List all registered tools ordered by name ascending.
+    pub fn list_tools(&self) -> Vec<ToolEntry> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT name, description, maintainer, contact, registered_by_name, registered_by_project, last_updated
+             FROM tools ORDER BY name ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            if let (Ok(name), Ok(description), Ok(maintainer), Ok(contact), Ok(by_name), Ok(by_project), Ok(last_updated)) = (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, String>(3),
+                row.get::<_, String>(4),
+                row.get::<_, String>(5),
+                row.get::<_, String>(6),
+            ) {
+                result.push(ToolEntry {
+                    name,
+                    description,
+                    maintainer,
+                    contact,
+                    registered_by: format!("{}.{}", by_name, by_project),
+                    last_updated,
+                });
+            }
+        }
+        result
+    }
+
+    /// Remove a tool entry by name. Returns Err if no entry found with that name.
+    pub fn delete_tool(&self, name: &str) -> Result<(), String> {
+        let rows = self.conn().execute(
+            "DELETE FROM tools WHERE name = ?1",
+            params![name],
+        ).map_err(|e| format!("Failed to delete tool: {e}"))?;
+        if rows == 0 {
+            Err(format!("Tool '{}' not found", name))
+        } else {
+            Ok(())
+        }
     }
 
     // --- Channels ---
@@ -992,5 +1107,71 @@ mod tests {
         let agents = repo.list_registered_agents(Some("proj-a"));
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].0, "Alice");
+    }
+}
+
+#[cfg(test)]
+mod tests_tools {
+    use super::*;
+    use crate::db::schema::ensure_schema;
+
+    fn make_repo() -> Repository {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let repo = Repository::new(conn);
+        // Tools table has no FK to projects/agents — no setup needed
+        repo
+    }
+
+    #[test]
+    fn register_tool_creates_entry() {
+        let repo = make_repo();
+        let entry = repo.register_tool("knowledge-sight", "Retrieves knowledge articles", "", "", "Alice", "CopilotCli").unwrap();
+        assert_eq!(entry.name, "knowledge-sight");
+        assert_eq!(entry.description, "Retrieves knowledge articles");
+        assert_eq!(entry.registered_by, "Alice.CopilotCli");
+    }
+
+    #[test]
+    fn register_tool_upsert_replaces_description() {
+        let repo = make_repo();
+        repo.register_tool("my-tool", "Original description", "", "", "Alice", "Proj").unwrap();
+        let updated = repo.register_tool("my-tool", "Updated description", "Alice", "dm Alice.Proj", "Bob", "Other").unwrap();
+        assert_eq!(updated.description, "Updated description");
+        assert_eq!(updated.registered_by, "Bob.Other");
+    }
+
+    #[test]
+    fn register_tool_registered_by_format() {
+        let repo = make_repo();
+        let entry = repo.register_tool("fmt-tool", "desc", "maintainer", "contact", "Neo", "Matrix").unwrap();
+        assert_eq!(entry.registered_by, "Neo.Matrix");
+    }
+
+    #[test]
+    fn list_tools_ordered_by_name() {
+        let repo = make_repo();
+        repo.register_tool("zebra-tool", "z", "", "", "A", "P").unwrap();
+        repo.register_tool("alpha-tool", "a", "", "", "A", "P").unwrap();
+        let tools = repo.list_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "alpha-tool");
+        assert_eq!(tools[1].name, "zebra-tool");
+    }
+
+    #[test]
+    fn delete_tool_removes_entry() {
+        let repo = make_repo();
+        repo.register_tool("temp-tool", "desc", "", "", "A", "P").unwrap();
+        repo.delete_tool("temp-tool").unwrap();
+        assert!(repo.get_tool("temp-tool").is_none());
+    }
+
+    #[test]
+    fn delete_tool_missing_returns_err() {
+        let repo = make_repo();
+        let result = repo.delete_tool("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 }

@@ -1,7 +1,7 @@
 FILE: admin.rs
 MOD: api/admin
-ROLE: Admin router — operator-level endpoints for project management, stats, suspension, and cascade deletion
-EP: admin_router; list_projects; get_stats; project_stats; delete_project; suspend_project; unsuspend_project
+ROLE: Admin router — operator-level endpoints for project management, stats, suspension, cascade deletion, and tool registry force-delete
+EP: admin_router; list_projects; get_stats; project_stats; delete_project; suspend_project; unsuspend_project; admin_delete_tool
 STAB: volatile
 INV:
   - All admin handlers require AdminAuth — zero shared code with ProjectAuth or AgentAuth
@@ -11,6 +11,7 @@ INV:
   - Admin handlers access repo via state.broker.repo — same path as regular handlers, not a bypass
   - AdminAuth returns 503 if BROKER_ADMIN_KEY env var not set (admin API disabled), 401 if key wrong
   - No admin operation touches body content or stanza routing logic
+  - DELETE /admin/tools/{name} — operator escape hatch for squatted/abandoned tool entries; 204 on success, 404 if not found
 LOOK: delete_project handler comment; disconnect_all_in_project in state.rs; verify_project_key status check in repository.rs
 CHK: arch validate && arch index after changes; verify disconnect before delete ordering in tests
 CNTR: api/admin::delete_project depends_on broker/state::disconnect_all_in_project

@@ -15,6 +15,8 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/projects/{name}/unsuspend", post(unsuspend_project))
         .route("/projects/{name}/stats", get(project_stats))
         .route("/stats", get(get_stats))
+        // Tool registry admin escape hatch — force-delete squatted/abandoned entries
+        .route("/tools/{name}", delete(admin_delete_tool))
 }
 
 async fn list_projects(
@@ -71,4 +73,17 @@ async fn project_stats(
     Path(name): Path<String>,
 ) -> Json<ProjectStats> {
     Json(state.broker.repo.project_stats(&name))
+}
+
+/// DELETE /admin/tools/{name} — operator force-delete of a tool entry.
+/// Use when the owning agent cannot or will not deregister (squatting, abandonment).
+async fn admin_delete_tool(
+    State(state): State<Arc<AppState>>,
+    _auth: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.broker.repo
+        .delete_tool(&name)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("Tool '{}' not found", name)))
 }

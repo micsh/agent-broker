@@ -71,6 +71,16 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
             target_project TEXT NOT NULL,
             PRIMARY KEY (source_project, target_project)
         );
+
+        CREATE TABLE IF NOT EXISTS tools (
+            name                  TEXT PRIMARY KEY,
+            description           TEXT NOT NULL,
+            maintainer            TEXT NOT NULL DEFAULT '',
+            contact               TEXT NOT NULL DEFAULT '',
+            registered_by_name    TEXT NOT NULL,
+            registered_by_project TEXT NOT NULL,
+            last_updated          TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .map_err(|e| format!("Schema setup failed: {e}"))?;

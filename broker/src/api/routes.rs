@@ -1,7 +1,7 @@
 use crate::api::auth::AgentAuth;
 use crate::broker::state::{AgentState, BrokerState};
 use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
-use crate::db::repository::PendingMessage;
+use crate::db::repository::{PendingMessage, ToolEntry};
 use crate::stanza;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -47,7 +47,12 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/agents", get(list_agents))
         .route("/messages", get(get_messages))
         .route("/messages/peek", get(peek_messages))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        // Tool registry — write paths require AgentAuth; read paths are open
+        .route("/tools", get(list_tools))
+        .route("/tools/{name}", put(register_tool_entry))
+        .route("/tools/{name}", get(get_tool_entry))
+        .route("/tools/{name}", delete(delete_tool_entry));
 
     Router::new()
         .merge(write_routes)
@@ -156,7 +161,86 @@ pub struct RekeyResponse {
     pub enrolled: bool,
 }
 
-// --- Handlers ---
+/// PUT /tools/{name} request body.
+#[derive(Deserialize)]
+pub struct RegisterToolRequest {
+    pub description: String,
+    pub maintainer: Option<String>,
+    pub contact: Option<String>,
+}
+
+// --- Tool registry handlers ---
+
+/// PUT /tools/{name} — create or replace a tool entry.
+/// Auth: AgentAuth (X-Project + X-Project-Key + X-Agent-Name). Last write wins.
+async fn register_tool_entry(
+    State(state): State<Arc<AppState>>,
+    auth: AgentAuth,
+    Path(name): Path<String>,
+    Json(req): Json<RegisterToolRequest>,
+) -> Result<Json<ToolEntry>, (StatusCode, String)> {
+    // Name validation: reject leading/trailing whitespace
+    if name != name.trim() {
+        return Err((StatusCode::BAD_REQUEST, "tool name must not have leading or trailing whitespace".to_string()));
+    }
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tool name must not be empty".to_string()));
+    }
+    if name.chars().count() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "tool name exceeds 128 characters".to_string()));
+    }
+    // Description is required and non-empty
+    if req.description.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "description must not be empty".to_string()));
+    }
+    if req.description.chars().count() > 2000 {
+        return Err((StatusCode::BAD_REQUEST, "description exceeds 2000 characters".to_string()));
+    }
+    let maintainer = req.maintainer.unwrap_or_default();
+    if maintainer.chars().count() > 500 {
+        return Err((StatusCode::BAD_REQUEST, "maintainer exceeds 500 characters".to_string()));
+    }
+    let contact = req.contact.unwrap_or_default();
+    if contact.chars().count() > 500 {
+        return Err((StatusCode::BAD_REQUEST, "contact exceeds 500 characters".to_string()));
+    }
+    let entry = state.broker.repo
+        .register_tool(&name, &req.description, &maintainer, &contact, &auth.agent_name, &auth.project)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(entry))
+}
+
+/// GET /tools — list all registered tools, ordered by name. Open endpoint (no auth).
+async fn list_tools(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<ToolEntry>> {
+    Json(state.broker.repo.list_tools())
+}
+
+/// GET /tools/{name} — get a single tool entry. Open endpoint (no auth).
+async fn get_tool_entry(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ToolEntry>, (StatusCode, String)> {
+    state.broker.repo
+        .get_tool(&name)
+        .map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Tool '{}' not found", name)))
+}
+
+/// DELETE /tools/{name} — deregister a tool entry. AgentAuth required (any authenticated agent).
+async fn delete_tool_entry(
+    State(state): State<Arc<AppState>>,
+    _auth: AgentAuth,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.broker.repo
+        .delete_tool(&name)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("Tool '{}' not found", name)))
+}
+
+// --- Health and project handlers ---
 
 async fn health() -> &'static str {
     "ok"
@@ -671,5 +755,264 @@ mod tests {
         // Default (include_offline=false) should return empty (Alice never connected via WS)
         let agents = state.broker.list_agents(None, false).await;
         assert!(agents.is_empty(), "should return no connected agents");
+    }
+
+    // --- Tool registry integration tests ---
+
+    /// PUT /tools/{name} with valid AgentAuth creates entry, returns 200 + ToolEntry JSON.
+    #[tokio::test]
+    async fn put_tool_creates_returns_200() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/knowledge-sight")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj")
+                .header("X-Project-Key", &key)
+                .header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({
+                    "description": "Retrieves knowledge articles"
+                }).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body["name"], "knowledge-sight");
+        assert_eq!(body["description"], "Retrieves knowledge articles");
+        assert_eq!(body["registered_by"], "Alice.proj");
+    }
+
+    /// Second PUT with different description replaces entry, returns 200.
+    #[tokio::test]
+    async fn put_tool_updates_existing_200() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let put = |desc: &'static str| {
+            let app = app.clone();
+            let key = key.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("PUT").uri("/tools/my-tool")
+                        .header("content-type", "application/json")
+                        .header("X-Project", "proj")
+                        .header("X-Project-Key", &key)
+                        .header("X-Agent-Name", "Alice")
+                        .body(Body::from(serde_json::json!({"description": desc}).to_string()))
+                        .unwrap()
+                ).await.unwrap()
+            }
+        };
+
+        put("First description").await;
+        let resp = put("Updated description").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body["description"], "Updated description");
+    }
+
+    /// PUT with empty name segment is a 404 (axum routing — no route matches empty segment).
+    /// PUT with whitespace-only description returns 400.
+    #[tokio::test]
+    async fn put_tool_empty_description_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/my-tool")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj")
+                .header("X-Project-Key", &key)
+                .header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "   "}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT with description > 2000 chars returns 400.
+    #[tokio::test]
+    async fn put_tool_description_too_long_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let long: String = "x".repeat(2001);
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/my-tool")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj")
+                .header("X-Project-Key", &key)
+                .header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": long}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT with name > 128 chars returns 400.
+    #[tokio::test]
+    async fn put_tool_name_too_long_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let long_name: String = "a".repeat(129);
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PUT").uri(&format!("/tools/{long_name}"))
+                .header("content-type", "application/json")
+                .header("X-Project", "proj")
+                .header("X-Project-Key", &key)
+                .header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "desc"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT without auth headers returns 400 (missing X-Project header).
+    #[tokio::test]
+    async fn put_tool_unauthenticated_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/my-tool")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"description": "desc"}).to_string()))
+                .unwrap()
+        ).await.unwrap();
+        // AgentAuth extractor returns 400 for missing X-Project header
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// GET /tools returns 200 + empty array when no tools registered.
+    #[tokio::test]
+    async fn get_tools_empty_returns_200_empty_array() {
+        let state = make_state();
+        let app = test_app(state);
+
+        let resp = app.oneshot(
+            Request::builder().method("GET").uri("/tools")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// GET /tools returns all registered entries.
+    #[tokio::test]
+    async fn get_tools_returns_list() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/tool-a")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "Tool A"}).to_string())).unwrap()
+        ).await.unwrap();
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/tool-b")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "Tool B"}).to_string())).unwrap()
+        ).await.unwrap();
+
+        let resp = app.oneshot(
+            Request::builder().method("GET").uri("/tools").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 2);
+    }
+
+    /// GET /tools/{name} returns 200 + entry when found.
+    #[tokio::test]
+    async fn get_tool_by_name_returns_200() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/specific-tool")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "Specific"}).to_string())).unwrap()
+        ).await.unwrap();
+
+        let resp = app.oneshot(
+            Request::builder().method("GET").uri("/tools/specific-tool").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body["name"], "specific-tool");
+    }
+
+    /// GET /tools/{name} returns 404 when not found.
+    #[tokio::test]
+    async fn get_tool_by_name_not_found_returns_404() {
+        let state = make_state();
+        let app = test_app(state);
+
+        let resp = app.oneshot(
+            Request::builder().method("GET").uri("/tools/missing").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// DELETE /tools/{name} with AgentAuth returns 204.
+    #[tokio::test]
+    async fn delete_tool_returns_204() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT").uri("/tools/deletable")
+                .header("content-type", "application/json")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::from(serde_json::json!({"description": "To delete"}).to_string())).unwrap()
+        ).await.unwrap();
+
+        let resp = app.oneshot(
+            Request::builder()
+                .method("DELETE").uri("/tools/deletable")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// DELETE /tools/{name} returns 404 when not found.
+    #[tokio::test]
+    async fn delete_tool_not_found_returns_404() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        let resp = app.oneshot(
+            Request::builder()
+                .method("DELETE").uri("/tools/nonexistent")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
