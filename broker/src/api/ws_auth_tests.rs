@@ -27,13 +27,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 
+// ── Test constants ────────────────────────────────────────────────────────────
+
+/// Shared secret used in tests that exercise the Boards TOFU bootstrap path.
+const TEST_BOARDS_TOKEN: &str = "test-registration-token-xyz";
+
 // ── Test server ───────────────────────────────────────────────────────────────
 
 async fn spawn_test_server() -> (SocketAddr, Arc<AppState>) {
+    spawn_test_server_inner(None).await
+}
+
+async fn spawn_test_server_with_boards_token(token: &str) -> (SocketAddr, Arc<AppState>) {
+    spawn_test_server_inner(Some(token.to_string())).await
+}
+
+async fn spawn_test_server_inner(boards_registration_token: Option<String>) -> (SocketAddr, Arc<AppState>) {
     let repo = Arc::new(db::open_memory().expect("in-memory DB"));
     let broker = Arc::new(BrokerState::new(repo));
     let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
-    let config = BrokerConfig { admin_key: None, rate_limit_rps: 100 };
+    let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token };
     let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
     let state = Arc::new(AppState { broker, delivery, config, rate_limiter });
 
@@ -92,11 +105,20 @@ fn setup_agent(state: &Arc<AppState>, project: &str, project_key: &str, agent: &
 }
 
 /// Do HELLO → CHALLENGE exchange. Returns nonce_b64 from the CHALLENGE X-Nonce header.
-/// `xpubkey`: if Some, adds an X-Pubkey header to the HELLO frame.
-async fn hello_and_get_challenge(ws: &mut WsStream, identity: &str, xpubkey: Option<&str>) -> String {
+/// `xpubkey`: if Some, adds X-Pubkey to the HELLO frame.
+/// `xtoken`: if Some, adds X-Registration-Token to the HELLO frame (for Boards TOFU).
+async fn hello_and_get_challenge(
+    ws: &mut WsStream,
+    identity: &str,
+    xpubkey: Option<&str>,
+    xtoken: Option<&str>,
+) -> String {
     let mut hello = HttpFrame::request("HELLO", "/v1/sessions").add_header("X-From", identity);
     if let Some(key) = xpubkey {
         hello = hello.add_header("X-Pubkey", key);
+    }
+    if let Some(token) = xtoken {
+        hello = hello.add_header("X-Registration-Token", token);
     }
     let hello = hello.finalize();
     send_frame(ws, &hello).await;
@@ -152,7 +174,7 @@ async fn ws_expired_nonce_sends_auth_stale() {
     let identity = "Alice@proj-stale";
 
     let mut ws = ws_connect(addr).await;
-    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None).await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None, None).await;
 
     // Derive nonce_hex to pre-drain it — simulates TTL expiry.
     let nonce_bytes = base64::engine::general_purpose::STANDARD
@@ -189,7 +211,7 @@ async fn ws_wrong_key_sends_auth_wrong_key_and_burns_nonce() {
     let identity = "Bob@proj-badkey";
 
     let mut ws = ws_connect(addr).await;
-    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None).await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None, None).await;
 
     // Sign with a DIFFERENT key — not the registered one.
     let wrong_key = SigningKey::generate(&mut OsRng);
@@ -228,7 +250,7 @@ async fn ws_duplicate_connect_rejected_with_409() {
 
     // First connection — must succeed.
     let mut ws1 = ws_connect(addr).await;
-    let nonce1 = hello_and_get_challenge(&mut ws1, identity, None).await;
+    let nonce1 = hello_and_get_challenge(&mut ws1, identity, None, None).await;
     let sig1 = sign_challenge(&signing_key, identity, &nonce1);
     let auth1 = HttpFrame::request("AUTH", "/v1/sessions")
         .add_header("X-Sig", &sig1)
@@ -239,7 +261,7 @@ async fn ws_duplicate_connect_rejected_with_409() {
 
     // Second connection — same identity, first still active → must get 409.
     let mut ws2 = ws_connect(addr).await;
-    let nonce2 = hello_and_get_challenge(&mut ws2, identity, None).await;
+    let nonce2 = hello_and_get_challenge(&mut ws2, identity, None, None).await;
     let sig2 = sign_challenge(&signing_key, identity, &nonce2);
     let auth2 = HttpFrame::request("AUTH", "/v1/sessions")
         .add_header("X-Sig", &sig2)
@@ -268,7 +290,7 @@ async fn ws_agent_xpubkey_ignored_no_rotation_attack() {
 
     let mut ws = ws_connect(addr).await;
     // HELLO with attacker's X-Pubkey — broker must ignore it.
-    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, Some(&attacker_pubkey_b64)).await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, Some(&attacker_pubkey_b64), None).await;
 
     // Sign with attacker's key — broker uses STORED pubkey → verify fails.
     let sig = sign_challenge(&attacker_key, identity, &nonce_b64);
@@ -301,7 +323,7 @@ async fn ws_agent_xpubkey_ignored_no_rotation_attack() {
 /// Proves that agents cannot impersonate other agents via X-From on POST.
 #[tokio::test]
 async fn ws_post_xfrom_canonicalized_prevents_impersonation() {
-    let (addr, state) = spawn_test_server().await;
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
     let agent_key = setup_agent(&state, "proj-xfrom", "key-xfrom", "Alice");
     let agent_identity = "Alice@proj-xfrom";
 
@@ -315,6 +337,7 @@ async fn ws_post_xfrom_canonicalized_prevents_impersonation() {
     let mut boards_hello = HttpFrame::request("HELLO", "/v1/sessions")
         .add_header("X-From", boards_identity);
     boards_hello = boards_hello.add_header("X-Pubkey", &boards_pubkey_b64);
+    boards_hello = boards_hello.add_header("X-Registration-Token", TEST_BOARDS_TOKEN);
     let boards_hello = boards_hello.finalize();
     send_frame(&mut boards_ws, &boards_hello).await;
     let boards_challenge = recv_frame(&mut boards_ws).await;
@@ -330,7 +353,7 @@ async fn ws_post_xfrom_canonicalized_prevents_impersonation() {
 
     // --- Connect agent ---
     let mut agent_ws = ws_connect(addr).await;
-    let nonce_b64 = hello_and_get_challenge(&mut agent_ws, agent_identity, None).await;
+    let nonce_b64 = hello_and_get_challenge(&mut agent_ws, agent_identity, None, None).await;
     let sig = sign_challenge(&agent_key, agent_identity, &nonce_b64);
     let auth = HttpFrame::request("AUTH", "/v1/sessions")
         .add_header("X-Sig", &sig)
@@ -368,7 +391,7 @@ async fn ws_post_xfrom_canonicalized_prevents_impersonation() {
 /// completes the four-frame handshake successfully.
 #[tokio::test]
 async fn ws_boards_tofu_first_connect_stores_key_and_succeeds() {
-    let (addr, state) = spawn_test_server().await;
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
     // Register project only — NO Boards agent row, NO stored key.
     state.broker.repo.register_project("proj-tofu", "pkey-tofu").expect("register_project");
 
@@ -385,7 +408,7 @@ async fn ws_boards_tofu_first_connect_stores_key_and_succeeds() {
     );
 
     let mut ws = ws_connect(addr).await;
-    let nonce_b64 = hello_and_get_challenge(&mut ws, boards_identity, Some(&boards_pubkey_b64)).await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, boards_identity, Some(&boards_pubkey_b64), Some(TEST_BOARDS_TOKEN)).await;
 
     let sig = sign_challenge(&boards_key, boards_identity, &nonce_b64);
     let auth = HttpFrame::request("AUTH", "/v1/sessions")
@@ -446,5 +469,111 @@ async fn ws_boards_key_rotation_rejected_before_challenge() {
         state.broker.repo.get_agent_public_key("Boards", "proj-no-rotate").as_deref(),
         Some(pinned_hex.as_str()),
         "stored Boards key must be unchanged after rotation rejection"
+    );
+}
+
+/// Scenario 9: Boards TOFU with no BOARDS_REGISTRATION_TOKEN configured (fail-closed).
+/// Broker must reject with 401 AUTH_INVALID_TOKEN — no open bootstrap allowed.
+#[tokio::test]
+async fn ws_boards_tofu_no_token_configured_rejected() {
+    // Server started WITHOUT a boards_registration_token.
+    let (addr, state) = spawn_test_server().await;
+    state.broker.repo.register_project("proj-notoken", "pkey-notoken").expect("register_project");
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-notoken";
+
+    let mut ws = ws_connect(addr).await;
+    // HELLO with valid X-Pubkey and even a token — but server has none configured.
+    let mut hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity)
+        .add_header("X-Pubkey", &boards_pubkey_b64);
+    hello = hello.add_header("X-Registration-Token", "any-token");
+    let hello = hello.finalize();
+    send_frame(&mut ws, &hello).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "must be 401 when no token configured: {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("AUTH_INVALID_TOKEN"),
+        "expected AUTH_INVALID_TOKEN: {:?}",
+        resp
+    );
+    // Key must NOT be written.
+    assert!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-notoken").is_none(),
+        "no key must be written when token check fails"
+    );
+}
+
+/// Scenario 10: Boards TOFU with missing X-Registration-Token header.
+/// Token is configured but header absent — must reject 401 AUTH_INVALID_TOKEN, no key written.
+#[tokio::test]
+async fn ws_boards_tofu_missing_token_header_rejected() {
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    state.broker.repo.register_project("proj-noheader", "pkey-noheader").expect("register_project");
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-noheader";
+
+    let mut ws = ws_connect(addr).await;
+    // HELLO with X-Pubkey but WITHOUT X-Registration-Token.
+    let hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity)
+        .add_header("X-Pubkey", &boards_pubkey_b64)
+        .finalize();
+    send_frame(&mut ws, &hello).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "must be 401 when token header absent: {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("AUTH_INVALID_TOKEN"),
+        "expected AUTH_INVALID_TOKEN: {:?}",
+        resp
+    );
+    assert!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-noheader").is_none(),
+        "no key must be written when token header is missing"
+    );
+}
+
+/// Scenario 11: Boards TOFU with wrong X-Registration-Token value.
+/// Token is configured but header value is wrong — must reject 401 AUTH_INVALID_TOKEN, no key written.
+#[tokio::test]
+async fn ws_boards_tofu_wrong_token_rejected() {
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    state.broker.repo.register_project("proj-wrongtoken", "pkey-wrongtoken").expect("register_project");
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-wrongtoken";
+
+    let mut ws = ws_connect(addr).await;
+    // HELLO with correct X-Pubkey but wrong token value.
+    let hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity)
+        .add_header("X-Pubkey", &boards_pubkey_b64)
+        .add_header("X-Registration-Token", "wrong-token-value")
+        .finalize();
+    send_frame(&mut ws, &hello).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "must be 401 for wrong token: {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("AUTH_INVALID_TOKEN"),
+        "expected AUTH_INVALID_TOKEN: {:?}",
+        resp
+    );
+    assert!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-wrongtoken").is_none(),
+        "no key must be written when token value is wrong"
     );
 }

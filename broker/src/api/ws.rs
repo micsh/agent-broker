@@ -68,8 +68,10 @@ fn error_response_with_code(status: u16, code: &str, reason: &str) -> HttpFrame 
 /// Returns `(name, project)` on success; sends an error frame and returns `None` on failure.
 ///
 /// Boards path (name == "Boards") — TOFU bootstrap rule (spec §6):
-///   • No stored key for Boards@project → X-Pubkey required; write once then CHALLENGE.
-///     Project row must already exist — 403 Forbidden if FK fails.
+///   • No stored key for Boards@project → token gate first (X-Registration-Token must match
+///     `BrokerConfig::boards_registration_token`; 401 AUTH_INVALID_TOKEN if absent/wrong).
+///     If token passes: X-Pubkey required; write once then CHALLENGE.
+///     If no token is configured in broker, TOFU is disabled (401).
 ///   • Stored key exists → X-Pubkey must be absent OR byte-equal to stored key.
 ///     Differing X-Pubkey → 401 KEY_MISMATCH, BEFORE CHALLENGE is issued (no rotation from wire).
 ///
@@ -118,7 +120,49 @@ async fn wait_for_handshake(
         let stored_hex = state.broker.repo.get_agent_public_key("Boards", &project);
         match stored_hex {
             None => {
-                // No stored key — X-Pubkey required for first-time registration.
+                // Token gate (spec §6): TOFU is gated behind a shared secret configured at
+                // startup via BOARDS_REGISTRATION_TOKEN. If not configured, TOFU is disabled.
+                match &state.config.boards_registration_token {
+                    None => {
+                        tracing::warn!(
+                            "Boards@{} TOFU attempt but BOARDS_REGISTRATION_TOKEN is not configured",
+                            project
+                        );
+                        let _ = send_frame(
+                            sender,
+                            &error_response_with_code(401, "AUTH_INVALID_TOKEN", "Unauthorized"),
+                        )
+                        .await;
+                        return None;
+                    }
+                    Some(expected) => {
+                        let provided = match frame.header("X-Registration-Token") {
+                            Some(t) => t.to_string(),
+                            None => {
+                                tracing::warn!(
+                                    "Boards@{} TOFU missing X-Registration-Token header",
+                                    project
+                                );
+                                let _ = send_frame(
+                                    sender,
+                                    &error_response_with_code(401, "AUTH_INVALID_TOKEN", "Unauthorized"),
+                                )
+                                .await;
+                                return None;
+                            }
+                        };
+                        if provided != *expected {
+                            tracing::warn!("Boards@{} TOFU X-Registration-Token mismatch", project);
+                            let _ = send_frame(
+                                sender,
+                                &error_response_with_code(401, "AUTH_INVALID_TOKEN", "Unauthorized"),
+                            )
+                            .await;
+                            return None;
+                        }
+                    }
+                }
+                // Token verified — X-Pubkey required for first-time registration.
                 let pubkey_b64 = match xpubkey {
                     Some(ref k) => k.clone(),
                     None => {
