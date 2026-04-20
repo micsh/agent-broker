@@ -6,8 +6,8 @@ DESC: MCP server (stdio) — exposes broker tools for AI agents (register, prese
 
 MOD: tools
   FILES: main.rs; tools.rs
-  OWN: BrokerTools; broker_register; broker_presence; broker_send; broker_send_stanza; broker_peek; broker_messages; xml_escape; send_raw
-  BND: MCP adapter only — constructs HTTP requests to broker, formats responses. No business logic.
+  OWN: BrokerTools; broker_register; broker_presence; broker_send; broker_frame_post; broker_peek; broker_messages; send_raw
+  BND: MCP adapter only — constructs HttpFrame requests to broker /v1/send, formats responses. No business logic.
   DEP: mcp/session
 
 MOD: session

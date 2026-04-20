@@ -15,7 +15,6 @@ CONT: api
 CONT: broker
 CONT: db
 CONT: identity
-CONT: stanza
 CONT: mcp
 
 # --- Negative rules (no_dependency) ---
@@ -35,19 +34,13 @@ RULE: broker-no-api
 RULE: identity-independence
   TYPE: no_dependency
   FROM: identity
-  TO: api; broker; db; stanza
+  TO: api; broker; db
   WHY: Identity is a leaf module — pure crypto, no dependencies on other layers
-
-RULE: stanza-independence
-  TYPE: no_dependency
-  FROM: stanza
-  TO: api; broker; db; identity
-  WHY: Stanza parser is a leaf module — pure parsing, no dependencies on other layers
 
 RULE: session-independence
   TYPE: no_dependency
   FROM: mcp/session
-  TO: api; broker; db; stanza; identity
+  TO: api; broker; db; identity
   WHY: SessionManager is a leaf — pure FS + in-memory state, no broker dependencies
 
 # --- Positive rules (restrict_callers_to) ---
@@ -57,12 +50,6 @@ RULE: identity-callers
   MODULE: identity
   ALLOWED: db/db; db/repository; broker/nonce; api/ws
   WHY: Crypto primitives used by persistence layer (hash_key/verify_key_hash), nonce store (build_challenge_payload), and WS auth handler (verify_agent_signature)
-
-RULE: stanza-callers
-  TYPE: restrict_callers_to
-  MODULE: stanza
-  ALLOWED: broker/state; broker/delivery; api/routes; api/ws
-  WHY: Stanza parsing contract used by broker routing layer and API handlers only
 
 RULE: db-callers
   TYPE: restrict_callers_to

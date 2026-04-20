@@ -1,21 +1,21 @@
 ARCH: 0.4
 CONT: api
 PATH: broker/src/api
-DEP: broker; db; identity; stanza
+DEP: broker; db; identity
 DESC: HTTP + WebSocket API layer — routes, request/response types, auth extractors, WS handlers
 
 MOD: routes
   FILES: mod.rs; routes.rs
   OWN: http-endpoints; request-types; response-types; AppState
   BND: HTTP boundary only — no business logic, no SQL
-  DEP: broker/state; broker/delivery; stanza/types
-  ROUTES: POST /projects/register; POST /agents/register; GET /agents; PUT /presence; POST /send; GET /messages; GET /messages/peek; POST /channels/{id}/subscribe; DELETE /channels/{id}/unsubscribe; GET /health
+  DEP: broker/state; broker/delivery
+  ROUTES: POST /projects/register; POST /agents/register; GET /agents; PUT /presence; POST /v1/send; GET /messages; GET /messages/peek; POST /channels/{id}/subscribe; DELETE /channels/{id}/unsubscribe; GET /health
 
 MOD: ws
   FILE: ws.rs
-  OWN: websocket-handler; connection-upgrade; live-streaming; WS-stanza-dispatch
+  OWN: websocket-handler; connection-upgrade; live-streaming; HttpFrame-dispatch
   BND: Connection management only — no delivery decisions
-  DEP: broker/state; broker/delivery; stanza/types; stanza/parser
+  DEP: broker/state; broker/delivery
 
 MOD: auth
   FILE: auth.rs

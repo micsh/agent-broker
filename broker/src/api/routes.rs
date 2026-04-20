@@ -1,10 +1,11 @@
 use crate::api::auth::AgentAuth;
 use crate::broker::state::{AgentState, BrokerState};
-use crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError};
+use crate::broker::DeliveryEngine;
 use crate::db::repository::{PendingMessage, ToolEntry};
-use crate::stanza;
+use crate::http_frame;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put, delete, patch};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
     // Write-path routes — rate-limited per project
     let write_routes = Router::new()
-        .route("/send", post(send_message))
+        .route("/v1/send", post(send_frame_http))
         .route("/presence", put(update_presence))
         .route("/channels/{id}/subscribe", post(subscribe_channel))
         .route("/channels/{id}/unsubscribe", delete(unsubscribe_channel))
@@ -108,11 +109,6 @@ pub struct PresenceRequest {
 /// Channel subscribe/unsubscribe payload -- credentials carried by AgentAuth extractor.
 #[derive(Deserialize)]
 pub struct ChannelRequest {}
-
-#[derive(Serialize)]
-pub struct SendResponse {
-    pub message_id: String,
-}
 
 #[derive(Deserialize)]
 pub struct AgentQuery {
@@ -402,55 +398,66 @@ async fn update_agent_description(
     Ok(StatusCode::OK)
 }
 
-/// Accept raw stanza XML. Auth via AgentAuth extractor (X-Project + X-Project-Key + X-Agent-Name headers).
-async fn send_message(
+/// POST /v1/send — accepts a raw HttpFrame text body, validates it, and forwards to Boards.
+/// Replaces POST /send (XML stanza path, removed in Phase 4). The frame's X-From is always
+/// overwritten with the authenticated session identity before forwarding (H2 invariant).
+async fn send_frame_http(
     State(state): State<Arc<AppState>>,
     AgentAuth { project, agent_name }: AgentAuth,
     body: String,
-) -> Result<Json<SendResponse>, (StatusCode, String)> {
-    // Reject empty or whitespace-only body
+) -> impl IntoResponse {
     if body.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Request body must not be empty".to_string()));
+        return (StatusCode::BAD_REQUEST, "Request body must not be empty").into_response();
     }
 
-    let parsed = stanza::parse(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid stanza: {e}")))?;
+    let mut frame = match http_frame::parse(&body) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid HttpFrame: {e}")).into_response(),
+    };
 
-    // Verify stanza from= matches authenticated agent (accept qualified or unqualified form)
-    if let stanza::Stanza::Message(ref msg) = parsed {
-        let (stanza_name, _) = stanza::resolve_agent_name(&msg.from, &project);
-        if stanza_name != agent_name {
-            return Err((
-                StatusCode::FORBIDDEN,
-                format!("Stanza from='{}' does not match authenticated agent '{}'", msg.from, agent_name),
-            ));
+    let verb = frame.verb().unwrap_or("").to_string();
+    let path = frame.path().unwrap_or("").to_string();
+
+    let xto = match frame.header("X-To").map(|s| s.to_string()) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, "Missing X-To header").into_response(),
+    };
+
+    if let Err(e) = http_frame::validate_xto_shape(&verb, &path, &xto) {
+        return (StatusCode::BAD_REQUEST, format!("Invalid X-To: {e}")).into_response();
+    }
+
+    let target_project = match (verb.as_str(), path.as_str()) {
+        ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
+            match http_frame::parse_channel(&xto) {
+                Ok((_, p)) => p.to_string(),
+                Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To channel format").into_response(),
+            }
         }
-    }
+        ("POST", "/v1/dms") => {
+            match http_frame::parse_identity(&xto) {
+                Ok((_, p)) => p.to_string(),
+                Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To identity format").into_response(),
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, format!("Unsupported verb/path: {verb} {path}")).into_response(),
+    };
 
-    match dispatch_stanza(parsed, &project, &state.broker, &state.delivery, true).await {
-        Ok(DispatchResult::MessageSent(id)) => Ok(Json(SendResponse { message_id: id })),
-        Ok(DispatchResult::PresenceUpdated) => Ok(Json(SendResponse { message_id: String::new() })),
-        Err(DispatchError::TargetNotFound { agent, project }) => Err((
-            StatusCode::BAD_REQUEST,
-            format!("Target agent '{}' not found in project '{}'", agent, project),
-        )),
-        Err(DispatchError::DeliveryFailed(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        Err(DispatchError::CrossProjectDenied { source, target }) => Err((
-            StatusCode::FORBIDDEN,
-            format!("Cross-project post from '{}' to '{}' is not authorized", source, target),
-        )),
-        Err(DispatchError::CrossProjectNotFound { channel, project }) => Err((
-            StatusCode::NOT_FOUND,
-            format!("Channel '{}' in project '{}' not found", channel, project),
-        )),
-        Err(DispatchError::AmbiguousMention { name, projects }) => Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Mention @{} is ambiguous: found in projects [{}]. Use Name.Project to disambiguate.",
-                name,
-                projects.join(", ")
-            ),
-        )),
+    // Canonicalize X-From to authenticated identity — never trust wire X-From from HTTP clients
+    // (same H2 invariant as the WS path in ws.rs handle_inbound)
+    frame.set_header("X-From", &format!("{}@{}", agent_name, project));
+
+    let delivered = state.broker.send_to_agent("Boards", &target_project, &frame.serialize()).await;
+    if delivered {
+        StatusCode::OK.into_response()
+    } else {
+        tracing::warn!("Boards@{} not connected — POST /v1/send 503", target_project);
+        let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "Boards not connected").into_response();
+        resp.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("retry-after"),
+            axum::http::HeaderValue::from_static("1"),
+        );
+        resp
     }
 }
 
@@ -1080,5 +1087,190 @@ mod tests {
                 .body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- POST /v1/send tests (HttpFrame send path) ---
+
+    /// Helper: build a minimal valid POST /v1/dms HttpFrame string.
+    fn make_dm_frame(from: &str, to: &str, body: &str) -> String {
+        format!(
+            "POST /v1/dms HTTP/1.1\r\nX-From: {from}\r\nX-To: {to}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// POST /v1/send with no auth returns 401.
+    #[tokio::test]
+    async fn v1_send_missing_auth_returns_401() {
+        let state = make_state();
+        let app = test_app(state);
+        let frame = make_dm_frame("Alice@proj", "Bob@proj", "hello");
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// POST /v1/send with empty body returns 400.
+    #[tokio::test]
+    async fn v1_send_empty_body_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from("")).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// POST /v1/send with malformed body (not an HttpFrame) returns 400.
+    #[tokio::test]
+    async fn v1_send_malformed_frame_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from("this is not an httpframe")).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// POST /v1/send with valid frame but missing X-To returns 400.
+    #[tokio::test]
+    async fn v1_send_missing_xto_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        // Valid frame structure but no X-To header
+        let frame = "POST /v1/dms HTTP/1.1\r\nX-From: Alice@proj\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// POST /v1/send with X-To in wrong format for the verb returns 400.
+    #[tokio::test]
+    async fn v1_send_bad_xto_shape_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        // POST /v1/dms requires name@project format; using channel format is invalid
+        let frame = "POST /v1/dms HTTP/1.1\r\nX-From: Alice@proj\r\nX-To: #general.proj\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// POST /v1/send with unsupported verb (e.g. HELLO) returns 400.
+    #[tokio::test]
+    async fn v1_send_unsupported_verb_returns_400() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let frame = "HELLO /v1/sessions HTTP/1.1\r\nX-To: Bob@proj\r\nContent-Length: 0\r\n\r\n";
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// POST /v1/send with a valid DM frame when Boards is not connected returns 503 + Retry-After.
+    #[tokio::test]
+    async fn v1_send_boards_not_connected_returns_503_with_retry_after() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let frame = make_dm_frame("Alice@proj", "Bob@proj", "hello");
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").map(|v| v.to_str().unwrap()), Some("1"));
+    }
+
+    /// POST /v1/send with a valid posts frame when Boards is not connected returns 503.
+    #[tokio::test]
+    async fn v1_send_post_to_channel_boards_not_connected_returns_503() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        let body = "hello channel";
+        let frame = format!(
+            "POST /v1/posts HTTP/1.1\r\nX-From: Alice@proj\r\nX-To: #general.proj\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// POST /v1/send rewrites X-From to authenticated identity before forwarding.
+    /// Boards session receives the frame with canonicalized X-From, regardless of what the client sent.
+    #[tokio::test]
+    async fn v1_send_xfrom_canonicalized_to_authenticated_identity() {
+        let state = make_state();
+        let app = test_app(state.clone());
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+
+        // Register Boards agent so connect() succeeds (FK check)
+        state.broker.repo.register_agent("Boards", "proj", "service", "").unwrap();
+        // Connect Boards — gives us a receiver to inspect what was forwarded
+        let mut boards_rx = state.broker.connect("Boards", "proj").await.expect("Boards connect");
+
+        // Alice sends a DM with a forged X-From
+        let frame = make_dm_frame("ForgedAgent@other-proj", "Bob@proj", "hello");
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // What Boards received must have X-From: Alice@proj (authenticated identity, not the forged value)
+        let received = boards_rx.recv().await.expect("Boards should have received the forwarded frame");
+        assert!(
+            received.contains("X-From: Alice@proj") || received.contains("x-from: Alice@proj"),
+            "X-From not canonicalized; Boards received: {received}"
+        );
+        assert!(
+            !received.contains("ForgedAgent"),
+            "Forged X-From leaked to Boards; received: {received}"
+        );
     }
 }

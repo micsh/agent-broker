@@ -1,6 +1,5 @@
 use crate::broker::nonce::NonceStore;
 use crate::db::Repository;
-use crate::stanza::PresenceStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -30,16 +29,6 @@ impl std::fmt::Display for AgentState {
             AgentState::Available => write!(f, "available"),
             AgentState::Busy => write!(f, "busy"),
             AgentState::Offline => write!(f, "offline"),
-        }
-    }
-}
-
-impl From<PresenceStatus> for AgentState {
-    fn from(status: PresenceStatus) -> Self {
-        match status {
-            PresenceStatus::Available => AgentState::Available,
-            PresenceStatus::Busy => AgentState::Busy,
-            PresenceStatus::Offline => AgentState::Offline,
         }
     }
 }
@@ -185,32 +174,6 @@ impl BrokerState {
         } else {
             false
         }
-    }
-
-    /// Broadcast a message to all agents on a channel within the given project.
-    /// Returns per-subscriber delivery results: (name, project, delivered).
-    pub async fn send_to_channel(
-        &self,
-        channel_id: &str,
-        project: &str,
-        message: &str,
-        exclude: Option<&str>,
-    ) -> Vec<(String, String, bool)> {
-        let subscribers = self.repo.get_subscribers(channel_id, project);
-        let sessions = self.sessions.read().await;
-        let mut results = Vec::new();
-        for (name, proj) in subscribers {
-            if exclude.is_some_and(|e| e == name) {
-                continue;
-            }
-            let key = AgentKey::new(&name, &proj);
-            let delivered = match sessions.get(&key) {
-                Some(session) => session.tx.send(message.to_string()).is_ok(),
-                None => false,
-            };
-            results.push((name, proj, delivered));
-        }
-        results
     }
 }
 

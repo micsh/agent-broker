@@ -4,8 +4,7 @@
       "depends_on": [
         "broker",
         "db",
-        "identity",
-        "stanza"
+        "identity"
       ],
       "description": "HTTP + WebSocket API layer — routes, request/response types, auth extractors, WS handlers",
       "id": "api",
@@ -14,8 +13,7 @@
           "boundary": "HTTP boundary only — no business logic, no SQL",
           "depends_on": [
             "broker/state",
-            "broker/delivery",
-            "stanza/types"
+            "broker/delivery"
           ],
           "file": "",
           "files": [
@@ -34,9 +32,7 @@
           "boundary": "Connection management only — no delivery decisions",
           "depends_on": [
             "broker/state",
-            "broker/delivery",
-            "stanza/types",
-            "stanza/parser"
+            "broker/delivery"
           ],
           "file": "ws.rs",
           "files": [],
@@ -45,7 +41,7 @@
             "websocket-handler",
             "connection-upgrade",
             "live-streaming",
-            "WS-stanza-dispatch"
+            "HttpFrame-dispatch"
           ]
         },
         {
@@ -102,24 +98,20 @@
     {
       "depends_on": [
         "db",
-        "stanza",
         "identity"
       ],
-      "description": "Core broker logic — agent state, presence, delivery engine, stanza dispatch, channel routing, nonce store",
+      "description": "Core broker logic — agent state, presence, delivery engine, channel routing, nonce store",
       "id": "broker",
       "modules": [
         {
           "boundary": "In-memory state + DB sync — no HTTP/WS concerns",
           "depends_on": [
-            "db/db",
-            "stanza/types",
-            "stanza/parser"
+            "db/db"
           ],
           "file": "",
           "files": [
             "mod.rs",
-            "state.rs",
-            "dispatch.rs"
+            "state.rs"
           ],
           "id": "broker/state",
           "owns": [
@@ -127,27 +119,21 @@
             "presence-tracking",
             "agent-discovery",
             "channel-broadcast",
-            "stanza-dispatch",
             "BrokerState",
-            "AgentKey",
-            "dispatch_stanza"
+            "AgentKey"
           ]
         },
         {
-          "boundary": "Delivery decisions only — no connection management, no SQL construction",
+          "boundary": "Delivery drain only — no SQL construction, no fan-out",
           "depends_on": [
-            "db/db",
-            "stanza/types"
+            "db/db"
           ],
           "file": "delivery.rs",
           "files": [],
           "id": "broker/delivery",
           "owns": [
-            "message-delivery",
-            "store-and-forward",
             "pending-drain",
-            "mention-fan-out",
-            "cross-project-channel-delivery",
+            "cleanup",
             "DeliveryEngine"
           ]
         },
@@ -274,55 +260,11 @@
     },
     {
       "depends_on": [],
-      "description": "XML stanza parser — extracts routing headers (from, to, type, mentions), preserves raw XML for forwarding",
-      "id": "stanza",
-      "modules": [
-        {
-          "boundary": "Attribute extraction only — body content is opaque, never parsed or modified",
-          "depends_on": [],
-          "file": "",
-          "files": [
-            "mod.rs",
-            "parser.rs"
-          ],
-          "id": "stanza/parser",
-          "owns": [
-            "parse",
-            "parse_message",
-            "parse_presence",
-            "ParseError"
-          ]
-        },
-        {
-          "boundary": "Pure types and routing functions — no I/O, no state, no side effects",
-          "depends_on": [],
-          "file": "types.rs",
-          "files": [],
-          "id": "stanza/types",
-          "owns": [
-            "Stanza",
-            "MessageStanza",
-            "PresenceStanza",
-            "MessageType",
-            "PresenceStatus",
-            "Destination",
-            "ResolvedMention",
-            "resolve_destination",
-            "resolve_agent_name",
-            "enrich_from",
-            "enrich_to_for_remote"
-          ]
-        }
-      ],
-      "path": "broker/src/stanza"
-    },
-    {
-      "depends_on": [],
       "description": "MCP server (stdio) — exposes broker tools for AI agents (register, presence, send, peek, messages)",
       "id": "mcp",
       "modules": [
         {
-          "boundary": "MCP adapter only — constructs HTTP requests to broker, formats responses. No business logic.",
+          "boundary": "MCP adapter only — constructs HttpFrame requests to broker /v1/send, formats responses. No business logic.",
           "depends_on": [
             "mcp/session"
           ],
@@ -337,10 +279,9 @@
             "broker_register",
             "broker_presence",
             "broker_send",
-            "broker_send_stanza",
+            "broker_frame_post",
             "broker_peek",
             "broker_messages",
-            "xml_escape",
             "send_raw"
           ]
         },
@@ -379,11 +320,6 @@
       "type": "no_dependency"
     },
     {
-      "id": "stanza-independence",
-      "reason": "Stanza parser is a leaf module — pure parsing, no dependencies on other layers",
-      "type": "no_dependency"
-    },
-    {
       "id": "session-independence",
       "reason": "SessionManager is a leaf — pure FS + in-memory state, no broker dependencies",
       "type": "no_dependency"
@@ -391,11 +327,6 @@
     {
       "id": "identity-callers",
       "reason": "Crypto primitives used by persistence layer (hash_key/verify_key_hash), nonce store (build_challenge_payload), and WS auth handler (verify_agent_signature)",
-      "type": "restrict_callers_to"
-    },
-    {
-      "id": "stanza-callers",
-      "reason": "Stanza parsing contract used by broker routing layer and API handlers only",
       "type": "restrict_callers_to"
     },
     {

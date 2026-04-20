@@ -3,7 +3,6 @@ mod broker;
 mod db;
 mod http_frame;
 mod identity;
-mod stanza;
 
 use api::AppState;
 use broker::BrokerState;

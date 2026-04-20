@@ -134,37 +134,7 @@
         }
       ],
       "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\mcp\\tools.llm"
-    },
-    {
-      "blocks": [
-        {
-          "file": "parser.rs",
-          "mod_id": "stanza/parser",
-          "source_hash": null,
-          "used_by": [
-            "api/ws",
-            "broker/state"
-          ]
-        }
-      ],
-      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\parser.llm"
-    },
-    {
-      "blocks": [
-        {
-          "file": "types.rs",
-          "mod_id": "stanza/types",
-          "source_hash": null,
-          "used_by": [
-            "api/routes",
-            "api/ws",
-            "broker/delivery",
-            "broker/state"
-          ]
-        }
-      ],
-      "source": "C:\\Users\\moshalal\\source\\repos\\agent-broker\\architecture\\llmcode\\stanza\\types.llm"
     }
   ],
-  "generated_at": "1776407641"
+  "generated_at": "1776690670"
 }

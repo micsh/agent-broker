@@ -38,7 +38,7 @@ pub struct RegisterArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendArgs {
-    /// Target agent -- fully qualified for cross-project: "Name.Project"
+    /// Target agent in 'name@project' format (e.g. "Bob@myproject"). Same project: just 'Bob@myproject'.
     pub to: String,
     /// Message body text
     pub message: String,
@@ -52,9 +52,11 @@ pub struct PresenceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StanzaArgs {
-    /// Raw stanza XML to send
-    pub stanza: String,
+pub struct FramePostArgs {
+    /// Channel address in '#channel.project' format (e.g. '#general.myproject')
+    pub channel: String,
+    /// Message body text
+    pub body: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -80,8 +82,6 @@ pub struct ToolNameArgs {
 #[derive(Deserialize)]
 struct RegProjResp { project_key: String }
 #[derive(Deserialize)]
-struct SendResp { message_id: String }
-#[derive(Deserialize)]
 struct AgentInfo { name: String, project: String, state: String, #[serde(default)] description: String }
 #[derive(Deserialize)]
 struct PendingMsg { from_agent: String, from_project: String, body: String, created_utc: String }
@@ -101,16 +101,6 @@ struct McpToolEntry {
 
 fn mcp_err(msg: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg, None)
-}
-
-/// Escape XML special characters in plain-text content before embedding in a stanza.
-/// Applied only to user-supplied plain text (broker_send message param), not to raw XML.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace('\'', "&apos;")
 }
 
 #[tool_router]
@@ -188,39 +178,48 @@ impl BrokerTools {
         Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
     }
 
-    #[tool(description = "Send a DM to an agent. Use 'Name.Project' for cross-project. For channels/threads/reactions use broker_send_stanza.")]
+    #[tool(description = "Send a DM to an agent. Use 'name@project' format (e.g. 'Bob@myproject').")]
     async fn broker_send(&self, Parameters(args): Parameters<SendArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Reject empty or whitespace-only messages before constructing the stanza
+        // Reject empty or whitespace-only messages before constructing the frame
         if args.message.trim().is_empty() {
             return Err(mcp_err("message must not be empty".to_string()));
         }
-        let (name, ..) = self.session.get()?;
-        // XML-escape plain text; wrap in <body> for cross-team protocol compatibility
-        let stanza = format!("<message type=\"dm\" from=\"{}\" to=\"{}\"><body>{}</body></message>", name, args.to, xml_escape(&args.message));
-        self.send_raw(stanza).await
+        let (name, project, ..) = self.session.get()?;
+        let frame_text = format!(
+            "POST /v1/dms HTTP/1.1\r\nX-From: {}@{}\r\nX-To: {}\r\nContent-Length: {}\r\n\r\n{}",
+            name, project, args.to, args.message.len(), args.message
+        );
+        self.send_raw(frame_text).await
     }
 
-    async fn send_raw(&self, stanza: String) -> Result<CallToolResult, rmcp::ErrorData> {
+    async fn send_raw(&self, frame_text: String) -> Result<CallToolResult, rmcp::ErrorData> {
         let (name, project, key, url) = self.session.get()?;
-        let resp = self.client.post(format!("{}/send", url))
+        let resp = self.client.post(format!("{}/v1/send", url))
             .header("X-Project", &project)
             .header("X-Project-Key", &key)
             .header("X-Agent-Name", &name)
-            .header("Content-Type", "application/xml")
-            .body(stanza)
+            .header("Content-Type", "text/plain")
+            .body(frame_text)
             .send().await.map_err(|e| mcp_err(format!("Send failed: {e}")))?;
         if resp.status().is_success() {
-            let r: SendResp = resp.json().await.map_err(|e| mcp_err(format!("Bad response: {e}")))?;
-            Ok(CallToolResult::success(vec![Content::text(format!("Sent (id: {})", r.message_id))]))
+            Ok(CallToolResult::success(vec![Content::text("Sent.")]))
         } else {
             let body = resp.text().await.unwrap_or_default();
             Err(mcp_err(format!("Send failed: {body}")))
         }
     }
 
-    #[tool(description = "Send a raw stanza XML frame. Use for channel posts, replies, reactions, and presence updates.")]
-    async fn broker_send_stanza(&self, Parameters(args): Parameters<StanzaArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.send_raw(args.stanza).await
+    #[tool(description = "Post a message to a channel. Channel must be in '#channel.project' format.")]
+    async fn broker_frame_post(&self, Parameters(args): Parameters<FramePostArgs>) -> Result<CallToolResult, rmcp::ErrorData> {
+        if args.body.trim().is_empty() {
+            return Err(mcp_err("body must not be empty".to_string()));
+        }
+        let (name, project, ..) = self.session.get()?;
+        let frame_text = format!(
+            "POST /v1/posts HTTP/1.1\r\nX-From: {}@{}\r\nX-To: {}\r\nContent-Length: {}\r\n\r\n{}",
+            name, project, args.channel, args.body.len(), args.body
+        );
+        self.send_raw(frame_text).await
     }
 
     #[tool(description = "Peek at pending messages: count and senders, without consuming.")]
@@ -347,6 +346,6 @@ impl ServerHandler for BrokerTools {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send, broker_send_stanza, broker_peek, broker_messages. Tool registry: broker_tool_register, broker_tool_list, broker_tool_get, broker_tool_deregister.".to_string())
+        .with_instructions("Agent broker MCP. Call broker_register first, then broker_presence, broker_send (DMs), broker_frame_post (channel posts), broker_peek, broker_messages. Tool registry: broker_tool_register, broker_tool_list, broker_tool_get, broker_tool_deregister.".to_string())
     }
 }
