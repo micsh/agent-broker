@@ -390,7 +390,11 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("send_task: receiver lagged, skipped {} messages", n);
+                        continue; // recoverable — receiver advances past skipped messages
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 Some(resp) = resp_rx.recv() => {
                     if sender.send(Message::Text(resp.into())).await.is_err() {
