@@ -1,3 +1,6 @@
+// §0 compliance: all WebSocket communication uses Message::Text (UTF-8 encoded).
+// Message::Binary is never sent or accepted. This invariant holds through the full
+// migration to HttpFrame framing (Cycle 12) — do not introduce Message::Binary.
 use crate::broker::state::BrokerState;
 use crate::broker::{DeliveryEngine, dispatch_stanza};
 use crate::api::routes::AppState;
@@ -73,8 +76,18 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         None => return, // error already sent inside auth helpers
     };
 
-    // Register live connection FIRST — so messages arriving during pending drain are buffered in rx
-    let mut rx = state.broker.connect(&name, &project).await;
+    // Register live connection FIRST — so messages arriving during pending drain are buffered in rx.
+    // Returns Err(()) if identity already connected — 409 Conflict.
+    let mut rx = match state.broker.connect(&name, &project).await {
+        Ok(rx) => rx,
+        Err(()) => {
+            let _ = send_envelope(&mut sender, &WsEnvelope::Error {
+                message: "Another session is already connected with this identity".to_string(),
+                error_code: Some("CONFLICT".to_string()),
+            }).await;
+            return;
+        }
+    };
 
     // Drain pending messages — each body is raw stanza XML
     let pending = state.delivery.drain_pending(&name, &project);

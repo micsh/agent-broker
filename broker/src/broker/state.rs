@@ -93,28 +93,29 @@ impl BrokerState {
 
     /// Register an agent connection. Returns a broadcast receiver for live messages.
     ///
-    /// Last-writer-wins: if the agent reconnects while a prior session is still active,
-    /// the new session replaces the old one (old receiver stops receiving). This is intentional —
-    /// the broker treats reconnect as a session refresh rather than an error.
+    /// Returns `Err(())` if a session for this identity is already active — caller must
+    /// send a 409 Conflict frame and close the connection.
     pub async fn connect(
         &self,
         name: &str,
         project: &str,
-    ) -> broadcast::Receiver<String> {
-        let (tx, rx) = broadcast::channel(64);
+    ) -> Result<broadcast::Receiver<String>, ()> {
         let key = AgentKey::new(name, project);
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(&key) {
+            tracing::warn!("Duplicate connect rejected: {}.{}", name, project);
+            return Err(());
+        }
+        let (tx, rx) = broadcast::channel(64);
         let session = AgentSession {
             name: name.to_string(),
             project: project.to_string(),
             state: AgentState::Available,
             tx,
         };
-
-        let mut sessions = self.sessions.write().await;
         sessions.insert(key, session);
-
         tracing::info!("Agent connected: {}.{}", name, project);
-        rx
+        Ok(rx)
     }
 
     /// Disconnect an agent.
@@ -146,10 +147,6 @@ impl BrokerState {
     /// Get all agents, optionally filtered by project.
     /// Connected agents are always included; offline (DB-registered) agents included when include_offline=true.
     /// Description is always enriched from the DB.
-    ///
-    /// Last-writer-wins: if the agent reconnects while a prior session is still active,
-    /// the new session replaces the old one (old receiver stops receiving). This is intentional —
-    /// the broker treats reconnect as a session refresh rather than an error.
     pub async fn list_agents(&self, project_filter: Option<&str>, include_offline: bool) -> Vec<AgentInfo> {
         let sessions = self.sessions.read().await;
         let mut result: Vec<AgentInfo> = sessions
@@ -230,4 +227,61 @@ pub struct AgentInfo {
     pub project: String,
     pub state: AgentState,
     pub description: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn make_state() -> Arc<BrokerState> {
+        let repo = Arc::new(db::open_memory().expect("in-memory DB"));
+        Arc::new(BrokerState::new(repo))
+    }
+
+    /// Fresh connect succeeds and returns a working receiver.
+    #[tokio::test]
+    async fn connect_fresh_returns_ok() {
+        let state = make_state();
+        assert!(state.connect("Alice", "proj").await.is_ok());
+    }
+
+    /// Duplicate connect (same name+project) is rejected with Err(()).
+    #[tokio::test]
+    async fn connect_duplicate_returns_err() {
+        let state = make_state();
+        assert!(state.connect("Alice", "proj").await.is_ok());
+        assert!(
+            state.connect("Alice", "proj").await.is_err(),
+            "second connect for same identity must return Err(())"
+        );
+    }
+
+    /// Different identities in the same project do NOT conflict.
+    #[tokio::test]
+    async fn connect_different_agents_in_same_project_both_ok() {
+        let state = make_state();
+        assert!(state.connect("Alice", "proj").await.is_ok());
+        assert!(state.connect("Bob", "proj").await.is_ok());
+    }
+
+    /// Same name but different project does NOT conflict.
+    #[tokio::test]
+    async fn connect_same_name_different_project_ok() {
+        let state = make_state();
+        assert!(state.connect("Alice", "proj-a").await.is_ok());
+        assert!(state.connect("Alice", "proj-b").await.is_ok());
+    }
+
+    /// After disconnect, the same identity can reconnect.
+    #[tokio::test]
+    async fn connect_after_disconnect_ok() {
+        let state = make_state();
+        assert!(state.connect("Alice", "proj").await.is_ok());
+        state.disconnect("Alice", "proj").await;
+        assert!(
+            state.connect("Alice", "proj").await.is_ok(),
+            "must be able to reconnect after disconnect"
+        );
+    }
 }

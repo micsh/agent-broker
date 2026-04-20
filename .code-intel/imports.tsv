@@ -70,7 +70,7 @@ broker/src/api/mod.rs	admin::admin_router
 broker/src/api/routes.rs	crate::api::auth::AgentAuth
 broker/src/api/routes.rs	crate::broker::state::{AgentState, BrokerState}
 broker/src/api/routes.rs	crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError}
-broker/src/api/routes.rs	crate::db::repository::PendingMessage
+broker/src/api/routes.rs	crate::db::repository::{PendingMessage, ToolEntry}
 broker/src/api/routes.rs	crate::stanza
 broker/src/api/routes.rs	axum::extract::{Path, Query, State}
 broker/src/api/routes.rs	axum::http::StatusCode
@@ -149,6 +149,8 @@ broker/src/db/mod.rs	std::path::Path
 broker/src/db/repository.rs	rusqlite::params
 broker/src/db/repository.rs	crate::identity
 broker/src/db/repository.rs	std::sync::Mutex
+broker/src/db/repository.rs	super::*
+broker/src/db/repository.rs	crate::db::schema::ensure_schema
 broker/src/db/repository.rs	super::*
 broker/src/db/repository.rs	crate::db::schema::ensure_schema
 broker/src/db/schema.rs	rusqlite::Connection

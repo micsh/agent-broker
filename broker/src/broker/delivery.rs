@@ -227,7 +227,7 @@ mod tests {
         state.repo.subscribe("Receiver", "proj", "general");
 
         // Connect Receiver so it has a live session (broadcast channel)
-        let _rx = state.connect("Receiver", "proj").await;
+        let _rx = state.connect("Receiver", "proj").await.expect("connect in test setup");
 
         let body = r##"<message type="post" from="Sender" to="#general"><body>Hi</body></message>"##;
         delivery.deliver("msg-2", "Sender", "proj", None, Some("general"), body, None, &[]).await.unwrap();
@@ -358,7 +358,7 @@ mod tests {
         state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
         // Bob connects live
-        let mut rx = state.connect("Bob", "proj").await;
+        let mut rx = state.connect("Bob", "proj").await.expect("connect in test setup");
 
         let body = r##"<message type="dm" from="Alice" to="Bob"><body>live hello</body></message>"##;
         delivery.deliver("m7", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
@@ -376,7 +376,7 @@ mod tests {
         state.repo.register_agent("Alice", "proj", "", "").unwrap();
         state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
-        let mut rx = state.connect("Bob", "proj").await;
+        let mut rx = state.connect("Bob", "proj").await.expect("connect in test setup");
 
         let body = r##"<message type="dm" from="Alice" to="Bob"><body>x &lt; y &gt; z</body></message>"##;
         delivery.deliver("m8", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();
@@ -393,7 +393,7 @@ mod tests {
         state.repo.register_agent("Alice", "proj", "", "").unwrap();
         state.repo.register_agent("Bob", "proj", "", "").unwrap();
 
-        let mut rx = state.connect("Bob", "proj").await;
+        let mut rx = state.connect("Bob", "proj").await.expect("connect in test setup");
 
         let body = r##"<message type="dm" from="Alice" to="Bob"><body><ref post-id="p-abc" /></body></message>"##;
         delivery.deliver("m9", "Alice", "proj", Some("Bob"), None, body, None, &[]).await.unwrap();

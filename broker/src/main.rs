@@ -1,6 +1,7 @@
 mod api;
 mod broker;
 mod db;
+mod http_frame;
 mod identity;
 mod stanza;
 
