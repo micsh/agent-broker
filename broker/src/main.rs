@@ -67,7 +67,9 @@ async fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100),
-        boards_registration_token: std::env::var("BOARDS_REGISTRATION_TOKEN").ok(),
+        boards_registration_token: std::env::var("BOARDS_REGISTRATION_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
     let rate_limiter = Arc::new(api::middleware::ProjectRateLimiter::new(config.rate_limit_rps));
 

@@ -472,7 +472,43 @@ async fn ws_boards_key_rotation_rejected_before_challenge() {
     );
 }
 
-/// Scenario 9: Boards TOFU with no BOARDS_REGISTRATION_TOKEN configured (fail-closed).
+/// Scenario 12: Boards TOFU with a blank (empty string) registration token configured.
+/// `Some("")` must behave identically to `None` after normalization at load time — fail-closed.
+/// This test sets the raw config value to `Some("")` to verify the runtime guard holds even
+/// if normalization is bypassed (defence-in-depth: the None branch handles both).
+#[tokio::test]
+async fn ws_boards_tofu_blank_token_configured_rejected() {
+    // Directly construct a server with boards_registration_token: Some("") — simulates a
+    // misconfigured deployment where the env var was set to an empty string.
+    let (addr, state) = spawn_test_server_inner(Some("".to_string())).await;
+    state.broker.repo.register_project("proj-blank-token", "pkey-blank-token").expect("register_project");
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-blank-token";
+
+    let mut ws = ws_connect(addr).await;
+    // HELLO with X-Pubkey — no X-Registration-Token (blank token = effectively unconfigured).
+    let hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity)
+        .add_header("X-Pubkey", &boards_pubkey_b64)
+        .finalize();
+    send_frame(&mut ws, &hello).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "blank token must be treated as unconfigured (401): {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("AUTH_INVALID_TOKEN"),
+        "expected AUTH_INVALID_TOKEN for blank token config: {:?}",
+        resp
+    );
+    assert!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-blank-token").is_none(),
+        "no key must be written when token is blank"
+    );
+}
 /// Broker must reject with 401 AUTH_INVALID_TOKEN — no open bootstrap allowed.
 #[tokio::test]
 async fn ws_boards_tofu_no_token_configured_rejected() {
