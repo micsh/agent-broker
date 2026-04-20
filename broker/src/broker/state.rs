@@ -77,18 +77,6 @@ impl BrokerState {
         }
     }
 
-    /// Authenticate an agent: verify project key and check agent registration.
-    /// Returns Ok(()) on success, Err(reason) on failure.
-    pub fn authenticate(&self, name: &str, project: &str, key: &str) -> Result<(), String> {
-        if !self.repo.verify_project_key(project, key) {
-            return Err("Invalid project key".to_string());
-        }
-        if !self.repo.agent_exists(name, project) {
-            return Err(format!("Agent '{}' not registered in project '{}'", name, project));
-        }
-        Ok(())
-    }
-
     // --- Session management ---
 
     /// Register an agent connection. Returns a broadcast receiver for live messages.
@@ -118,12 +106,16 @@ impl BrokerState {
         Ok(rx)
     }
 
-    /// Disconnect an agent.
+    /// Disconnect an agent. Forces the session state to Offline under the write lock
+    /// before removing it, satisfying spec §13 (last state must be offline on teardown).
     pub async fn disconnect(&self, name: &str, project: &str) {
         let key = AgentKey::new(name, project);
         let mut sessions = self.sessions.write().await;
+        // Force offline before removal — spec §13 mandate.
+        if let Some(session) = sessions.get_mut(&key) {
+            session.state = AgentState::Offline;
+        }
         sessions.remove(&key);
-
         tracing::info!("Agent disconnected: {}.{}", name, project);
     }
 
@@ -152,6 +144,7 @@ impl BrokerState {
         let mut result: Vec<AgentInfo> = sessions
             .values()
             .filter(|s| project_filter.map_or(true, |p| s.project == p))
+            .filter(|s| s.name != "Boards") // Boards is a service participant, not an agent
             .map(|s| AgentInfo {
                 name: s.name.clone(),
                 project: s.project.clone(),
@@ -169,6 +162,7 @@ impl BrokerState {
             // Synthesise offline entries for agents in DB but not in sessions
             let registered = self.repo.list_registered_agents(project_filter);
             for (name, project, description) in registered {
+                if name == "Boards" { continue; } // service participant, not an agent
                 if !connected.contains(&(name.clone(), project.clone())) {
                     result.push(AgentInfo {
                         name,

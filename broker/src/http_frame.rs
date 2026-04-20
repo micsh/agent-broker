@@ -13,13 +13,6 @@
 //! \r\n
 //! <body of exactly N bytes>
 //! ```
-//!
-//! # Migration note
-//! This module is fully implemented and tested (Phase 2) but not yet wired to production
-//! callers. Wiring happens in Phase 3 (ws.rs rewrite). The dead-code suppression below
-//! is intentional and will be removed once ws.rs imports this module.
-
-#![allow(dead_code)]
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -223,15 +216,6 @@ impl HttpFrame {
         }
     }
 
-    /// Set the body and update `Content-Length` to match.
-    #[must_use]
-    pub fn with_body(mut self, body: impl Into<String>) -> Self {
-        self.body = body.into();
-        let len = self.body.len();
-        self.set_header("Content-Length", len.to_string());
-        self
-    }
-
     /// Ensure `Content-Length` header matches `body.len()`. Call before `serialize()`.
     #[must_use]
     pub fn finalize(mut self) -> Self {
@@ -363,11 +347,12 @@ mod tests {
 
     #[test]
     fn frame_with_body_round_trip() {
-        let frame = HttpFrame::request("POST", "/v1/dms")
+        let mut frame = HttpFrame::request("POST", "/v1/dms")
             .add_header("X-From", "alice@TeamA")
             .add_header("X-To", "bob@TeamB")
-            .add_header("Content-Type", "text/markdown")
-            .with_body("Hello Bob!");
+            .add_header("Content-Type", "text/markdown");
+        frame.body = "Hello Bob!".to_string();
+        let frame = frame.finalize();
         let serialized = frame.serialize();
         let parsed = parse(&serialized).expect("parse round-trip");
         assert_eq!(parsed.body, "Hello Bob!");
@@ -378,10 +363,11 @@ mod tests {
     fn frame_with_crlf_in_body() {
         // Body may contain CRLF — must be preserved verbatim.
         let body = "line one\r\nline two\r\nline three";
-        let frame = HttpFrame::request("POST", "/v1/posts")
+        let mut frame = HttpFrame::request("POST", "/v1/posts")
             .add_header("X-From", "neo@Matrix")
-            .add_header("X-To", "#general.Matrix")
-            .with_body(body);
+            .add_header("X-To", "#general.Matrix");
+        frame.body = body.to_string();
+        let frame = frame.finalize();
         let serialized = frame.serialize();
         let parsed = parse(&serialized).expect("parse round-trip");
         assert_eq!(parsed.body, body);
@@ -400,13 +386,14 @@ mod tests {
 
     #[test]
     fn multi_header_frame_round_trip() {
-        let frame = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        let mut frame = HttpFrame::request("PUBLISH", "/v1/deliveries")
             .add_header("X-From", "alice@TeamA")
             .add_header("X-To", "bob@TeamB,carol@TeamC")
             .add_header("X-Thread", "t-abc")
             .add_header("X-Post-Id", "p-xyz")
-            .add_header("Content-Type", "text/markdown")
-            .with_body("A message body.");
+            .add_header("Content-Type", "text/markdown");
+        frame.body = "A message body.".to_string();
+        let frame = frame.finalize();
         let serialized = frame.serialize();
         let parsed = parse(&serialized).expect("parse round-trip");
         assert_eq!(parsed.header("X-Thread"), Some("t-abc"));
@@ -416,11 +403,12 @@ mod tests {
 
     #[test]
     fn deliver_frame_round_trip() {
-        let frame = HttpFrame::request("DELIVER", "/v1/deliveries")
+        let mut frame = HttpFrame::request("DELIVER", "/v1/deliveries")
             .add_header("X-From", "alice@TeamA")
             .add_header("X-To", "bob@TeamB")
-            .add_header("Content-Type", "text/markdown")
-            .with_body("Hello from Alice.");
+            .add_header("Content-Type", "text/markdown");
+        frame.body = "Hello from Alice.".to_string();
+        let frame = frame.finalize();
         let serialized = frame.serialize();
         let parsed = parse(&serialized).expect("round-trip");
         assert_eq!(parsed.verb(), Some("DELIVER"));

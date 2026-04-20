@@ -7,6 +7,7 @@
 //! reconnect for a fresh challenge. This is intentional: prevents oracle attacks where
 //! an attacker probes multiple signatures against the same nonce.
 
+use base64::Engine;
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -25,28 +26,21 @@ impl NonceStore {
         }
     }
 
-    /// Issue a new nonce: generate random bytes, build the canonical challenge payload,
-    /// and store it keyed by nonce_hex with a TTL.
+    /// Issue a new nonce for the given identity (`name@project`).
     ///
-    /// Returns `(nonce_bytes, canonical_payload, timestamp_u64)`.
-    /// The caller sends `nonce_hex` + `timestamp` + `session_id` in the Challenge envelope.
-    /// The stored payload is retrieved by `consume()` at verify time.
-    pub fn issue(
-        &self,
-        session_id: &str,
-        name: &str,
-        project: &str,
-    ) -> ([u8; 32], Vec<u8>, u64) {
+    /// Generates random bytes, encodes as standard base64 for the CHALLENGE X-Nonce header,
+    /// builds the canonical challenge payload, and stores it keyed by nonce_hex with a TTL.
+    ///
+    /// Returns `(nonce_bytes, nonce_b64, canonical_payload)`.
+    /// - `nonce_b64` is sent as `X-Nonce` in the CHALLENGE frame.
+    /// - `canonical_payload` is the bytes the client must sign.
+    /// - The stored payload is retrieved by `consume(nonce_hex)` at verify time.
+    pub fn issue(&self, identity: &str) -> ([u8; 32], String, Vec<u8>) {
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let payload =
-            crate::identity::build_challenge_payload(&nonce, timestamp, session_id, name, project);
+        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
+        let payload = crate::identity::build_challenge_payload(identity, &nonce_b64);
 
         let nonce_hex = hex::encode(nonce);
         let expires_at = Instant::now() + Duration::from_secs(NONCE_TTL_SECS);
@@ -56,7 +50,7 @@ impl NonceStore {
             .unwrap_or_else(|p| p.into_inner())
             .insert(nonce_hex, (payload.clone(), expires_at));
 
-        (nonce, payload, timestamp)
+        (nonce, nonce_b64, payload)
     }
 
     /// Consume a nonce: return the stored canonical payload if the nonce exists and is not expired.
@@ -91,7 +85,7 @@ mod tests {
     #[test]
     fn consume_burns_nonce_regardless_of_verify_outcome() {
         let store = NonceStore::new();
-        let (nonce_bytes, _payload, _ts) = store.issue("sess-1", "Alice", "proj");
+        let (nonce_bytes, _nonce_b64, _payload) = store.issue("Alice@proj");
         let nonce_hex = hex::encode(nonce_bytes);
 
         // First consume — payload returned (caller will attempt verify_agent_signature)
@@ -115,7 +109,7 @@ mod tests {
     #[test]
     fn issue_and_consume_payload_matches() {
         let store = NonceStore::new();
-        let (nonce_bytes, issued_payload, _ts) = store.issue("sess-2", "Bob", "my-proj");
+        let (nonce_bytes, _nonce_b64, issued_payload) = store.issue("Bob@my-proj");
         let nonce_hex = hex::encode(nonce_bytes);
 
         let consumed_payload = store.consume(&nonce_hex).expect("must return payload");

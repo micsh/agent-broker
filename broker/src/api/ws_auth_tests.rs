@@ -1,47 +1,41 @@
-//! WS-level integration tests for Ed25519 challenge-response auth.
+//! WS-level integration tests for the HttpFrame Ed25519 four-frame handshake.
 //!
 //! Spins up a real axum server on a random port and connects via tokio-tungstenite.
 //! Full internal access (this is a #[cfg(test)] submodule of api::ws) lets us
 //! inspect `nonce_store` state after protocol exchanges without lib.rs exposure.
 //!
-//! Three adversarial scenarios:
-//!   1. Auth-before-Challenge → PROTOCOL_ERROR frame
-//!   2. Expired nonce (pre-drained) → AUTH_STALE frame  
-//!   3. Wrong private key → AUTH_WRONG_KEY frame; nonce burned (second consume → None)
+//! Five scenarios:
+//!   1. Non-HELLO first frame → 400 PROTOCOL_ERROR
+//!   2. Expired nonce (pre-drained) → 401 AUTH_STALE
+//!   3. Wrong private key → 401 AUTH_WRONG_KEY; nonce burned (second consume → None)
+//!   4. Duplicate connect (same identity, first session still open) → 409 Conflict
+//!   5. Agent HELLO with attacker X-Pubkey, signs with attacker key → 401 AUTH_WRONG_KEY
+//!      (proves stored key used, not the wire X-Pubkey — no rotation attack possible)
 
 use crate::api;
 use crate::api::middleware::ProjectRateLimiter;
 use crate::api::routes::{AppState, BrokerConfig};
 use crate::broker::{BrokerState, DeliveryEngine};
 use crate::db;
+use crate::http_frame::{self, HttpFrame};
+use base64::Engine;
 use ed25519_dalek::Signer;
 use ed25519_dalek::SigningKey;
 use futures::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
-use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 
-// ── Test server ──────────────────────────────────────────────────────────────
+// ── Test server ───────────────────────────────────────────────────────────────
 
-/// Spawn a test broker on a random port. Returns the address and shared state.
-/// Caller retains the `Arc<AppState>` to inspect nonce_store and repo after WS exchanges.
 async fn spawn_test_server() -> (SocketAddr, Arc<AppState>) {
     let repo = Arc::new(db::open_memory().expect("in-memory DB"));
     let broker = Arc::new(BrokerState::new(repo));
     let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
-    let config = BrokerConfig {
-        admin_key: None,
-        rate_limit_rps: 100,
-    };
+    let config = BrokerConfig { admin_key: None, rate_limit_rps: 100 };
     let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
-    let state = Arc::new(AppState {
-        broker,
-        delivery,
-        config,
-        rate_limiter,
-    });
+    let state = Arc::new(AppState { broker, delivery, config, rate_limiter });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -52,14 +46,12 @@ async fn spawn_test_server() -> (SocketAddr, Arc<AppState>) {
         .route("/ws", axum::routing::get(api::handle_ws))
         .with_state(state.clone());
 
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
 
     (addr, state)
 }
 
-// ── WS helpers ───────────────────────────────────────────────────────────────
+// ── WS helpers ────────────────────────────────────────────────────────────────
 
 type WsStream = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -70,160 +62,236 @@ async fn ws_connect(addr: SocketAddr) -> WsStream {
     connect_async(url).await.expect("WS connect").0
 }
 
-async fn send_json(ws: &mut WsStream, v: Value) {
-    ws.send(WsMsg::Text(v.to_string().into()))
+async fn send_frame(ws: &mut WsStream, frame: &HttpFrame) {
+    ws.send(WsMsg::Text(frame.serialize().into()))
         .await
         .expect("WS send");
 }
 
-async fn recv_json(ws: &mut WsStream) -> Value {
+async fn recv_frame(ws: &mut WsStream) -> HttpFrame {
     loop {
         let msg = ws.next().await.expect("stream ended").expect("WS recv");
         match msg {
-            WsMsg::Text(t) => return serde_json::from_str(&t).expect("JSON parse"),
+            WsMsg::Text(t) => return http_frame::parse(&t).expect("HttpFrame parse"),
             WsMsg::Close(_) => panic!("connection closed before receiving expected frame"),
             _ => continue,
         }
     }
 }
 
-// ── Test data setup ──────────────────────────────────────────────────────────
+// ── Test data setup ───────────────────────────────────────────────────────────
 
-/// Register a project and agent with a fresh Ed25519 key pair.
-/// Returns the SigningKey so tests can sign challenges.
+/// Register a project and agent with a fresh Ed25519 key pair. Returns the SigningKey.
 fn setup_agent(state: &Arc<AppState>, project: &str, project_key: &str, agent: &str) -> SigningKey {
     let signing_key = SigningKey::generate(&mut OsRng);
     let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
-    state
-        .broker
-        .repo
-        .register_project(project, project_key)
-        .expect("register_project");
-    state
-        .broker
-        .repo
-        .register_agent(agent, project, "agent", "")
-        .expect("register_agent");
-    state
-        .broker
-        .repo
-        .set_agent_public_key(agent, project, &pubkey_hex)
-        .expect("set_agent_public_key");
+    state.broker.repo.register_project(project, project_key).expect("register_project");
+    state.broker.repo.register_agent(agent, project, "agent", "").expect("register_agent");
+    state.broker.repo.set_agent_public_key(agent, project, &pubkey_hex).expect("set_agent_public_key");
     signing_key
 }
 
-/// Do Hello → Challenge exchange. Returns `(nonce_hex, timestamp, session_id)`.
-async fn hello_and_get_challenge(
-    ws: &mut WsStream,
-    agent: &str,
-    project: &str,
-) -> (String, u64, String) {
-    send_json(ws, json!({"type": "hello", "name": agent, "project": project})).await;
-    let challenge = recv_json(ws).await;
-    assert_eq!(challenge["type"], "challenge", "expected challenge frame");
-    let nonce_hex = challenge["nonce"].as_str().unwrap().to_string();
-    let timestamp = challenge["timestamp"].as_u64().unwrap();
-    let session_id = challenge["session_id"].as_str().unwrap().to_string();
-    (nonce_hex, timestamp, session_id)
-}
+/// Do HELLO → CHALLENGE exchange. Returns nonce_b64 from the CHALLENGE X-Nonce header.
+/// `xpubkey`: if Some, adds an X-Pubkey header to the HELLO frame.
+async fn hello_and_get_challenge(ws: &mut WsStream, identity: &str, xpubkey: Option<&str>) -> String {
+    let mut hello = HttpFrame::request("HELLO", "/v1/sessions").add_header("X-From", identity);
+    if let Some(key) = xpubkey {
+        hello = hello.add_header("X-Pubkey", key);
+    }
+    let hello = hello.finalize();
+    send_frame(ws, &hello).await;
 
-/// Build the canonical payload and sign it.
-fn sign_challenge(
-    signing_key: &SigningKey,
-    nonce_hex: &str,
-    timestamp: u64,
-    session_id: &str,
-    agent: &str,
-    project: &str,
-) -> String {
-    let nonce_bytes: [u8; 32] = hex::decode(nonce_hex)
-        .expect("nonce hex")
-        .try_into()
-        .expect("nonce 32 bytes");
-    let payload = crate::identity::build_challenge_payload(
-        &nonce_bytes, timestamp, session_id, agent, project,
+    let challenge = recv_frame(ws).await;
+    assert_eq!(
+        challenge.verb(),
+        Some("CHALLENGE"),
+        "expected CHALLENGE frame, got: {:?}",
+        challenge.first_line
     );
-    hex::encode(signing_key.sign(&payload).to_bytes())
+    challenge.header("X-Nonce").expect("X-Nonce missing in CHALLENGE frame").to_string()
 }
 
-// ── Adversarial tests ────────────────────────────────────────────────────────
+/// Build the canonical payload and sign it with `signing_key`. Returns base64-encoded signature.
+fn sign_challenge(signing_key: &SigningKey, identity: &str, nonce_b64: &str) -> String {
+    let payload = crate::identity::build_challenge_payload(identity, nonce_b64);
+    base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&payload).to_bytes())
+}
 
-/// Scenario 1: Client sends Auth as the first message (no Hello/Challenge first).
-/// Broker must send PROTOCOL_ERROR and close — not silently drop.
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Scenario 1: Client sends a non-HELLO frame as the first message (protocol violation).
+/// Broker must respond with 400 Bad Request + PROTOCOL_ERROR, not silently drop.
 #[tokio::test]
-async fn ws_auth_before_challenge_sends_protocol_error() {
+async fn ws_non_hello_first_frame_sends_protocol_error() {
     let (addr, _state) = spawn_test_server().await;
     let mut ws = ws_connect(addr).await;
 
-    // Skip Hello — send Auth immediately (protocol violation)
-    send_json(&mut ws, json!({"type": "auth", "signature": "deadbeef"})).await;
+    // Send AUTH without first doing HELLO
+    let frame = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", "deadbeef")
+        .finalize();
+    send_frame(&mut ws, &frame).await;
 
-    let resp = recv_json(&mut ws).await;
-    assert_eq!(resp["type"], "error", "expected error frame, got: {resp}");
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(400), "expected 400 for protocol violation: {:?}", resp.first_line);
     assert_eq!(
-        resp["error_code"], "PROTOCOL_ERROR",
-        "expected PROTOCOL_ERROR, got: {resp}"
+        resp.header("X-Error-Code"),
+        Some("PROTOCOL_ERROR"),
+        "expected PROTOCOL_ERROR code: {:?}",
+        resp
     );
 }
 
 /// Scenario 2: Nonce expires between Challenge issuance and Auth receipt.
-/// Simulated by pre-draining the nonce from the store after receiving Challenge.
-/// Broker must send AUTH_STALE — client must reconnect for a fresh challenge.
+/// Simulated by pre-draining the nonce from the store after receiving CHALLENGE.
+/// Broker must respond 401 AUTH_STALE — client must reconnect for a fresh challenge.
 #[tokio::test]
 async fn ws_expired_nonce_sends_auth_stale() {
     let (addr, state) = spawn_test_server().await;
     let signing_key = setup_agent(&state, "proj-stale", "key-stale", "Alice");
+    let identity = "Alice@proj-stale";
 
     let mut ws = ws_connect(addr).await;
-    let (nonce_hex, timestamp, session_id) =
-        hello_and_get_challenge(&mut ws, "Alice", "proj-stale").await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None).await;
 
-    // Pre-drain the nonce — simulates TTL expiry before Auth arrives
+    // Derive nonce_hex to pre-drain it — simulates TTL expiry.
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&nonce_b64)
+        .expect("nonce b64 decode");
+    let nonce_hex = hex::encode(&nonce_bytes);
     let was_present = state.broker.nonce_store.consume(&nonce_hex);
     assert!(was_present.is_some(), "nonce must be in store after challenge issuance");
 
-    // Send a correctly-signed Auth — signature is valid, but nonce is gone
-    let sig_hex = sign_challenge(&signing_key, &nonce_hex, timestamp, &session_id, "Alice", "proj-stale");
-    send_json(&mut ws, json!({"type": "auth", "signature": sig_hex})).await;
+    // Send a validly-signed AUTH — signature is correct, but nonce is gone.
+    let sig = sign_challenge(&signing_key, identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut ws, &auth).await;
 
-    let resp = recv_json(&mut ws).await;
-    assert_eq!(resp["type"], "error", "expected error frame, got: {resp}");
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "expected 401 for stale nonce: {:?}", resp.first_line);
     assert_eq!(
-        resp["error_code"], "AUTH_STALE",
-        "expected AUTH_STALE for drained nonce, got: {resp}"
+        resp.header("X-Error-Code"),
+        Some("AUTH_STALE"),
+        "expected AUTH_STALE: {:?}",
+        resp
     );
 }
 
 /// Scenario 3: Client signs with the wrong private key.
-/// Broker must send AUTH_WRONG_KEY. Nonce is burned — second consume returns None,
-/// forcing the client to reconnect for a fresh challenge.
+/// Broker must respond 401 AUTH_WRONG_KEY. Nonce is burned — second consume → None,
+/// forcing the client to reconnect for a fresh challenge (oracle attack prevention).
 #[tokio::test]
 async fn ws_wrong_key_sends_auth_wrong_key_and_burns_nonce() {
     let (addr, state) = spawn_test_server().await;
     let _correct_key = setup_agent(&state, "proj-badkey", "key-badkey", "Bob");
+    let identity = "Bob@proj-badkey";
 
     let mut ws = ws_connect(addr).await;
-    let (nonce_hex, timestamp, session_id) =
-        hello_and_get_challenge(&mut ws, "Bob", "proj-badkey").await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, None).await;
 
-    // Sign with a DIFFERENT key — not the registered one
+    // Sign with a DIFFERENT key — not the registered one.
     let wrong_key = SigningKey::generate(&mut OsRng);
-    let sig_hex = sign_challenge(&wrong_key, &nonce_hex, timestamp, &session_id, "Bob", "proj-badkey");
-    send_json(&mut ws, json!({"type": "auth", "signature": sig_hex})).await;
+    let sig = sign_challenge(&wrong_key, identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut ws, &auth).await;
 
-    // Broker sends AUTH_WRONG_KEY
-    let resp = recv_json(&mut ws).await;
-    assert_eq!(resp["type"], "error", "expected error frame, got: {resp}");
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "expected 401 for wrong key: {:?}", resp.first_line);
     assert_eq!(
-        resp["error_code"], "AUTH_WRONG_KEY",
-        "expected AUTH_WRONG_KEY for wrong private key, got: {resp}"
+        resp.header("X-Error-Code"),
+        Some("AUTH_WRONG_KEY"),
+        "expected AUTH_WRONG_KEY: {:?}",
+        resp
     );
 
-    // Nonce is burned: server consumed it before calling verify_agent_signature.
-    // Second consume must return None — client must reconnect for a fresh challenge.
-    let second = state.broker.nonce_store.consume(&nonce_hex);
+    // Nonce is burned — second consume must return None.
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&nonce_b64)
+        .expect("nonce b64 decode");
+    let nonce_hex = hex::encode(&nonce_bytes);
     assert!(
-        second.is_none(),
+        state.broker.nonce_store.consume(&nonce_hex).is_none(),
         "nonce must be burned after failed verify — oracle attack prevention"
+    );
+}
+
+/// Scenario 4: Two connections with the same identity. First succeeds; second gets 409.
+#[tokio::test]
+async fn ws_duplicate_connect_rejected_with_409() {
+    let (addr, state) = spawn_test_server().await;
+    let signing_key = setup_agent(&state, "proj-dup", "key-dup", "Alice");
+    let identity = "Alice@proj-dup";
+
+    // First connection — must succeed.
+    let mut ws1 = ws_connect(addr).await;
+    let nonce1 = hello_and_get_challenge(&mut ws1, identity, None).await;
+    let sig1 = sign_challenge(&signing_key, identity, &nonce1);
+    let auth1 = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig1)
+        .finalize();
+    send_frame(&mut ws1, &auth1).await;
+    let resp1 = recv_frame(&mut ws1).await;
+    assert_eq!(resp1.status(), Some(200), "first connect must succeed: {:?}", resp1.first_line);
+
+    // Second connection — same identity, first still active → must get 409.
+    let mut ws2 = ws_connect(addr).await;
+    let nonce2 = hello_and_get_challenge(&mut ws2, identity, None).await;
+    let sig2 = sign_challenge(&signing_key, identity, &nonce2);
+    let auth2 = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig2)
+        .finalize();
+    send_frame(&mut ws2, &auth2).await;
+    let resp2 = recv_frame(&mut ws2).await;
+    assert_eq!(resp2.status(), Some(409), "second connect must get 409 Conflict: {:?}", resp2.first_line);
+
+    drop(ws1); // keep ws1 alive through the assertion, then close
+}
+
+/// Scenario 5: Agent HELLO includes X-Pubkey with an attacker's public key.
+/// Attacker signs AUTH with their own private key.
+/// Broker must use the STORED pubkey (not wire X-Pubkey) → 401 AUTH_WRONG_KEY.
+/// This proves spec §6: X-Pubkey on agent HELLO is ignored — no rotation attack possible.
+#[tokio::test]
+async fn ws_agent_xpubkey_ignored_no_rotation_attack() {
+    let (addr, state) = spawn_test_server().await;
+    let _correct_key = setup_agent(&state, "proj-xpubkey", "key-xpubkey", "Eve");
+    let identity = "Eve@proj-xpubkey";
+
+    // Attacker generates their own key pair and attempts to inject it via X-Pubkey.
+    let attacker_key = SigningKey::generate(&mut OsRng);
+    let attacker_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(attacker_key.verifying_key().to_bytes());
+
+    let mut ws = ws_connect(addr).await;
+    // HELLO with attacker's X-Pubkey — broker must ignore it.
+    let nonce_b64 = hello_and_get_challenge(&mut ws, identity, Some(&attacker_pubkey_b64)).await;
+
+    // Sign with attacker's key — broker uses STORED pubkey → verify fails.
+    let sig = sign_challenge(&attacker_key, identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut ws, &auth).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "expected 401 — stored key used, not wire X-Pubkey: {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("AUTH_WRONG_KEY"),
+        "expected AUTH_WRONG_KEY: {:?}",
+        resp
+    );
+
+    // Stored pubkey must be unchanged — attacker's key was NOT persisted.
+    let stored_hex = state.broker.repo.get_agent_public_key("Eve", "proj-xpubkey");
+    let attacker_hex = hex::encode(attacker_key.verifying_key().to_bytes());
+    assert_ne!(
+        stored_hex.as_deref(),
+        Some(attacker_hex.as_str()),
+        "stored pubkey must not have changed — rotation attack prevented"
     );
 }

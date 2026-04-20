@@ -1,16 +1,14 @@
 // §0 compliance: all WebSocket communication uses Message::Text (UTF-8 encoded).
-// Message::Binary is never sent or accepted. This invariant holds through the full
-// migration to HttpFrame framing (Cycle 12) — do not introduce Message::Binary.
-use crate::broker::state::BrokerState;
-use crate::broker::{DeliveryEngine, dispatch_stanza};
+// Message::Binary is never sent or accepted. HttpFrame framing per spec §1 (Cycle 12).
 use crate::api::routes::AppState;
-use crate::stanza;
+use crate::broker::state::{AgentState, BrokerState};
+use crate::http_frame::{self, FirstLine, HttpFrame};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
+use base64::Engine;
 use futures::stream::StreamExt;
 use futures::SinkExt;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub async fn handle_ws(
@@ -20,98 +18,258 @@ pub async fn handle_ws(
     ws.on_upgrade(move |socket| handle_connection(socket, state))
 }
 
-/// JSON envelopes for the WebSocket control plane.
-/// After Connected handshake, all data is raw stanza XML.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WsEnvelope {
-    /// Legacy: Client → Broker: authenticate with project key.
-    /// Deprecated — agents should register a public key and use Hello.
-    Connect {
-        name: String,
-        project: String,
-        project_key: String,
-    },
-    /// New: Client → Broker: initiate Ed25519 challenge-response handshake.
-    Hello {
-        name: String,
-        project: String,
-    },
-    /// Broker → Client: challenge bytes for Ed25519 signing.
-    Challenge {
-        /// 32-byte nonce as lowercase hex string.
-        nonce: String,
-        /// Unix timestamp (seconds) when challenge was issued. Client includes in signed payload.
-        timestamp: u64,
-        /// Connection-scoped session UUID. Included in signed payload.
-        session_id: String,
-    },
-    /// New: Client → Broker: signed challenge response.
-    Auth {
-        /// Ed25519 signature over canonical payload as lowercase hex string.
-        signature: String,
-    },
-    /// Broker → Client: auth success + pending count.
-    Connected {
-        session_id: String,
-        pending_count: usize,
-    },
-    /// Broker → Client: error notification.
-    Error {
-        message: String,
-        /// Structured error code for machine-readable handling. None for non-auth errors.
-        /// AUTH_WRONG_KEY  — wrong private key (config error).
-        /// AUTH_STALE      — nonce expired or clock skew (retry).
-        /// AUTH_INVALID_CREDS — project key wrong or agent not found.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error_code: Option<String>,
-    },
+// ── Frame I/O helpers ─────────────────────────────────────────────────────────
+
+/// Send a single HttpFrame as a UTF-8 WS text message. Returns false if the send failed.
+async fn send_frame(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    frame: &HttpFrame,
+) -> bool {
+    sender.send(Message::Text(frame.serialize().into())).await.is_ok()
 }
+
+/// Receive and parse the next HttpFrame from the WS stream.
+/// Returns None on connection close or unrecoverable parse error.
+async fn recv_frame(
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+) -> Option<HttpFrame> {
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(t) => match http_frame::parse(&t) {
+                Ok(f) => return Some(f),
+                Err(e) => {
+                    tracing::warn!("HttpFrame parse error: {e}");
+                    return None;
+                }
+            },
+            Message::Close(_) => return None,
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Build a plain response frame (no body, no extra headers).
+fn error_response(status: u16, reason: &str) -> HttpFrame {
+    HttpFrame::response(status, reason).finalize()
+}
+
+/// Build a response frame with a machine-readable X-Error-Code header.
+fn error_response_with_code(status: u16, code: &str, reason: &str) -> HttpFrame {
+    let mut frame = HttpFrame::response(status, reason);
+    frame.set_header("X-Error-Code", code);
+    frame.finalize()
+}
+
+// ── Handshake ─────────────────────────────────────────────────────────────────
+
+/// Perform the four-frame Ed25519 handshake: HELLO → CHALLENGE → AUTH → (caller sends 200/409).
+///
+/// Returns `(name, project)` on success; sends an error frame and returns `None` on failure.
+///
+/// Boards path (X-Pubkey on HELLO, name == "Boards"):
+///   Auto-registers Boards@project via register_agent + set_agent_public_key.
+///   Project must already exist — returns 403 Forbidden if it does not.
+///
+/// Agent path (no X-Pubkey, or X-Pubkey present but name != "Boards"):
+///   X-Pubkey is silently ignored (spec §6 — no pubkey rotation from the wire).
+///   Agent must be pre-registered with a stored pubkey.
+async fn wait_for_handshake(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+    state: &Arc<AppState>,
+) -> Option<(String, String)> {
+    let frame = recv_frame(receiver).await?;
+
+    // Must be HELLO /v1/sessions
+    if frame.verb() != Some("HELLO") || frame.path() != Some("/v1/sessions") {
+        if frame.status().is_some() {
+            tracing::warn!(
+                "Expected HELLO request, received response frame (status {:?})",
+                frame.status()
+            );
+        }
+        let _ = send_frame(sender, &error_response_with_code(400, "PROTOCOL_ERROR", "Bad Request")).await;
+        return None;
+    }
+
+    let xfrom = match frame.header("X-From") {
+        Some(v) => v.to_string(),
+        None => {
+            let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+            return None;
+        }
+    };
+
+    let (name, project) = match http_frame::parse_identity(&xfrom) {
+        Ok((n, p)) => (n.to_string(), p.to_string()),
+        Err(_) => {
+            let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+            return None;
+        }
+    };
+
+    let xpubkey = frame.header("X-Pubkey").map(|s| s.to_string());
+
+    if name == "Boards" {
+        // Boards path: X-Pubkey required — auto-register as service participant.
+        let pubkey_b64 = match xpubkey {
+            Some(ref k) => k.clone(),
+            None => {
+                tracing::warn!("Boards HELLO missing X-Pubkey for project '{}'", project);
+                let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+                return None;
+            }
+        };
+        let pubkey_bytes = match base64::engine::general_purpose::STANDARD.decode(&pubkey_b64) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+                return None;
+            }
+        };
+        let pubkey_hex = hex::encode(&pubkey_bytes);
+
+        // register_agent is a no-op if already registered; returns FK error if project doesn't exist.
+        if let Err(e) = state.broker.repo.register_agent("Boards", &project, "service", "") {
+            tracing::warn!("Boards auto-register failed for project '{}': {}", project, e);
+            let _ = send_frame(sender, &error_response(403, "Forbidden")).await;
+            return None;
+        }
+        if let Err(e) = state.broker.repo.set_agent_public_key("Boards", &project, &pubkey_hex) {
+            tracing::warn!("Boards set_agent_public_key failed for project '{}': {}", project, e);
+            let _ = send_frame(sender, &error_response(403, "Forbidden")).await;
+            return None;
+        }
+    } else if xpubkey.is_some() {
+        // Agent HELLO with X-Pubkey — spec §6: MUST ignore, no pubkey rotation from wire.
+        tracing::warn!(
+            "Agent HELLO from {}@{} carried X-Pubkey — ignoring (spec §6: no pubkey rotation from wire)",
+            name, project
+        );
+    }
+
+    // Common path: agent must be registered and have a stored pubkey.
+    if !state.broker.repo.agent_exists(&name, &project) {
+        tracing::warn!("HELLO from unregistered agent {}@{}", name, project);
+        let _ = send_frame(sender, &error_response_with_code(403, "AUTH_INVALID_CREDS", "Forbidden")).await;
+        return None;
+    }
+    let pubkey_hex = match state.broker.repo.get_agent_public_key(&name, &project) {
+        Some(k) => k,
+        None => {
+            tracing::warn!("HELLO from {}@{} — no public key registered", name, project);
+            let _ = send_frame(sender, &error_response_with_code(403, "AUTH_INVALID_CREDS", "Forbidden")).await;
+            return None;
+        }
+    };
+
+    // Issue challenge
+    let identity = format!("{}@{}", name, project);
+    let (nonce_bytes, nonce_b64, _payload) = state.broker.nonce_store.issue(&identity);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    let challenge = HttpFrame::request("CHALLENGE", "/v1/sessions")
+        .add_header("X-Nonce", &nonce_b64)
+        .finalize();
+    if !send_frame(sender, &challenge).await {
+        return None;
+    }
+
+    // Receive AUTH
+    let auth_frame = recv_frame(receiver).await?;
+    if auth_frame.verb() != Some("AUTH") || auth_frame.path() != Some("/v1/sessions") {
+        let _ = send_frame(sender, &error_response_with_code(400, "PROTOCOL_ERROR", "Bad Request")).await;
+        return None;
+    }
+    let xsig = match auth_frame.header("X-Sig") {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+            return None;
+        }
+    };
+
+    // Decode X-Sig from base64 → bytes → hex (verify_agent_signature takes hex)
+    let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&xsig) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+            return None;
+        }
+    };
+    let sig_hex = hex::encode(&sig_bytes);
+
+    // Consume nonce — retrieves stored canonical payload; None means expired/unknown.
+    let payload = match state.broker.nonce_store.consume(&nonce_hex) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("Stale nonce for {}@{}", name, project);
+            let _ = send_frame(sender, &error_response_with_code(401, "AUTH_STALE", "Unauthorized")).await;
+            return None;
+        }
+    };
+
+    // Verify — verify_strict rejects malleable signatures.
+    match crate::identity::verify_agent_signature(&pubkey_hex, &payload, &sig_hex) {
+        Ok(()) => {
+            tracing::info!("Ed25519 auth: {}@{} authenticated", name, project);
+            Some((name, project))
+        }
+        Err(_) => {
+            tracing::warn!("Bad signature from {}@{}", name, project);
+            let _ = send_frame(sender, &error_response_with_code(401, "AUTH_WRONG_KEY", "Unauthorized")).await;
+            None
+        }
+    }
+}
+
+// ── Connection lifecycle ──────────────────────────────────────────────────────
 
 async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
-    let (name, project, session_id) = match wait_for_connect(&mut sender, &mut receiver, &state).await {
+    let (name, project) = match wait_for_handshake(&mut sender, &mut receiver, &state).await {
         Some(info) => info,
-        None => return, // error already sent inside auth helpers
+        None => return, // error already sent in wait_for_handshake
     };
 
-    // Register live connection FIRST — so messages arriving during pending drain are buffered in rx.
-    // Returns Err(()) if identity already connected — 409 Conflict.
+    // Register live session — 409 Conflict if same identity already connected.
     let mut rx = match state.broker.connect(&name, &project).await {
         Ok(rx) => rx,
         Err(()) => {
-            let _ = send_envelope(&mut sender, &WsEnvelope::Error {
-                message: "Another session is already connected with this identity".to_string(),
-                error_code: Some("CONFLICT".to_string()),
-            }).await;
+            let _ = send_frame(&mut sender, &error_response_with_code(409, "CONFLICT", "Conflict")).await;
             return;
         }
     };
 
-    // Drain pending messages — each body is raw stanza XML
+    // Drain pending messages stored while agent was offline.
     let pending = state.delivery.drain_pending(&name, &project);
     let pending_count = pending.len();
 
-    let connected = WsEnvelope::Connected {
-        session_id: session_id.clone(),
-        pending_count,
-    };
-    if sender.send(Message::Text(serde_json::to_string(&connected).unwrap().into())).await.is_err() {
+    // Send 200 OK — session is open.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let ok_frame = HttpFrame::response(200, "OK")
+        .add_header("X-Session-Id", &session_id)
+        .add_header("X-Pending-Count", &pending_count.to_string())
+        .finalize();
+    if !send_frame(&mut sender, &ok_frame).await {
+        state.broker.disconnect(&name, &project).await;
         return;
     }
 
-    // Send each pending message as a raw stanza XML frame
+    // Send each pending message body as a raw text frame.
     for msg in pending {
         if sender.send(Message::Text(msg.body.into())).await.is_err() {
+            state.broker.disconnect(&name, &project).await;
             return;
         }
     }
 
-    // mpsc channel: recv_task sends error frames back to send_task for delivery to client
-    let (err_tx, mut err_rx) = tokio::sync::mpsc::channel::<String>(8);
+    // mpsc channel: recv_task sends response frames back to send_task for client delivery.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(8);
 
-    // Forward live messages and error frames to the client
+    // Send task: forward live messages and response frames to the client.
     let mut send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -124,9 +282,9 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
                     }
                     Err(_) => break,
                 },
-                Some(err_msg) = err_rx.recv() => {
-                    if sender.send(Message::Text(err_msg.into())).await.is_err() {
-                        tracing::warn!("WS send error on error frame — send_task exiting");
+                Some(resp) = resp_rx.recv() => {
+                    if sender.send(Message::Text(resp.into())).await.is_err() {
+                        tracing::warn!("WS send error on response frame — send_task exiting");
                         break;
                     }
                 }
@@ -135,25 +293,32 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     });
 
     let broker = state.broker.clone();
-    let delivery = state.delivery.clone();
     let rate_limiter = state.rate_limiter.clone();
     let agent_name = name.clone();
     let agent_project = project.clone();
 
-    // Receive stanza XML from client
+    // Receive task: parse inbound HttpFrames and dispatch.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
                     // Rate-limit per project — same bucket as HTTP write-path routes.
-                    // Drop the stanza and send an error frame; keep the connection alive.
                     if !rate_limiter.check(&agent_project) {
                         tracing::debug!("WS rate limit exceeded for project '{}'", agent_project);
-                        let msg = WsEnvelope::Error { message: "Rate limit exceeded".to_string(), error_code: None };
-                        let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
+                        let _ = resp_tx.try_send(error_response(429, "Too Many Requests").serialize());
                         continue;
                     }
-                    handle_stanza(&text, &agent_name, &agent_project, &broker, &delivery, &err_tx).await;
+                    match http_frame::parse(&text) {
+                        Ok(frame) => {
+                            handle_inbound(frame, &agent_name, &agent_project, &broker, &resp_tx).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("HttpFrame parse error from {}@{}: {}", agent_name, agent_project, e);
+                            let _ = resp_tx.try_send(
+                                error_response_with_code(400, "PARSE_ERROR", "Bad Request").serialize(),
+                            );
+                        }
+                    }
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -167,226 +332,163 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     }
 
     state.broker.disconnect(&name, &project).await;
-    tracing::info!("WebSocket closed: {}.{}", name, project);
+    tracing::info!("WebSocket closed: {}@{}", name, project);
 }
 
-/// Authenticate the WebSocket client. Handles both Ed25519 (Hello→Challenge→Auth) and
-/// legacy project-key (Connect) flows. Returns (name, project, session_id) on success.
-/// Sends Challenge (Ed25519 path) or Error frames directly via sender.
-async fn wait_for_connect(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    receiver: &mut futures::stream::SplitStream<WebSocket>,
-    state: &Arc<AppState>,
-) -> Option<(String, String, String)> {
-    let text = recv_text(receiver).await?;
-    match serde_json::from_str::<WsEnvelope>(&text).ok()? {
-        WsEnvelope::Hello { name, project } => {
-            handle_hello_auth(sender, receiver, state, name, project).await
+// ── Inbound frame dispatch ────────────────────────────────────────────────────
+
+/// Dispatch a verified inbound frame from an authenticated connection.
+/// Handles: POST /v1/posts|reactions|dms (→ Boards), PUBLISH /v1/deliveries (Boards→agents),
+/// PUT /v1/presence. Sends a response frame via resp_tx on completion.
+async fn handle_inbound(
+    frame: HttpFrame,
+    name: &str,
+    project: &str,
+    broker: &Arc<BrokerState>,
+    resp_tx: &tokio::sync::mpsc::Sender<String>,
+) {
+    let verb = frame.verb().unwrap_or("").to_string();
+    let path = frame.path().unwrap_or("").to_string();
+
+    match (verb.as_str(), path.as_str()) {
+        ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
+            let xto = match frame.header("X-To").map(|s| s.to_string()) {
+                Some(v) => v,
+                None => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            let channel_project = match http_frame::parse_channel(&xto) {
+                Ok((_, p)) => p.to_string(),
+                Err(_) => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            forward_to_boards(frame, &channel_project, broker, resp_tx).await;
         }
-        WsEnvelope::Connect { name, project, project_key } => {
-            handle_legacy_auth(sender, state, name, project, project_key).await
+        ("POST", "/v1/dms") => {
+            let xto = match frame.header("X-To").map(|s| s.to_string()) {
+                Some(v) => v,
+                None => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            let recipient_project = match http_frame::parse_identity(&xto) {
+                Ok((_, p)) => p.to_string(),
+                Err(_) => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            forward_to_boards(frame, &recipient_project, broker, resp_tx).await;
+        }
+        ("PUBLISH", "/v1/deliveries") => {
+            // Boards-only verb — reject from regular agents.
+            if name != "Boards" {
+                tracing::warn!("PUBLISH rejected from non-Boards agent {}@{}", name, project);
+                let _ = resp_tx.try_send(error_response(403, "Forbidden").serialize());
+                return;
+            }
+            let xto = match frame.header("X-To").map(|s| s.to_string()) {
+                Some(v) => v,
+                None => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            // Validate all recipients in X-To are valid name@project identities (spec §9).
+            if let Err(e) = http_frame::validate_xto_shape("PUBLISH", "/v1/deliveries", &xto) {
+                tracing::warn!("PUBLISH X-To invalid from {}@{}: {}", name, project, e);
+                let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                return;
+            }
+            // MUST NOT block the recv loop — spawn fan-out.
+            let broker_clone = broker.clone();
+            tokio::spawn(async move {
+                fan_out_publish(frame, xto, &broker_clone).await;
+            });
+        }
+        ("PUT", "/v1/presence") => {
+            let status = match frame.header("X-Status").map(|s| s.to_string()) {
+                Some(s) => s,
+                None => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            let agent_state = match status.as_str() {
+                "available" => AgentState::Available,
+                "busy" => AgentState::Busy,
+                "offline" => AgentState::Offline,
+                _ => {
+                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    return;
+                }
+            };
+            broker.set_state(name, project, agent_state).await;
+            let _ = resp_tx.try_send(HttpFrame::response(200, "OK").finalize().serialize());
         }
         _ => {
-            // Unexpected envelope type — client sent something that isn't Hello or Connect.
-            // Send a structured error so the client can distinguish protocol violations from drops.
-            let _ = send_envelope(sender, &WsEnvelope::Error {
-                message: "Expected Hello or Connect envelope to initiate connection".to_string(),
-                error_code: Some("PROTOCOL_ERROR".to_string()),
-            }).await;
-            None
+            tracing::warn!("Unknown verb/path from {}@{}: {} {}", name, project, verb, path);
+            let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
         }
     }
 }
 
-/// Receive a single Text message from the WS stream. Returns None on close or non-text.
-async fn recv_text(receiver: &mut futures::stream::SplitStream<WebSocket>) -> Option<String> {
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            Message::Text(t) => return Some(t.to_string()),
-            Message::Close(_) => return None,
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Send a WsEnvelope frame via the sender. Returns false if serialization or send failed.
-async fn send_envelope(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    env: &WsEnvelope,
-) -> bool {
-    match serde_json::to_string(env) {
-        Ok(json) => sender.send(Message::Text(json.into())).await.is_ok(),
-        Err(_) => false,
-    }
-}
-
-/// Ed25519 challenge-response path. Called when client sends Hello.
-async fn handle_hello_auth(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    receiver: &mut futures::stream::SplitStream<WebSocket>,
-    state: &Arc<AppState>,
-    name: String,
-    project: String,
-) -> Option<(String, String, String)> {
-    // Agent must exist
-    if !state.broker.repo.agent_exists(&name, &project) {
-        tracing::warn!("Hello from unregistered agent {}.{}", name, project);
-        let _ = send_envelope(sender, &WsEnvelope::Error {
-            message: "Agent not registered".to_string(),
-            error_code: Some("AUTH_INVALID_CREDS".to_string()),
-        }).await;
-        return None;
-    }
-
-    // Must have a public key — no silent fallback within the Hello path
-    let pubkey_hex = match state.broker.repo.get_agent_public_key(&name, &project) {
-        Some(k) => k,
-        None => {
-            tracing::warn!(
-                "Hello from {}.{} — no public key registered. Use Connect for project-key auth.",
-                name, project
-            );
-            let _ = send_envelope(sender, &WsEnvelope::Error {
-                message: "No public key registered — use project-key auth (Connect)".to_string(),
-                error_code: Some("AUTH_INVALID_CREDS".to_string()),
-            }).await;
-            return None;
-        }
-    };
-
-    // Issue challenge
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let (nonce_bytes, _payload, timestamp) = state.broker.nonce_store.issue(&session_id, &name, &project);
-    let nonce_hex = hex::encode(nonce_bytes);
-
-    if !send_envelope(sender, &WsEnvelope::Challenge {
-        nonce: nonce_hex.clone(),
-        timestamp,
-        session_id: session_id.clone(),
-    }).await {
-        return None;
-    }
-
-    // Receive Auth response
-    let auth_text = recv_text(receiver).await?;
-    let signature_hex = match serde_json::from_str::<WsEnvelope>(&auth_text).ok()? {
-        WsEnvelope::Auth { signature } => signature,
-        _ => return None,
-    };
-
-    // Consume nonce — retrieves stored canonical payload; None means expired
-    let payload = match state.broker.nonce_store.consume(&nonce_hex) {
-        Some(p) => p,
-        None => {
-            tracing::warn!("Stale nonce from {}.{}", name, project);
-            let _ = send_envelope(sender, &WsEnvelope::Error {
-                message: "Challenge expired — reconnect and retry".to_string(),
-                error_code: Some("AUTH_STALE".to_string()),
-            }).await;
-            return None;
-        }
-    };
-
-    // Verify signature
-    match crate::identity::verify_agent_signature(&pubkey_hex, &payload, &signature_hex) {
-        Ok(()) => {
-            tracing::info!("Ed25519 auth: {}.{} authenticated", name, project);
-            Some((name, project, session_id))
-        }
-        Err(_) => {
-            tracing::warn!("Bad signature from {}.{}", name, project);
-            let _ = send_envelope(sender, &WsEnvelope::Error {
-                message: "Signature verification failed — wrong private key".to_string(),
-                error_code: Some("AUTH_WRONG_KEY".to_string()),
-            }).await;
-            None
-        }
-    }
-}
-
-/// Legacy project-key path. Called when client sends Connect.
-async fn handle_legacy_auth(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    state: &Arc<AppState>,
-    name: String,
-    project: String,
-    project_key: String,
-) -> Option<(String, String, String)> {
-    tracing::warn!(
-        "Deprecated project-key WS auth for {}.{} — register a public key via POST /agents/register",
-        name, project
-    );
-    if let Err(reason) = state.broker.authenticate(&name, &project, &project_key) {
-        tracing::warn!("Legacy auth failed for {}.{}: {}", name, project, reason);
-        let _ = send_envelope(sender, &WsEnvelope::Error {
-            message: reason,
-            error_code: Some("AUTH_INVALID_CREDS".to_string()),
-        }).await;
-        return None;
-    }
-    let session_id = uuid::Uuid::new_v4().to_string();
-    tracing::info!("WS connected (legacy auth): {}.{}", name, project);
-    Some((name, project, session_id))
-}
-
-/// Handle an incoming stanza from an authenticated WebSocket client.
-/// Sends WsEnvelope::Error frames back via err_tx on parse failure or identity mismatch.
-async fn handle_stanza(
-    text: &str,
-    agent_name: &str,
-    agent_project: &str,
+/// Forward a POST frame to Boards@target_project.
+/// Responds 200 OK if delivered, 503 Service Unavailable (Retry-After: 1) if not connected.
+async fn forward_to_boards(
+    frame: HttpFrame,
+    target_project: &str,
     broker: &Arc<BrokerState>,
-    delivery: &Arc<DeliveryEngine>,
-    err_tx: &tokio::sync::mpsc::Sender<String>,
+    resp_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
-    let parsed = match stanza::parse(text) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Invalid stanza from {}.{}: {}", agent_name, agent_project, e);
-            let msg = WsEnvelope::Error { message: format!("Invalid stanza: {e}"), error_code: None };
-            let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
-            return;
+    let delivered = broker.send_to_agent("Boards", target_project, &frame.serialize()).await;
+    let response = if delivered {
+        HttpFrame::response(200, "OK").finalize()
+    } else {
+        tracing::warn!("Boards@{} not connected — 503", target_project);
+        let mut r = HttpFrame::response(503, "Service Unavailable").finalize();
+        r.set_header("Retry-After", "1");
+        r
+    };
+    let _ = resp_tx.try_send(response.serialize());
+}
+
+/// Fan out a PUBLISH frame to each recipient in the comma-separated X-To list.
+/// Sends a DELIVER frame (same headers, verb changed) to each connected recipient.
+/// Live-only: drops delivery if recipient is not connected (no pending queue for DELIVER).
+async fn fan_out_publish(frame: HttpFrame, xto: String, broker: &Arc<BrokerState>) {
+    for recipient in xto.split(',') {
+        let recipient = recipient.trim();
+        if recipient.is_empty() {
+            continue;
         }
-    };
-
-    // Accept both 'Name' and 'Name.Project' — reject only true spoofing
-    let stanza_from = match &parsed {
-        stanza::Stanza::Message(msg) => msg.from.as_str(),
-        stanza::Stanza::Presence(p) => p.from.as_str(),
-    };
-    let (stanza_name, _) = stanza::resolve_agent_name(stanza_from, agent_project);
-    if stanza_name != agent_name {
-        tracing::warn!(
-            "Stanza 'from' mismatch: stanza says '{}', authenticated as '{}'",
-            stanza_from, agent_name
-        );
-        let msg = WsEnvelope::Error {
-            message: "Stanza 'from' does not match authenticated identity".to_string(),
-            error_code: None,
+        let (recv_name, recv_project) = match http_frame::parse_identity(recipient) {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!("PUBLISH fan-out: invalid recipient '{}'", recipient);
+                continue;
+            }
         };
-        let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
-        return;
-    }
 
-    // WS dispatch doesn't validate target existence (broker stores for offline agents)
-    if let Err(e) = dispatch_stanza(parsed, agent_project, broker, delivery, false).await {
-        match e {
-            crate::broker::DispatchError::DeliveryFailed(reason) => {
-                tracing::error!("Delivery failed for {}.{}: {}", agent_name, agent_project, reason);
-            }
-            crate::broker::DispatchError::AmbiguousMention { name, projects } => {
-                let msg = WsEnvelope::Error {
-                    message: format!(
-                        "Mention @{} is ambiguous: found in projects [{}]. Use Name.Project to disambiguate.",
-                        name,
-                        projects.join(", ")
-                    ),
-                    error_code: None,
-                };
-                let _ = err_tx.try_send(serde_json::to_string(&msg).unwrap_or_default());
-            }
-            _ => {}
+        // Clone PUBLISH frame and change verb+path to DELIVER; replace X-To with single recipient.
+        let mut deliver = frame.clone();
+        deliver.first_line = FirstLine::Request {
+            verb: "DELIVER".to_string(),
+            path: "/v1/deliveries".to_string(),
+        };
+        deliver.set_header("X-To", recipient);
+
+        let delivered = broker.send_to_agent(recv_name, recv_project, &deliver.serialize()).await;
+        if !delivered {
+            tracing::debug!(
+                "DELIVER to {} not connected — dropping (live-only fan-out)",
+                recipient
+            );
         }
     }
 }
