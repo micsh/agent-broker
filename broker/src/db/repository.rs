@@ -450,17 +450,19 @@ impl Repository {
         agent_name: &str,
         agent_project: &str,
     ) -> Result<ToolEntry, String> {
+        // Single time source — DB row and returned ToolEntry share the same timestamp.
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.conn().execute(
             "INSERT INTO tools (name, description, maintainer, contact, registered_by_name, registered_by_project, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(name) DO UPDATE SET
                description           = excluded.description,
                maintainer            = excluded.maintainer,
                contact               = excluded.contact,
                registered_by_name    = excluded.registered_by_name,
                registered_by_project = excluded.registered_by_project,
-               last_updated          = datetime('now')",
-            params![name, description, maintainer, contact, agent_name, agent_project],
+               last_updated          = excluded.last_updated",
+            params![name, description, maintainer, contact, agent_name, agent_project, now],
         ).map_err(|e| format!("Failed to register tool: {e}"))?;
         // Construct the return value from input data — avoids a second DB query and eliminates
         // the TOCTOU window where a concurrent DELETE could make the readback return None.
@@ -470,7 +472,7 @@ impl Repository {
             maintainer: maintainer.to_string(),
             contact: contact.to_string(),
             registered_by: format!("{agent_name}.{agent_project}"),
-            last_updated: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            last_updated: now,
         })
     }
 
