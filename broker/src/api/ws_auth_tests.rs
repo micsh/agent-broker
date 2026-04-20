@@ -295,3 +295,156 @@ async fn ws_agent_xpubkey_ignored_no_rotation_attack() {
         "stored pubkey must not have changed — rotation attack prevented"
     );
 }
+
+/// Scenario 6: Agent sends POST /v1/posts with a forged X-From header.
+/// Broker must canonicalize X-From to the authenticated session identity before forwarding to Boards.
+/// Proves that agents cannot impersonate other agents via X-From on POST.
+#[tokio::test]
+async fn ws_post_xfrom_canonicalized_prevents_impersonation() {
+    let (addr, state) = spawn_test_server().await;
+    let agent_key = setup_agent(&state, "proj-xfrom", "key-xfrom", "Alice");
+    let agent_identity = "Alice@proj-xfrom";
+
+    // --- Connect Boards (four-frame handshake) ---
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-xfrom";
+
+    let mut boards_ws = ws_connect(addr).await;
+    let mut boards_hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity);
+    boards_hello = boards_hello.add_header("X-Pubkey", &boards_pubkey_b64);
+    let boards_hello = boards_hello.finalize();
+    send_frame(&mut boards_ws, &boards_hello).await;
+    let boards_challenge = recv_frame(&mut boards_ws).await;
+    assert_eq!(boards_challenge.verb(), Some("CHALLENGE"), "expected Boards CHALLENGE: {:?}", boards_challenge.first_line);
+    let boards_nonce = boards_challenge.header("X-Nonce").expect("X-Nonce missing").to_string();
+    let boards_sig = sign_challenge(&boards_key, boards_identity, &boards_nonce);
+    let boards_auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &boards_sig)
+        .finalize();
+    send_frame(&mut boards_ws, &boards_auth).await;
+    let boards_ok = recv_frame(&mut boards_ws).await;
+    assert_eq!(boards_ok.status(), Some(200), "Boards must authenticate: {:?}", boards_ok.first_line);
+
+    // --- Connect agent ---
+    let mut agent_ws = ws_connect(addr).await;
+    let nonce_b64 = hello_and_get_challenge(&mut agent_ws, agent_identity, None).await;
+    let sig = sign_challenge(&agent_key, agent_identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut agent_ws, &auth).await;
+    let agent_ok = recv_frame(&mut agent_ws).await;
+    assert_eq!(agent_ok.status(), Some(200), "agent must authenticate: {:?}", agent_ok.first_line);
+
+    // --- Agent sends POST /v1/posts with a forged X-From ---
+    let mut post = HttpFrame::request("POST", "/v1/posts")
+        .add_header("X-From", "FakeAgent@proj-xfrom") // forged identity
+        .add_header("X-To", "#general.proj-xfrom");
+    post.body = "hello".to_string();
+    let post = post.finalize();
+    send_frame(&mut agent_ws, &post).await;
+
+    // --- Boards must receive POST with canonicalized X-From = authenticated identity ---
+    let forwarded = recv_frame(&mut boards_ws).await;
+    assert_eq!(
+        forwarded.header("X-From"),
+        Some(agent_identity),
+        "X-From must be canonicalized to authenticated identity, not forged value: {:?}",
+        forwarded
+    );
+
+    // Agent must receive 200 OK
+    let ack = recv_frame(&mut agent_ws).await;
+    assert_eq!(ack.status(), Some(200), "agent must get 200 OK: {:?}", ack.first_line);
+
+    drop(boards_ws);
+    drop(agent_ws);
+}
+
+/// Scenario 7: Boards TOFU — first HELLO with X-Pubkey on fresh project stores the key and
+/// completes the four-frame handshake successfully.
+#[tokio::test]
+async fn ws_boards_tofu_first_connect_stores_key_and_succeeds() {
+    let (addr, state) = spawn_test_server().await;
+    // Register project only — NO Boards agent row, NO stored key.
+    state.broker.repo.register_project("proj-tofu", "pkey-tofu").expect("register_project");
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_pubkey_hex = hex::encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-tofu";
+
+    // No stored key yet.
+    assert!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-tofu").is_none(),
+        "no key must be stored before TOFU HELLO"
+    );
+
+    let mut ws = ws_connect(addr).await;
+    let nonce_b64 = hello_and_get_challenge(&mut ws, boards_identity, Some(&boards_pubkey_b64)).await;
+
+    let sig = sign_challenge(&boards_key, boards_identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut ws, &auth).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(200), "TOFU Boards handshake must succeed: {:?}", resp.first_line);
+
+    // Key must now be persisted in DB.
+    assert_eq!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-tofu").as_deref(),
+        Some(boards_pubkey_hex.as_str()),
+        "TOFU key must be stored after first Boards HELLO"
+    );
+}
+
+/// Scenario 8: Boards key-rotation rejected — after TOFU, a second HELLO carrying a different
+/// X-Pubkey must be rejected with 401 KEY_MISMATCH BEFORE a CHALLENGE is issued.
+/// Proves spec §6: no Boards key rotation from the wire.
+#[tokio::test]
+async fn ws_boards_key_rotation_rejected_before_challenge() {
+    let (addr, state) = spawn_test_server().await;
+    state.broker.repo.register_project("proj-no-rotate", "pkey-no-rotate").expect("register_project");
+
+    // Pre-pin a Boards key (simulates post-TOFU state).
+    let pinned_key = SigningKey::generate(&mut OsRng);
+    let pinned_hex = hex::encode(pinned_key.verifying_key().to_bytes());
+    state.broker.repo.register_agent("Boards", "proj-no-rotate", "service", "").expect("register Boards");
+    state.broker.repo.set_agent_public_key("Boards", "proj-no-rotate", &pinned_hex).expect("pin key");
+
+    // Attacker tries to reconnect with a different key.
+    let attacker_key = SigningKey::generate(&mut OsRng);
+    let attacker_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(attacker_key.verifying_key().to_bytes());
+    let boards_identity = "Boards@proj-no-rotate";
+
+    let mut ws = ws_connect(addr).await;
+    let mut hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", boards_identity);
+    hello = hello.add_header("X-Pubkey", &attacker_pubkey_b64);
+    let hello = hello.finalize();
+    send_frame(&mut ws, &hello).await;
+
+    // Must get 401 KEY_MISMATCH — no CHALLENGE should be issued.
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(resp.status(), Some(401), "rotation attempt must be rejected with 401: {:?}", resp.first_line);
+    assert_eq!(
+        resp.header("X-Error-Code"),
+        Some("KEY_MISMATCH"),
+        "expected KEY_MISMATCH error code: {:?}",
+        resp
+    );
+
+    // Stored key must be unchanged.
+    assert_eq!(
+        state.broker.repo.get_agent_public_key("Boards", "proj-no-rotate").as_deref(),
+        Some(pinned_hex.as_str()),
+        "stored Boards key must be unchanged after rotation rejection"
+    );
+}

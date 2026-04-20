@@ -67,11 +67,13 @@ fn error_response_with_code(status: u16, code: &str, reason: &str) -> HttpFrame 
 ///
 /// Returns `(name, project)` on success; sends an error frame and returns `None` on failure.
 ///
-/// Boards path (X-Pubkey on HELLO, name == "Boards"):
-///   Auto-registers Boards@project via register_agent + set_agent_public_key.
-///   Project must already exist — returns 403 Forbidden if it does not.
+/// Boards path (name == "Boards") — TOFU bootstrap rule (spec §6):
+///   • No stored key for Boards@project → X-Pubkey required; write once then CHALLENGE.
+///     Project row must already exist — 403 Forbidden if FK fails.
+///   • Stored key exists → X-Pubkey must be absent OR byte-equal to stored key.
+///     Differing X-Pubkey → 401 KEY_MISMATCH, BEFORE CHALLENGE is issued (no rotation from wire).
 ///
-/// Agent path (no X-Pubkey, or X-Pubkey present but name != "Boards"):
+/// Agent path (name != "Boards"):
 ///   X-Pubkey is silently ignored (spec §6 — no pubkey rotation from the wire).
 ///   Agent must be pre-registered with a stored pubkey.
 async fn wait_for_handshake(
@@ -112,34 +114,70 @@ async fn wait_for_handshake(
     let xpubkey = frame.header("X-Pubkey").map(|s| s.to_string());
 
     if name == "Boards" {
-        // Boards path: X-Pubkey required — auto-register as service participant.
-        let pubkey_b64 = match xpubkey {
-            Some(ref k) => k.clone(),
+        // TOFU bootstrap rule (spec §6): check for an existing stored key first.
+        let stored_hex = state.broker.repo.get_agent_public_key("Boards", &project);
+        match stored_hex {
             None => {
-                tracing::warn!("Boards HELLO missing X-Pubkey for project '{}'", project);
-                let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
-                return None;
+                // No stored key — X-Pubkey required for first-time registration.
+                let pubkey_b64 = match xpubkey {
+                    Some(ref k) => k.clone(),
+                    None => {
+                        tracing::warn!(
+                            "Boards HELLO missing X-Pubkey for unregistered Boards@{}",
+                            project
+                        );
+                        let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+                        return None;
+                    }
+                };
+                let pubkey_bytes = match base64::engine::general_purpose::STANDARD.decode(&pubkey_b64) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+                        return None;
+                    }
+                };
+                let pubkey_hex = hex::encode(&pubkey_bytes);
+                // register_agent is a no-op if row exists; returns FK error if project doesn't exist.
+                if let Err(e) = state.broker.repo.register_agent("Boards", &project, "service", "") {
+                    tracing::warn!("Boards TOFU register_agent failed for project '{}': {}", project, e);
+                    let _ = send_frame(sender, &error_response(403, "Forbidden")).await;
+                    return None;
+                }
+                if let Err(e) = state.broker.repo.set_agent_public_key("Boards", &project, &pubkey_hex) {
+                    tracing::warn!("Boards TOFU set_agent_public_key failed for project '{}': {}", project, e);
+                    let _ = send_frame(sender, &error_response(500, "Internal Server Error")).await;
+                    return None;
+                }
+                tracing::info!("Boards@{}: TOFU — first key registered", project);
             }
-        };
-        let pubkey_bytes = match base64::engine::general_purpose::STANDARD.decode(&pubkey_b64) {
-            Ok(b) => b,
-            Err(_) => {
-                let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
-                return None;
+            Some(stored_hex) => {
+                // Key already stored — X-Pubkey must be absent or byte-equal. No rotation from wire.
+                if let Some(ref wire_b64) = xpubkey {
+                    let wire_bytes = match base64::engine::general_purpose::STANDARD.decode(wire_b64) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
+                            return None;
+                        }
+                    };
+                    let wire_hex = hex::encode(&wire_bytes);
+                    if wire_hex != stored_hex {
+                        // Rotation attempt — reject BEFORE issuing CHALLENGE (spec §6).
+                        tracing::warn!(
+                            "Boards@{} key rotation rejected — wire X-Pubkey differs from stored key",
+                            project
+                        );
+                        let _ = send_frame(
+                            sender,
+                            &error_response_with_code(401, "KEY_MISMATCH", "Unauthorized"),
+                        )
+                        .await;
+                        return None;
+                    }
+                }
+                // X-Pubkey absent or byte-equal — proceed to CHALLENGE using stored key.
             }
-        };
-        let pubkey_hex = hex::encode(&pubkey_bytes);
-
-        // register_agent is a no-op if already registered; returns FK error if project doesn't exist.
-        if let Err(e) = state.broker.repo.register_agent("Boards", &project, "service", "") {
-            tracing::warn!("Boards auto-register failed for project '{}': {}", project, e);
-            let _ = send_frame(sender, &error_response(403, "Forbidden")).await;
-            return None;
-        }
-        if let Err(e) = state.broker.repo.set_agent_public_key("Boards", &project, &pubkey_hex) {
-            tracing::warn!("Boards set_agent_public_key failed for project '{}': {}", project, e);
-            let _ = send_frame(sender, &error_response(403, "Forbidden")).await;
-            return None;
         }
     } else if xpubkey.is_some() {
         // Agent HELLO with X-Pubkey — spec §6: MUST ignore, no pubkey rotation from wire.
@@ -341,7 +379,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 /// Handles: POST /v1/posts|reactions|dms (→ Boards), PUBLISH /v1/deliveries (Boards→agents),
 /// PUT /v1/presence. Sends a response frame via resp_tx on completion.
 async fn handle_inbound(
-    frame: HttpFrame,
+    mut frame: HttpFrame,
     name: &str,
     project: &str,
     broker: &Arc<BrokerState>,
@@ -366,6 +404,9 @@ async fn handle_inbound(
                     return;
                 }
             };
+            // Canonicalize X-From to the authenticated session identity (spec §5).
+            // Prevents agents from forging a different sender identity to Boards.
+            frame.set_header("X-From", &format!("{}@{}", name, project));
             forward_to_boards(frame, &channel_project, broker, resp_tx).await;
         }
         ("POST", "/v1/dms") => {
@@ -383,6 +424,9 @@ async fn handle_inbound(
                     return;
                 }
             };
+            // Canonicalize X-From to the authenticated session identity (spec §5).
+            // Prevents agents from forging a different sender identity to Boards.
+            frame.set_header("X-From", &format!("{}@{}", name, project));
             forward_to_boards(frame, &recipient_project, broker, resp_tx).await;
         }
         ("PUBLISH", "/v1/deliveries") => {
