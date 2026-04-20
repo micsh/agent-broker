@@ -46,7 +46,7 @@ async fn spawn_test_server_inner(boards_registration_token: Option<String>) -> (
     let repo = Arc::new(db::open_memory().expect("in-memory DB"));
     let broker = Arc::new(BrokerState::new(repo));
     let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
-    let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token };
+    let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token, archive_dms: false };
     let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
     let state = Arc::new(AppState { broker, delivery, config, rate_limiter });
 
@@ -671,4 +671,242 @@ async fn ws_boards_tofu_auto_creates_project_on_fresh_db() {
         Some(boards_pubkey_hex.as_str()),
         "Boards key must be stored after TOFU on fresh project"
     );
+}
+
+// ── DM tests ──────────────────────────────────────────────────────────────────
+
+/// Helper: server variant with archive_dms enabled.
+async fn spawn_test_server_with_archive() -> (SocketAddr, Arc<AppState>) {
+    let repo = Arc::new(db::open_memory().expect("in-memory DB"));
+    let broker = Arc::new(BrokerState::new(repo));
+    let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
+    let config = BrokerConfig {
+        admin_key: None,
+        rate_limit_rps: 100,
+        boards_registration_token: Some(TEST_BOARDS_TOKEN.to_string()),
+        archive_dms: true,
+    };
+    let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
+    let state = Arc::new(AppState { broker, delivery, config, rate_limiter });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
+    let addr = listener.local_addr().expect("local_addr");
+    let app = api::http_router(state.clone())
+        .route("/ws", axum::routing::get(api::handle_ws))
+        .with_state(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    (addr, state)
+}
+
+/// Complete HELLO → CHALLENGE → AUTH → 200 OK on an existing WS connection.
+async fn complete_handshake(ws: &mut WsStream, identity: &str, signing_key: &SigningKey) {
+    let nonce_b64 = hello_and_get_challenge(ws, identity, None, None).await;
+    let sig = sign_challenge(signing_key, identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(ws, &auth).await;
+    let ok = recv_frame(ws).await;
+    assert_eq!(ok.status(), Some(200), "handshake must succeed: {:?}", ok.first_line);
+}
+
+/// Register an agent in an already-existing project (project row not created).
+fn setup_agent_in_project(state: &Arc<AppState>, project: &str, agent: &str) -> SigningKey {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    state.broker.repo.register_agent(agent, project, "agent", "").expect("register_agent");
+    state.broker.repo.set_agent_public_key(agent, project, &pubkey_hex).expect("set_agent_public_key");
+    signing_key
+}
+
+/// DM test 1 (i-dm-t5-i): DM delivered to live recipient while Boards is offline.
+/// Sender gets 200 OK and recipient receives DELIVER on their WS connection.
+/// Boards is never involved — proves broker-direct hot path.
+#[tokio::test]
+async fn ws_dm_live_delivery_boards_offline() {
+    let (addr, state) = spawn_test_server().await;
+    let alice_key = setup_agent(&state, "proj-dm1", "key-dm1", "Alice");
+    let bob_key = setup_agent_in_project(&state, "proj-dm1", "Bob");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-dm1", &alice_key).await;
+
+    let mut bob_ws = ws_connect(addr).await;
+    complete_handshake(&mut bob_ws, "Bob@proj-dm1", &bob_key).await;
+
+    // Alice sends DM to Bob — Boards is not connected.
+    let mut dm = HttpFrame::request("POST", "/v1/dms")
+        .add_header("X-From", "Alice@proj-dm1")
+        .add_header("X-To", "Bob@proj-dm1");
+    dm.body = "hello bob".to_string();
+    let dm = dm.finalize();
+    send_frame(&mut alice_ws, &dm).await;
+
+    // Alice must receive 200 OK.
+    let ack = recv_frame(&mut alice_ws).await;
+    assert_eq!(ack.status(), Some(200), "sender must get 200 OK for live DM: {:?}", ack.first_line);
+
+    // Bob must receive DELIVER /v1/dms.
+    let deliver = recv_frame(&mut bob_ws).await;
+    assert_eq!(deliver.verb(), Some("DELIVER"), "recipient must receive DELIVER: {:?}", deliver.first_line);
+    assert_eq!(deliver.path(), Some("/v1/dms"), "DELIVER path must be /v1/dms");
+    assert_eq!(deliver.header("X-From"), Some("Alice@proj-dm1"), "X-From must be canonicalized");
+    assert_eq!(deliver.header("X-To"), Some("Bob@proj-dm1"), "X-To must be the recipient");
+    assert_eq!(deliver.body, "hello bob", "body must be preserved");
+
+    drop(alice_ws);
+    drop(bob_ws);
+}
+
+/// DM test 2 (i-dm-t5-ii): DM to offline recipient → 202 Accepted + drains on reconnect.
+/// Also verifies no double-delivery: after drain + mark_delivered, second drain is empty.
+#[tokio::test]
+async fn ws_dm_offline_recipient_queued_and_drained() {
+    let (addr, state) = spawn_test_server().await;
+    let alice_key = setup_agent(&state, "proj-dm2", "key-dm2-a", "Alice");
+    setup_agent_in_project(&state, "proj-dm2", "Bob"); // registered but not connected
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-dm2", &alice_key).await;
+
+    // Alice sends DM to offline Bob.
+    let mut dm = HttpFrame::request("POST", "/v1/dms")
+        .add_header("X-From", "Alice@proj-dm2")
+        .add_header("X-To", "Bob@proj-dm2");
+    dm.body = "queued message".to_string();
+    let dm = dm.finalize();
+    send_frame(&mut alice_ws, &dm).await;
+
+    // Alice must receive 202 Accepted.
+    let ack = recv_frame(&mut alice_ws).await;
+    assert_eq!(ack.status(), Some(202), "sender must get 202 for offline recipient: {:?}", ack.first_line);
+
+    // Pending row must exist.
+    let pending = state.broker.repo.peek_pending("Bob", "proj-dm2");
+    assert!(!pending.is_empty(), "pending row must exist after 202");
+
+    // Simulate Bob reconnecting: drain_pending → marks 'sending'.
+    let drained = state.delivery.drain_pending("Bob", "proj-dm2");
+    assert_eq!(drained.len(), 1, "exactly one message must drain");
+    let msg = &drained[0];
+    assert_eq!(msg.from_agent, "Alice", "from_agent must be Alice");
+    assert!(msg.body.contains("queued message"), "body must contain original message");
+
+    // Simulate successful WS write → mark delivered.
+    state.delivery.mark_delivered(&msg.id, "Bob", "proj-dm2");
+
+    // Second drain must return nothing — no double-delivery.
+    let second_drain = state.delivery.drain_pending("Bob", "proj-dm2");
+    assert!(second_drain.is_empty(), "second drain must be empty after mark_delivered");
+
+    drop(alice_ws);
+}
+
+/// DM test 3 (i-dm-t5-iii): DM to unknown recipient → 404 Not Found.
+#[tokio::test]
+async fn ws_dm_unknown_recipient_404() {
+    let (addr, state) = spawn_test_server().await;
+    let alice_key = setup_agent(&state, "proj-dm3", "key-dm3", "Alice");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-dm3", &alice_key).await;
+
+    // DM to an agent that was never registered.
+    let mut dm = HttpFrame::request("POST", "/v1/dms")
+        .add_header("X-From", "Alice@proj-dm3")
+        .add_header("X-To", "Nobody@proj-dm3");
+    dm.body = "hello?".to_string();
+    let dm = dm.finalize();
+    send_frame(&mut alice_ws, &dm).await;
+
+    let resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(resp.status(), Some(404), "unknown recipient must return 404: {:?}", resp.first_line);
+
+    drop(alice_ws);
+}
+
+/// DM test 4 (i-dm-t5-iv): X-From canonicalization — forged X-From is replaced by the
+/// authenticated identity on the DELIVER frame received by the recipient.
+#[tokio::test]
+async fn ws_dm_xfrom_canonicalized() {
+    let (addr, state) = spawn_test_server().await;
+    let alice_key = setup_agent(&state, "proj-dm4", "key-dm4-a", "Alice");
+    let bob_key = setup_agent_in_project(&state, "proj-dm4", "Bob");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-dm4", &alice_key).await;
+
+    let mut bob_ws = ws_connect(addr).await;
+    complete_handshake(&mut bob_ws, "Bob@proj-dm4", &bob_key).await;
+
+    // Alice sends DM with a FORGED X-From.
+    let mut dm = HttpFrame::request("POST", "/v1/dms")
+        .add_header("X-From", "EvilAgent@other-project") // forged
+        .add_header("X-To", "Bob@proj-dm4");
+    dm.body = "impersonation attempt".to_string();
+    let dm = dm.finalize();
+    send_frame(&mut alice_ws, &dm).await;
+
+    let ack = recv_frame(&mut alice_ws).await;
+    assert_eq!(ack.status(), Some(200), "sender must get 200 OK: {:?}", ack.first_line);
+
+    // Bob must see X-From canonicalized to Alice's authenticated identity.
+    let deliver = recv_frame(&mut bob_ws).await;
+    assert_eq!(
+        deliver.header("X-From"),
+        Some("Alice@proj-dm4"),
+        "X-From must be canonicalized to authenticated identity, not forged value: {:?}",
+        deliver
+    );
+
+    drop(alice_ws);
+    drop(bob_ws);
+}
+
+/// DM test 5 (i-dm-t5-v): BROKER_ARCHIVE_DMS=true — Boards offline does NOT block delivery.
+/// Live delivery succeeds with 200 OK and recipient receives DELIVER. Archive failure is silent.
+#[tokio::test]
+async fn ws_dm_archive_dms_boards_offline_does_not_block() {
+    // Server with archive_dms=true; Boards is NOT connected.
+    let (addr, state) = spawn_test_server_with_archive().await;
+    let alice_key = setup_agent(&state, "proj-dm5", "key-dm5-a", "Alice");
+    let bob_key = setup_agent_in_project(&state, "proj-dm5", "Bob");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-dm5", &alice_key).await;
+
+    let mut bob_ws = ws_connect(addr).await;
+    complete_handshake(&mut bob_ws, "Bob@proj-dm5", &bob_key).await;
+
+    // Alice sends DM — Boards@proj-dm5 is not connected (archive_dms=true but Boards offline).
+    let mut dm = HttpFrame::request("POST", "/v1/dms")
+        .add_header("X-From", "Alice@proj-dm5")
+        .add_header("X-To", "Bob@proj-dm5");
+    dm.body = "archive test".to_string();
+    let dm = dm.finalize();
+    send_frame(&mut alice_ws, &dm).await;
+
+    // Alice must get 200 OK — Boards absence must not block.
+    let ack = recv_frame(&mut alice_ws).await;
+    assert_eq!(
+        ack.status(),
+        Some(200),
+        "delivery must succeed (200) even when Boards is offline (archive_dms=true): {:?}",
+        ack.first_line
+    );
+
+    // Bob must still receive DELIVER.
+    let deliver = recv_frame(&mut bob_ws).await;
+    assert_eq!(
+        deliver.verb(),
+        Some("DELIVER"),
+        "recipient must receive DELIVER despite archive failure: {:?}",
+        deliver.first_line
+    );
+    assert_eq!(deliver.body, "archive test", "body must be preserved");
+
+    drop(alice_ws);
+    drop(bob_ws);
 }

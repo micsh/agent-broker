@@ -1,3 +1,4 @@
+broker/src/http_frame.rs	super::*
 broker/src/main.rs	api::AppState
 broker/src/main.rs	broker::BrokerState
 broker/src/main.rs	broker::DeliveryEngine
@@ -69,11 +70,12 @@ broker/src/api/mod.rs	ws::handle_ws
 broker/src/api/mod.rs	admin::admin_router
 broker/src/api/routes.rs	crate::api::auth::AgentAuth
 broker/src/api/routes.rs	crate::broker::state::{AgentState, BrokerState}
-broker/src/api/routes.rs	crate::broker::{DeliveryEngine, dispatch_stanza, DispatchResult, DispatchError}
+broker/src/api/routes.rs	crate::broker::DeliveryEngine
 broker/src/api/routes.rs	crate::db::repository::{PendingMessage, ToolEntry}
-broker/src/api/routes.rs	crate::stanza
+broker/src/api/routes.rs	crate::http_frame
 broker/src/api/routes.rs	axum::extract::{Path, Query, State}
 broker/src/api/routes.rs	axum::http::StatusCode
+broker/src/api/routes.rs	axum::response::IntoResponse
 broker/src/api/routes.rs	axum::routing::{get, post, put, delete, patch}
 broker/src/api/routes.rs	axum::{Json, Router}
 broker/src/api/routes.rs	serde::{Deserialize, Serialize}
@@ -91,47 +93,37 @@ broker/src/api/routes.rs	http_body_util::BodyExt
 broker/src/api/routes.rs	std::sync::Arc
 broker/src/api/routes.rs	tower::ServiceExt
 broker/src/api/routes.rs	crate::api
-broker/src/api/ws.rs	crate::broker::state::BrokerState
-broker/src/api/ws.rs	crate::broker::{DeliveryEngine, dispatch_stanza}
 broker/src/api/ws.rs	crate::api::routes::AppState
-broker/src/api/ws.rs	crate::stanza
+broker/src/api/ws.rs	crate::broker::state::{AgentState, BrokerState}
+broker/src/api/ws.rs	crate::http_frame::{self, FirstLine, HttpFrame}
 broker/src/api/ws.rs	axum::extract::ws::{Message, WebSocket}
 broker/src/api/ws.rs	axum::extract::{State, WebSocketUpgrade}
 broker/src/api/ws.rs	axum::response::IntoResponse
+broker/src/api/ws.rs	base64::Engine
 broker/src/api/ws.rs	futures::stream::StreamExt
 broker/src/api/ws.rs	futures::SinkExt
-broker/src/api/ws.rs	serde::{Deserialize, Serialize}
 broker/src/api/ws.rs	std::sync::Arc
+broker/src/api/ws.rs	uuid::Uuid
 broker/src/api/ws_auth_tests.rs	crate::api
 broker/src/api/ws_auth_tests.rs	crate::api::middleware::ProjectRateLimiter
 broker/src/api/ws_auth_tests.rs	crate::api::routes::{AppState, BrokerConfig}
 broker/src/api/ws_auth_tests.rs	crate::broker::{BrokerState, DeliveryEngine}
 broker/src/api/ws_auth_tests.rs	crate::db
+broker/src/api/ws_auth_tests.rs	crate::http_frame::{self, HttpFrame}
+broker/src/api/ws_auth_tests.rs	base64::Engine
 broker/src/api/ws_auth_tests.rs	ed25519_dalek::Signer
 broker/src/api/ws_auth_tests.rs	ed25519_dalek::SigningKey
 broker/src/api/ws_auth_tests.rs	futures::{SinkExt, StreamExt}
 broker/src/api/ws_auth_tests.rs	rand::rngs::OsRng
-broker/src/api/ws_auth_tests.rs	serde_json::{json, Value}
 broker/src/api/ws_auth_tests.rs	std::net::SocketAddr
 broker/src/api/ws_auth_tests.rs	std::sync::Arc
 broker/src/api/ws_auth_tests.rs	tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg}
 broker/src/broker/delivery.rs	crate::broker::state::BrokerState
 broker/src/broker/delivery.rs	crate::db::repository::PendingMessage
-broker/src/broker/delivery.rs	crate::stanza::{self, ResolvedMention}
 broker/src/broker/delivery.rs	std::sync::Arc
-broker/src/broker/delivery.rs	super::*
-broker/src/broker/delivery.rs	crate::broker::state::BrokerState
-broker/src/broker/delivery.rs	crate::db
-broker/src/broker/dispatch.rs	crate::broker::state::BrokerState
-broker/src/broker/dispatch.rs	crate::broker::DeliveryEngine
-broker/src/broker/dispatch.rs	crate::db::repository::Repository
-broker/src/broker/dispatch.rs	crate::stanza::{self, Destination, ResolvedMention, Stanza}
-broker/src/broker/dispatch.rs	std::sync::Arc
-broker/src/broker/dispatch.rs	super::*
-broker/src/broker/dispatch.rs	crate::db
 broker/src/broker/mod.rs	state::BrokerState
 broker/src/broker/mod.rs	delivery::DeliveryEngine
-broker/src/broker/mod.rs	pub use dispatch::{dispatch_stanza, DispatchResult, DispatchError}
+broker/src/broker/nonce.rs	base64::Engine
 broker/src/broker/nonce.rs	rand_core::{OsRng, RngCore}
 broker/src/broker/nonce.rs	std::collections::HashMap
 broker/src/broker/nonce.rs	std::sync::RwLock
@@ -139,13 +131,15 @@ broker/src/broker/nonce.rs	std::time::{Duration, Instant}
 broker/src/broker/nonce.rs	super::*
 broker/src/broker/state.rs	crate::broker::nonce::NonceStore
 broker/src/broker/state.rs	crate::db::Repository
-broker/src/broker/state.rs	crate::stanza::PresenceStatus
 broker/src/broker/state.rs	std::collections::HashMap
 broker/src/broker/state.rs	std::sync::Arc
 broker/src/broker/state.rs	tokio::sync::{broadcast, RwLock}
+broker/src/broker/state.rs	super::*
+broker/src/broker/state.rs	crate::db
 broker/src/db/mod.rs	repository::Repository
 broker/src/db/mod.rs	rusqlite::Connection
 broker/src/db/mod.rs	std::path::Path
+broker/src/db/repository.rs	chrono::Utc
 broker/src/db/repository.rs	rusqlite::params
 broker/src/db/repository.rs	crate::identity
 broker/src/db/repository.rs	std::sync::Mutex
@@ -159,11 +153,3 @@ broker/src/identity/ed25519.rs	ed25519_dalek::{Signature, VerifyingKey}
 broker/src/identity/mod.rs	pub use secret::{hash_key, verify_key_hash}
 broker/src/identity/mod.rs	pub use ed25519::{build_challenge_payload, verify_agent_signature}
 broker/src/identity/secret.rs	sha2::{Digest, Sha256}
-broker/src/stanza/mod.rs	parser::parse
-broker/src/stanza/mod.rs	pub use types::*
-broker/src/stanza/parser.rs	regex::Regex
-broker/src/stanza/parser.rs	std::sync::LazyLock
-broker/src/stanza/parser.rs	super::types::*
-broker/src/stanza/parser.rs	super::*
-broker/src/stanza/types.rs	serde::{Deserialize, Serialize}
-broker/src/stanza/types.rs	super::*

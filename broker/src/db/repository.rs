@@ -187,7 +187,7 @@ impl Repository {
         let mut stmt = match conn.prepare(
             "SELECT p.name, p.status, p.created_utc,
                     COUNT(DISTINCT a.name) as agent_count,
-                    COUNT(DISTINCT CASE WHEN dl.status='pending' THEN dl.message_id END) as pending_count
+                    COUNT(DISTINCT CASE WHEN dl.status IN ('pending','sending') THEN dl.message_id END) as pending_count
              FROM projects p
              LEFT JOIN agents a ON a.project = p.name
              LEFT JOIN delivery_log dl ON dl.project = p.name
@@ -224,7 +224,7 @@ impl Repository {
             .and_then(|mut s| s.query_row(params![project], |r| r.get(0)).ok())
             .unwrap_or(0);
         let pending_count: i64 = conn
-            .prepare("SELECT COUNT(*) FROM delivery_log WHERE project = ?1 AND status = 'pending'")
+            .prepare("SELECT COUNT(*) FROM delivery_log WHERE project = ?1 AND status IN ('pending','sending')")
             .ok()
             .and_then(|mut s| s.query_row(params![project], |r| r.get(0)).ok())
             .unwrap_or(0);
@@ -245,7 +245,7 @@ impl Repository {
             .and_then(|mut s| s.query_row([], |r| r.get(0)).ok())
             .unwrap_or(0);
         let pending_count: i64 = conn
-            .prepare("SELECT COUNT(*) FROM delivery_log WHERE status = 'pending'")
+            .prepare("SELECT COUNT(*) FROM delivery_log WHERE status IN ('pending','sending')")
             .ok()
             .and_then(|mut s| s.query_row([], |r| r.get(0)).ok())
             .unwrap_or(0);
@@ -574,6 +574,87 @@ impl Repository {
 
     // --- Messages ---
 
+    /// Insert a DM frame into the messages table.
+    /// Enforces a cap of 1 000 pending/sending frames per recipient identity — returns
+    /// `Err` if the cap would be exceeded. The cap check and insert run in a single
+    /// transaction to prevent TOCTOU under concurrent senders.
+    pub fn insert_message(
+        &self,
+        id: &str,
+        from_agent: &str,
+        from_project: &str,
+        to_agent: &str,
+        to_project: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| format!("insert_message tx: {e}"))?;
+
+        let queued: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_log
+                 WHERE agent_name = ?1 AND project = ?2
+                   AND status IN ('pending', 'sending')",
+                params![to_agent, to_project],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if queued >= 1000 {
+            return Err(format!(
+                "pending queue cap (1000) exceeded for {to_agent}@{to_project}"
+            ));
+        }
+
+        tx.execute(
+            "INSERT INTO messages (id, from_agent, from_project, to_agent, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, from_agent, from_project, to_agent, body],
+        )
+        .map_err(|e| format!("insert_message: {e}"))?;
+
+        tx.commit().map_err(|e| format!("insert_message commit: {e}"))?;
+        Ok(())
+    }
+
+    /// Record a pending delivery for `agent_name@project`. Must be called after
+    /// `insert_message` with the same `message_id`.
+    pub fn record_pending(
+        &self,
+        message_id: &str,
+        agent_name: &str,
+        project: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_log
+             (message_id, agent_name, project, status)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![message_id, agent_name, project],
+        )
+        .map_err(|e| format!("record_pending: {e}"))?;
+        Ok(())
+    }
+
+    /// Mark a single delivery_log row as 'delivered' after the DELIVER frame was
+    /// successfully written to the WS connection. Part of the idempotent drain flow:
+    /// drain_pending marks rows 'sending'; each successful WS write then calls mark_delivered.
+    pub fn mark_delivered(&self, message_id: &str, agent_name: &str, project: &str) {
+        let conn = self.conn();
+        let _ = conn.execute(
+            "UPDATE delivery_log
+             SET status = 'delivered', delivered_utc = datetime('now')
+             WHERE message_id = ?1 AND agent_name = ?2 AND project = ?3",
+            params![message_id, agent_name, project],
+        );
+    }
+
+    /// Drain messages queued for `name@project`.
+    ///
+    /// Returns messages with `status IN ('pending', 'sending')` created within the last
+    /// 7 days. Marks them `'sending'` (not `'delivered'`) atomically within one
+    /// transaction. The caller must call `mark_delivered` for each message after the
+    /// DELIVER frame is successfully written — this prevents silent loss on WS drops.
+    /// On reconnect, any rows still in `'sending'` are recovered along with `'pending'`.
     pub fn drain_pending(&self, name: &str, project: &str) -> Vec<PendingMessage> {
         let mut conn = self.conn();
         let tx = match conn.transaction() {
@@ -586,7 +667,9 @@ impl Repository {
                 "SELECT m.id, m.from_agent, m.from_project, m.body, m.metadata, m.created_utc
                  FROM delivery_log dl
                  JOIN messages m ON dl.message_id = m.id
-                 WHERE dl.agent_name = ?1 AND dl.project = ?2 AND dl.status = 'pending'
+                 WHERE dl.agent_name = ?1 AND dl.project = ?2
+                   AND dl.status IN ('pending', 'sending')
+                   AND m.created_utc >= datetime('now', '-7 days')
                  ORDER BY m.created_utc ASC",
             ) {
                 Ok(s) => s,
@@ -608,9 +691,15 @@ impl Repository {
         };
 
         if !messages.is_empty() {
+            // Mark 'sending' — each successful WS write will transition to 'delivered'.
             let _ = tx.execute(
-                "UPDATE delivery_log SET status = 'delivered', delivered_utc = datetime('now')
-                 WHERE agent_name = ?1 AND project = ?2 AND status = 'pending'",
+                "UPDATE delivery_log SET status = 'sending'
+                 WHERE agent_name = ?1 AND project = ?2
+                   AND status IN ('pending', 'sending')
+                   AND message_id IN (
+                     SELECT id FROM messages
+                     WHERE created_utc >= datetime('now', '-7 days')
+                   )",
                 params![name, project],
             );
         }
@@ -626,7 +715,8 @@ impl Repository {
             "SELECT m.from_agent, m.from_project, m.created_utc
              FROM delivery_log dl
              JOIN messages m ON dl.message_id = m.id
-             WHERE dl.agent_name = ?1 AND dl.project = ?2 AND dl.status = 'pending'
+             WHERE dl.agent_name = ?1 AND dl.project = ?2
+               AND dl.status IN ('pending', 'sending')
              ORDER BY m.created_utc ASC",
         ) {
             Ok(s) => s,
@@ -663,10 +753,12 @@ impl Repository {
             [],
         ).unwrap_or(0);
 
-        // Step 3: Drop expired pending delivery_log entries.
+        // Step 3: Drop expired pending/sending delivery_log entries (TTL enforcement).
+        // 'sending' rows that survived reconnect will be re-drained — they're treated
+        // as pending and age out under the same TTL rule.
         let _ = conn.execute(
             "DELETE FROM delivery_log
-             WHERE status = 'pending'
+             WHERE status IN ('pending', 'sending')
              AND message_id IN (
                  SELECT id FROM messages
                  WHERE created_utc < datetime('now', ?1)

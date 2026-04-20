@@ -20,6 +20,9 @@ pub struct BrokerConfig {
     /// Shared secret required in X-Registration-Token on the first Boards HELLO (TOFU).
     /// None means TOFU is disabled — Boards must be pre-registered out-of-band.
     pub boards_registration_token: Option<String>,
+    /// When true, DMs are archived to Boards@recipient_project after broker-direct delivery.
+    /// Best-effort only — Boards offline never blocks delivery. Default: false.
+    pub archive_dms: bool,
 }
 
 /// Shared application state passed to all route handlers.
@@ -536,7 +539,7 @@ mod tests {
         let repo = Arc::new(db::open_memory().expect("in-memory DB"));
         let broker = Arc::new(BrokerState::new(repo));
         let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
-        let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token: None };
+        let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token: None, archive_dms: false };
         let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
         Arc::new(AppState { broker, delivery, config, rate_limiter })
     }

@@ -364,9 +364,13 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Send each pending message body as a raw text frame.
+    // Send each pending DELIVER frame and mark it delivered after each successful write.
+    // drain_pending marks rows 'sending' — we transition them to 'delivered' here so a
+    // WS drop mid-drain causes 'sending' rows to be re-drained on reconnect (no silent loss).
     for msg in pending {
-        if sender.send(Message::Text(msg.body.into())).await.is_err() {
+        if sender.send(Message::Text(msg.body.clone().into())).await.is_ok() {
+            state.delivery.mark_delivered(&msg.id, &name, &project);
+        } else {
             state.broker.disconnect(&name, &project).await;
             return;
         }
@@ -398,7 +402,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    let broker = state.broker.clone();
+    let state_for_recv = state.clone();
     let rate_limiter = state.rate_limiter.clone();
     let agent_name = name.clone();
     let agent_project = project.clone();
@@ -416,7 +420,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
                     }
                     match http_frame::parse(&text) {
                         Ok(frame) => {
-                            handle_inbound(frame, &agent_name, &agent_project, &broker, &resp_tx).await;
+                            handle_inbound(frame, &agent_name, &agent_project, &state_for_recv, &resp_tx).await;
                         }
                         Err(e) => {
                             tracing::warn!("HttpFrame parse error from {}@{}: {}", agent_name, agent_project, e);
@@ -444,13 +448,14 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 // ── Inbound frame dispatch ────────────────────────────────────────────────────
 
 /// Dispatch a verified inbound frame from an authenticated connection.
-/// Handles: POST /v1/posts|reactions|dms (→ Boards), PUBLISH /v1/deliveries (Boards→agents),
-/// PUT /v1/presence. Sends a response frame via resp_tx on completion.
+/// Handles: POST /v1/posts|reactions (→ Boards), POST /v1/dms (broker-direct),
+/// PUBLISH /v1/deliveries (Boards→agents), PUT /v1/presence.
+/// Sends a response frame via resp_tx on completion.
 async fn handle_inbound(
     mut frame: HttpFrame,
     name: &str,
     project: &str,
-    broker: &Arc<BrokerState>,
+    state: &Arc<AppState>,
     resp_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
     let verb = frame.verb().unwrap_or("").to_string();
@@ -475,9 +480,13 @@ async fn handle_inbound(
             // Canonicalize X-From to the authenticated session identity (spec §5).
             // Prevents agents from forging a different sender identity to Boards.
             frame.set_header("X-From", &format!("{}@{}", name, project));
-            forward_to_boards(frame, &channel_project, broker, resp_tx).await;
+            forward_to_boards(frame, &channel_project, &state.broker, resp_tx).await;
         }
         ("POST", "/v1/dms") => {
+            // Broker-direct DM delivery — no Boards dependency on the hot path (spec §5).
+            // Live recipient → DELIVER + 200 OK.
+            // Offline recipient → store pending + 202 Accepted (drain on reconnect).
+            // Unknown recipient → 404.
             let xto = match frame.header("X-To").map(|s| s.to_string()) {
                 Some(v) => v,
                 None => {
@@ -485,17 +494,81 @@ async fn handle_inbound(
                     return;
                 }
             };
-            let recipient_project = match http_frame::parse_identity(&xto) {
-                Ok((_, p)) => p.to_string(),
+            let (recv_name, recv_project) = match http_frame::parse_identity(&xto) {
+                Ok((n, p)) => (n.to_string(), p.to_string()),
                 Err(_) => {
                     let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
                     return;
                 }
             };
+
             // Canonicalize X-From to the authenticated session identity (spec §5).
-            // Prevents agents from forging a different sender identity to Boards.
-            frame.set_header("X-From", &format!("{}@{}", name, project));
-            forward_to_boards(frame, &recipient_project, broker, resp_tx).await;
+            let sender_identity = format!("{}@{}", name, project);
+            frame.set_header("X-From", &sender_identity);
+
+            // Unknown recipient → 404.
+            if !state.broker.repo.agent_exists(&recv_name, &recv_project) {
+                let _ = resp_tx.try_send(error_response(404, "Not Found").serialize());
+                return;
+            }
+
+            // Build DELIVER frame: same body, verb changed to DELIVER /v1/dms.
+            let mut deliver = HttpFrame::request("DELIVER", "/v1/dms")
+                .add_header("X-From", &sender_identity)
+                .add_header("X-To", &xto);
+            deliver.body = frame.body.clone();
+            let deliver = deliver.finalize();
+
+            // Attempt live delivery.
+            let delivered = state.broker.send_to_agent(&recv_name, &recv_project, &deliver.serialize()).await;
+            if delivered {
+                let _ = resp_tx.try_send(HttpFrame::response(200, "OK").finalize().serialize());
+
+                // Best-effort archive fan-out — Boards offline must NOT block delivery.
+                if state.config.archive_dms {
+                    let archive_broker = state.broker.clone();
+                    let mut archive = HttpFrame::request("POST", "/v1/dms")
+                        .add_header("X-Original-From", &sender_identity)
+                        .add_header("X-Original-To", &xto);
+                    archive.body = frame.body.clone();
+                    let archive = archive.finalize();
+                    let recv_project_clone = recv_project.clone();
+                    tokio::spawn(async move {
+                        let sent = archive_broker
+                            .send_to_agent("Boards", &recv_project_clone, &archive.serialize())
+                            .await;
+                        if !sent {
+                            tracing::debug!(
+                                "DM archive: Boards@{} not connected — drop",
+                                recv_project_clone
+                            );
+                        }
+                    });
+                }
+            } else {
+                // Recipient offline — store for drain on reconnect.
+                match state.delivery.store_pending(
+                    &recv_name,
+                    &recv_project,
+                    name,
+                    project,
+                    &deliver.serialize(),
+                ) {
+                    Ok(()) => {
+                        let _ = resp_tx
+                            .try_send(HttpFrame::response(202, "Accepted").finalize().serialize());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "DM store_pending failed for {}@{}: {}",
+                            recv_name,
+                            recv_project,
+                            e
+                        );
+                        let _ = resp_tx.try_send(error_response(503, "Service Unavailable").serialize());
+                    }
+                }
+            }
         }
         ("PUBLISH", "/v1/deliveries") => {
             // Boards-only verb — reject from regular agents.
@@ -518,7 +591,7 @@ async fn handle_inbound(
                 return;
             }
             // MUST NOT block the recv loop — spawn fan-out.
-            let broker_clone = broker.clone();
+            let broker_clone = state.broker.clone();
             tokio::spawn(async move {
                 fan_out_publish(frame, xto, &broker_clone).await;
             });
@@ -540,7 +613,7 @@ async fn handle_inbound(
                     return;
                 }
             };
-            broker.set_state(name, project, agent_state).await;
+            state.broker.set_state(name, project, agent_state).await;
             let _ = resp_tx.try_send(HttpFrame::response(200, "OK").finalize().serialize());
         }
         _ => {
