@@ -10,6 +10,7 @@ use base64::Engine;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub async fn handle_ws(
     ws: WebSocketUpgrade,
@@ -182,7 +183,23 @@ async fn wait_for_handshake(
                     }
                 };
                 let pubkey_hex = hex::encode(&pubkey_bytes);
-                // register_agent is a no-op if row exists; returns FK error if project doesn't exist.
+                // Auto-create project if it doesn't exist — Boards connects via WS only,
+                // there is no separate provisioning step. Use a random sentinel key; Boards
+                // never uses project-key auth so no one needs to know it.
+                if !state.broker.repo.project_exists(&project) {
+                    let sentinel = Uuid::new_v4().to_string();
+                    if let Err(e) = state.broker.repo.register_project(&project, &sentinel) {
+                        tracing::warn!(
+                            "Boards TOFU auto-create project '{}' failed: {}",
+                            project,
+                            e
+                        );
+                        let _ = send_frame(sender, &error_response(500, "Internal Server Error")).await;
+                        return None;
+                    }
+                    tracing::info!("Boards@{}: TOFU — auto-created project row", project);
+                }
+                // register_agent is a no-op if row exists (project now guaranteed to exist).
                 if let Err(e) = state.broker.repo.register_agent("Boards", &project, "service", "") {
                     tracing::warn!("Boards TOFU register_agent failed for project '{}': {}", project, e);
                     let _ = send_frame(sender, &error_response(403, "Forbidden")).await;

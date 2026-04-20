@@ -613,3 +613,62 @@ async fn ws_boards_tofu_wrong_token_rejected() {
         "no key must be written when token value is wrong"
     );
 }
+
+/// Scenario 13: Boards TOFU auto-creates project on fresh DB.
+/// When Boards presents a valid TOFU HELLO for a project that has no row in the broker DB,
+/// the broker must auto-create the project (with a sentinel key), then proceed with the
+/// standard TOFU registration. The full four-frame handshake must succeed.
+#[tokio::test]
+async fn ws_boards_tofu_auto_creates_project_on_fresh_db() {
+    // Server started with token — but NO project pre-registered.
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let project = "proj-autoprovision";
+
+    // Confirm project does not exist before the test.
+    assert!(
+        !state.broker.repo.project_exists(project),
+        "project must not exist before TOFU HELLO"
+    );
+
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_pubkey_hex = hex::encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = format!("Boards@{}", project);
+
+    let mut ws = ws_connect(addr).await;
+    let nonce_b64 = hello_and_get_challenge(
+        &mut ws,
+        &boards_identity,
+        Some(&boards_pubkey_b64),
+        Some(TEST_BOARDS_TOKEN),
+    )
+    .await;
+
+    let sig = sign_challenge(&boards_key, &boards_identity, &nonce_b64);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut ws, &auth).await;
+
+    let resp = recv_frame(&mut ws).await;
+    assert_eq!(
+        resp.status(),
+        Some(200),
+        "TOFU on fresh project must succeed: {:?}",
+        resp.first_line
+    );
+
+    // Project row must exist now.
+    assert!(
+        state.broker.repo.project_exists(project),
+        "project row must be auto-created after TOFU HELLO"
+    );
+
+    // Boards key must be stored.
+    assert_eq!(
+        state.broker.repo.get_agent_public_key("Boards", project).as_deref(),
+        Some(boards_pubkey_hex.as_str()),
+        "Boards key must be stored after TOFU on fresh project"
+    );
+}
