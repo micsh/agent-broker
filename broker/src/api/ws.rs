@@ -34,7 +34,14 @@ async fn send_frame(
 async fn recv_frame(
     receiver: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Option<HttpFrame> {
-    while let Some(Ok(msg)) = receiver.next().await {
+    while let Some(next) = receiver.next().await {
+        let msg = match next {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("recv_frame: WS error: {e}");
+                return None;
+            }
+        };
         match msg {
             Message::Text(t) => match http_frame::parse(&t) {
                 Ok(f) => return Some(f),
