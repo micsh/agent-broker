@@ -1,3 +1,4 @@
+use chrono::Utc;
 use rusqlite::params;
 use crate::identity;
 use std::sync::Mutex;
@@ -461,7 +462,16 @@ impl Repository {
                last_updated          = datetime('now')",
             params![name, description, maintainer, contact, agent_name, agent_project],
         ).map_err(|e| format!("Failed to register tool: {e}"))?;
-        self.get_tool(name).ok_or_else(|| "Tool not found after upsert".to_string())
+        // Construct the return value from input data — avoids a second DB query and eliminates
+        // the TOCTOU window where a concurrent DELETE could make the readback return None.
+        Ok(ToolEntry {
+            name: name.to_string(),
+            description: description.to_string(),
+            maintainer: maintainer.to_string(),
+            contact: contact.to_string(),
+            registered_by: format!("{agent_name}.{agent_project}"),
+            last_updated: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        })
     }
 
     /// Get a single tool entry by exact name. Returns None if not registered.
