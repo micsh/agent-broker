@@ -324,17 +324,16 @@ pub fn parse_channel(s: &str) -> Result<(&str, &str), ()> {
 /// - `valid`: owned strings that passed validation
 /// - `invalid`: `(part, reason)` pairs for parts that failed
 ///
-/// Empty parts (from trailing commas or double commas) are treated as invalid.
-/// The caller should 400 if `valid` is empty, or 200 with `X-Dropped` if some
-/// parts were dropped.
+/// Empty parts (from trailing commas or double commas) are silently skipped —
+/// they are formatting artifacts, not intended recipients, and do not appear
+/// in `X-Dropped`. The caller should 400 if `valid` is empty.
 pub fn partition_publish_recipients(xto: &str) -> (Vec<String>, Vec<(String, String)>) {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for part in xto.split(',') {
         let part = part.trim();
         if part.is_empty() {
-            invalid.push((part.to_string(), "empty recipient segment".to_string()));
-            continue;
+            continue; // formatting artifact — not an identity, skip silently
         }
         match parse_identity(part) {
             Ok(_) => valid.push(part.to_string()),
@@ -631,5 +630,47 @@ mod tests {
         // Unknown verb/path combos are not rejected by this validator.
         assert!(validate_xto_shape("DELIVER", "/v1/deliveries", "anything").is_ok());
         assert!(validate_xto_shape("HELLO", "/v1/sessions", "").is_ok());
+    }
+
+    // ── partition_publish_recipients tests ────────────────────────────────────
+
+    #[test]
+    fn partition_all_valid() {
+        let (valid, invalid) = partition_publish_recipients("alice@A,bob@B");
+        assert_eq!(valid, vec!["alice@A", "bob@B"]);
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn partition_mixed_valid_and_invalid() {
+        let (valid, invalid) = partition_publish_recipients("alice@A,BadIdentity,bob@B");
+        assert_eq!(valid, vec!["alice@A", "bob@B"]);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].0, "BadIdentity");
+    }
+
+    #[test]
+    fn partition_all_invalid() {
+        let (valid, invalid) = partition_publish_recipients("BadOne,BadTwo");
+        assert!(valid.is_empty());
+        assert_eq!(invalid.len(), 2);
+    }
+
+    #[test]
+    fn partition_empty_segments_skipped_not_invalid() {
+        // Trailing comma: empty segment is silently skipped, not added to invalid.
+        let (valid, invalid) = partition_publish_recipients("alice@proj,");
+        assert_eq!(valid, vec!["alice@proj"]);
+        assert!(invalid.is_empty(), "trailing comma must not produce X-Dropped entry");
+
+        // Double comma: same behaviour.
+        let (valid2, invalid2) = partition_publish_recipients("alice@proj,,bob@proj");
+        assert_eq!(valid2, vec!["alice@proj", "bob@proj"]);
+        assert!(invalid2.is_empty(), "double comma must not produce X-Dropped entry");
+
+        // Only commas → valid is empty → caller returns 400 (all-invalid path).
+        let (valid3, invalid3) = partition_publish_recipients(",,");
+        assert!(valid3.is_empty());
+        assert!(invalid3.is_empty(), "comma-only input must yield empty invalid (no false X-Dropped)");
     }
 }

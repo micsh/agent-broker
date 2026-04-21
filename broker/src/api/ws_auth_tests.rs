@@ -1052,3 +1052,39 @@ async fn ws_publish_single_invalid_recipient_returns_400() {
 
     drop(boards_ws);
 }
+
+/// PUBLISH test 5 (i-pd-t4-v): Trailing/double commas in X-To are silently skipped.
+/// Empty segments are formatting artifacts — not identities — and must not appear in X-Dropped.
+#[tokio::test]
+async fn ws_publish_trailing_and_double_commas_skipped_not_dropped() {
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let alice_key = setup_agent(&state, "proj-pub5", "key-pub5", "Alice");
+    let bob_key = setup_agent_in_project(&state, "proj-pub5", "Bob");
+
+    let mut boards_ws = connect_boards_tofu(addr, "proj-pub5").await;
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-pub5", &alice_key).await;
+    let mut bob_ws = ws_connect(addr).await;
+    complete_handshake(&mut bob_ws, "Bob@proj-pub5", &bob_key).await;
+
+    // X-To has trailing comma and double comma — both produce empty segments.
+    let mut publish = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        .add_header("X-From", "Boards@proj-pub5")
+        .add_header("X-To", "Alice@proj-pub5,,Bob@proj-pub5,");
+    publish.body = "comma noise".to_string();
+    let publish = publish.finalize();
+    send_frame(&mut boards_ws, &publish).await;
+
+    // 200 OK with no X-Dropped — empty segments are not identities.
+    let ack = recv_frame(&mut boards_ws).await;
+    assert_eq!(ack.status(), Some(200), "PUBLISH with comma noise must return 200: {:?}", ack.first_line);
+    assert!(ack.header("X-Dropped").is_none(), "empty segments must not appear in X-Dropped");
+
+    // Both valid recipients must still receive DELIVER.
+    let alice_deliver = recv_frame(&mut alice_ws).await;
+    assert_eq!(alice_deliver.verb(), Some("DELIVER"), "Alice must receive DELIVER: {:?}", alice_deliver.first_line);
+    let bob_deliver = recv_frame(&mut bob_ws).await;
+    assert_eq!(bob_deliver.verb(), Some("DELIVER"), "Bob must receive DELIVER: {:?}", bob_deliver.first_line);
+
+    drop(boards_ws); drop(alice_ws); drop(bob_ws);
+}
