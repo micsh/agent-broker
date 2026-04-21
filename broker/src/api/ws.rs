@@ -588,16 +588,32 @@ async fn handle_inbound(
                     return;
                 }
             };
-            // Validate all recipients in X-To are valid name@project identities (spec §9).
-            if let Err(e) = http_frame::validate_xto_shape("PUBLISH", "/v1/deliveries", &xto) {
-                tracing::warn!("PUBLISH X-To invalid from {}@{}: {}", name, project, e);
+            // Partial delivery: filter invalid recipients, fan out to valid ones.
+            // All-invalid → 400. Some-invalid → 200 with X-Dropped header.
+            let (valid, dropped) = http_frame::partition_publish_recipients(&xto);
+            if valid.is_empty() {
+                tracing::warn!("PUBLISH from {}@{}: all recipients invalid — dropping", name, project);
                 let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
                 return;
             }
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    "PUBLISH from {}@{}: dropped {} invalid recipients: {:?}",
+                    name, project, dropped.len(), dropped
+                );
+            }
+            // Build 200 response with optional X-Dropped header.
+            let mut ok_frame = HttpFrame::response(200, "OK");
+            if !dropped.is_empty() {
+                let dropped_list = dropped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(",");
+                ok_frame.set_header("X-Dropped", &dropped_list);
+            }
+            let ok_frame = ok_frame.finalize();
+            let _ = resp_tx.try_send(ok_frame.serialize());
             // MUST NOT block the recv loop — spawn fan-out.
             let broker_clone = state.broker.clone();
             tokio::spawn(async move {
-                fan_out_publish(frame, xto, &broker_clone).await;
+                fan_out_publish(frame, valid, &broker_clone).await;
             });
         }
         ("PUT", "/v1/presence") => {
@@ -647,19 +663,17 @@ async fn forward_to_boards(
     let _ = resp_tx.try_send(response.serialize());
 }
 
-/// Fan out a PUBLISH frame to each recipient in the comma-separated X-To list.
+/// Fan out a PUBLISH frame to a pre-validated list of recipients.
 /// Sends a DELIVER frame (same headers, verb changed) to each connected recipient.
 /// Live-only: drops delivery if recipient is not connected (no pending queue for DELIVER).
-async fn fan_out_publish(frame: HttpFrame, xto: String, broker: &Arc<BrokerState>) {
-    for recipient in xto.split(',') {
-        let recipient = recipient.trim();
-        if recipient.is_empty() {
-            continue;
-        }
+/// Recipients are already validated — no re-parsing needed.
+async fn fan_out_publish(frame: HttpFrame, recipients: Vec<String>, broker: &Arc<BrokerState>) {
+    for recipient in &recipients {
         let (recv_name, recv_project) = match http_frame::parse_identity(recipient) {
             Ok(r) => r,
             Err(_) => {
-                tracing::warn!("PUBLISH fan-out: invalid recipient '{}'", recipient);
+                // Should not happen — caller pre-validates — but be defensive.
+                tracing::warn!("PUBLISH fan-out: invalid recipient '{}' (should have been filtered)", recipient);
                 continue;
             }
         };

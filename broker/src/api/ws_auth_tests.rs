@@ -910,3 +910,145 @@ async fn ws_dm_archive_dms_boards_offline_does_not_block() {
     drop(alice_ws);
     drop(bob_ws);
 }
+
+// ── PUBLISH partial delivery tests ────────────────────────────────────────────
+
+/// Connect Boards via TOFU handshake. Returns the connected WS stream.
+async fn connect_boards_tofu(addr: SocketAddr, project: &str) -> WsStream {
+    let boards_key = SigningKey::generate(&mut OsRng);
+    let boards_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(boards_key.verifying_key().to_bytes());
+    let boards_identity = format!("Boards@{}", project);
+
+    let mut boards_ws = ws_connect(addr).await;
+    let hello = HttpFrame::request("HELLO", "/v1/sessions")
+        .add_header("X-From", &boards_identity)
+        .add_header("X-Pubkey", &boards_pubkey_b64)
+        .add_header("X-Registration-Token", TEST_BOARDS_TOKEN)
+        .finalize();
+    send_frame(&mut boards_ws, &hello).await;
+
+    let challenge = recv_frame(&mut boards_ws).await;
+    assert_eq!(challenge.verb(), Some("CHALLENGE"), "Boards CHALLENGE expected: {:?}", challenge.first_line);
+    let nonce = challenge.header("X-Nonce").expect("X-Nonce missing").to_string();
+    let sig = sign_challenge(&boards_key, &boards_identity, &nonce);
+    let auth = HttpFrame::request("AUTH", "/v1/sessions")
+        .add_header("X-Sig", &sig)
+        .finalize();
+    send_frame(&mut boards_ws, &auth).await;
+
+    let ok = recv_frame(&mut boards_ws).await;
+    assert_eq!(ok.status(), Some(200), "Boards must authenticate: {:?}", ok.first_line);
+    boards_ws
+}
+
+/// PUBLISH test 1 (i-pd-t4-i): All-valid X-To → 200 OK, all recipients receive DELIVER.
+#[tokio::test]
+async fn ws_publish_all_valid_recipients_all_receive_deliver() {
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let alice_key = setup_agent(&state, "proj-pub1", "key-pub1-a", "Alice");
+    let bob_key = setup_agent_in_project(&state, "proj-pub1", "Bob");
+
+    let mut boards_ws = connect_boards_tofu(addr, "proj-pub1").await;
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-pub1", &alice_key).await;
+    let mut bob_ws = ws_connect(addr).await;
+    complete_handshake(&mut bob_ws, "Bob@proj-pub1", &bob_key).await;
+
+    // Boards sends PUBLISH to Alice and Bob.
+    let mut publish = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        .add_header("X-From", "Boards@proj-pub1")
+        .add_header("X-To", "Alice@proj-pub1,Bob@proj-pub1");
+    publish.body = "hello both".to_string();
+    let publish = publish.finalize();
+    send_frame(&mut boards_ws, &publish).await;
+
+    // Boards must receive 200 OK with no X-Dropped.
+    let ack = recv_frame(&mut boards_ws).await;
+    assert_eq!(ack.status(), Some(200), "all-valid PUBLISH must return 200: {:?}", ack.first_line);
+    assert!(ack.header("X-Dropped").is_none(), "no X-Dropped expected when all valid");
+
+    // Both Alice and Bob must receive DELIVER.
+    let alice_deliver = recv_frame(&mut alice_ws).await;
+    assert_eq!(alice_deliver.verb(), Some("DELIVER"), "Alice must receive DELIVER: {:?}", alice_deliver.first_line);
+    let bob_deliver = recv_frame(&mut bob_ws).await;
+    assert_eq!(bob_deliver.verb(), Some("DELIVER"), "Bob must receive DELIVER: {:?}", bob_deliver.first_line);
+
+    drop(boards_ws); drop(alice_ws); drop(bob_ws);
+}
+
+/// PUBLISH test 2 (i-pd-t4-ii): Mixed valid+invalid X-To → 200 OK, valid receives DELIVER,
+/// X-Dropped header lists invalid entry, invalid recipient receives nothing.
+#[tokio::test]
+async fn ws_publish_mixed_recipients_valid_receive_deliver_invalid_dropped() {
+    let (addr, state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let alice_key = setup_agent(&state, "proj-pub2", "key-pub2", "Alice");
+
+    let mut boards_ws = connect_boards_tofu(addr, "proj-pub2").await;
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-pub2", &alice_key).await;
+
+    // PUBLISH to Alice (valid) and "BadIdentity" (no @, invalid).
+    let mut publish = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        .add_header("X-From", "Boards@proj-pub2")
+        .add_header("X-To", "Alice@proj-pub2,BadIdentity");
+    publish.body = "partial test".to_string();
+    let publish = publish.finalize();
+    send_frame(&mut boards_ws, &publish).await;
+
+    // Boards must receive 200 OK.
+    let ack = recv_frame(&mut boards_ws).await;
+    assert_eq!(ack.status(), Some(200), "mixed PUBLISH must return 200: {:?}", ack.first_line);
+
+    // X-Dropped must list the invalid recipient.
+    let dropped = ack.header("X-Dropped").expect("X-Dropped must be present for mixed PUBLISH");
+    assert!(dropped.contains("BadIdentity"), "X-Dropped must contain 'BadIdentity', got: {}", dropped);
+
+    // Alice (valid) must receive DELIVER.
+    let deliver = recv_frame(&mut alice_ws).await;
+    assert_eq!(deliver.verb(), Some("DELIVER"), "valid recipient must receive DELIVER: {:?}", deliver.first_line);
+    assert_eq!(deliver.body, "partial test", "body must be preserved");
+
+    drop(boards_ws); drop(alice_ws);
+}
+
+/// PUBLISH test 3 (i-pd-t4-iii): All-invalid X-To → 400 Bad Request.
+#[tokio::test]
+async fn ws_publish_all_invalid_recipients_returns_400() {
+    let (addr, _state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let mut boards_ws = connect_boards_tofu(addr, "proj-pub3").await;
+
+    // PUBLISH where all X-To entries are invalid format (no @ separator).
+    let mut publish = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        .add_header("X-From", "Boards@proj-pub3")
+        .add_header("X-To", "BadOne,BadTwo");
+    publish.body = "should fail".to_string();
+    let publish = publish.finalize();
+    send_frame(&mut boards_ws, &publish).await;
+
+    let resp = recv_frame(&mut boards_ws).await;
+    assert_eq!(resp.status(), Some(400), "all-invalid PUBLISH must return 400: {:?}", resp.first_line);
+
+    drop(boards_ws);
+}
+
+/// PUBLISH test 4 (i-pd-t4-iv): Single bare "User" (no @project) → 400.
+/// Confirms single-recipient edge case collapses to all-invalid path, not partial delivery.
+#[tokio::test]
+async fn ws_publish_single_invalid_recipient_returns_400() {
+    let (addr, _state) = spawn_test_server_with_boards_token(TEST_BOARDS_TOKEN).await;
+    let mut boards_ws = connect_boards_tofu(addr, "proj-pub4").await;
+
+    // Single recipient missing @project — not a valid name@project identity.
+    let mut publish = HttpFrame::request("PUBLISH", "/v1/deliveries")
+        .add_header("X-From", "Boards@proj-pub4")
+        .add_header("X-To", "User");
+    publish.body = "single bad".to_string();
+    let publish = publish.finalize();
+    send_frame(&mut boards_ws, &publish).await;
+
+    let resp = recv_frame(&mut boards_ws).await;
+    assert_eq!(resp.status(), Some(400), "single invalid recipient must return 400: {:?}", resp.first_line);
+
+    drop(boards_ws);
+}

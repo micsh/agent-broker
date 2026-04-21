@@ -317,6 +317,33 @@ pub fn parse_channel(s: &str) -> Result<(&str, &str), ()> {
     Ok((channel, project))
 }
 
+/// Partition a PUBLISH X-To value into valid and invalid recipients.
+///
+/// X-To is a comma-separated list of `name@project` identities. Each part is
+/// trimmed and validated with `parse_identity`. Returns:
+/// - `valid`: owned strings that passed validation
+/// - `invalid`: `(part, reason)` pairs for parts that failed
+///
+/// Empty parts (from trailing commas or double commas) are treated as invalid.
+/// The caller should 400 if `valid` is empty, or 200 with `X-Dropped` if some
+/// parts were dropped.
+pub fn partition_publish_recipients(xto: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for part in xto.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            invalid.push((part.to_string(), "empty recipient segment".to_string()));
+            continue;
+        }
+        match parse_identity(part) {
+            Ok(_) => valid.push(part.to_string()),
+            Err(_) => invalid.push((part.to_string(), format!("'{}' is not a valid name@project", part))),
+        }
+    }
+    (valid, invalid)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
