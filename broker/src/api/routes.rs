@@ -310,7 +310,7 @@ async fn rekey_agent(
     // Set key
     state.broker.repo.set_agent_public_key(&agent_name, &req.project, &req.public_key)
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
-    tracing::info!("Public key rekeyed for {}.{}", agent_name, req.project);
+    tracing::info!("Public key rekeyed for {}@{}", agent_name, req.project);
     Ok(Json(RekeyResponse { enrolled: true }))
 }
 
@@ -357,7 +357,7 @@ async fn register_agent(
             .ok_or((StatusCode::BAD_REQUEST, "public_key must be 64-hex-char Ed25519 public key".to_string()))?;
         state.broker.repo.set_agent_public_key(&req.name, &req.project, pk)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        tracing::info!("Ed25519 public key enrolled for {}.{}", req.name, req.project);
+        tracing::info!("Ed25519 public key enrolled for {}@{}", req.name, req.project);
     }
 
     // NOTE: this is a correlation ID only -- live sessions are created exclusively on WS handshake.
@@ -369,7 +369,7 @@ async fn register_agent(
         None
     };
 
-    tracing::info!("Agent registered: {}.{}", req.name, req.project);
+    tracing::info!("Agent registered: {}@{}", req.name, req.project);
     Ok(Json(RegisterAgentResponse { session_id, deprecation_notice }))
 }
 

@@ -80,7 +80,7 @@ impl BrokerState {
         let key = AgentKey::new(name, project);
         let mut sessions = self.sessions.write().await;
         if sessions.contains_key(&key) {
-            tracing::warn!("Duplicate connect rejected: {}.{}", name, project);
+            tracing::warn!("Duplicate connect rejected: {}@{}", name, project);
             return Err(());
         }
         let (tx, rx) = broadcast::channel(64);
@@ -91,7 +91,7 @@ impl BrokerState {
             tx,
         };
         sessions.insert(key, session);
-        tracing::info!("Agent connected: {}.{}", name, project);
+        tracing::info!("Agent connected: {}@{}", name, project);
         Ok(rx)
     }
 
@@ -105,7 +105,7 @@ impl BrokerState {
             session.state = AgentState::Offline;
         }
         sessions.remove(&key);
-        tracing::info!("Agent disconnected: {}.{}", name, project);
+        tracing::info!("Agent disconnected: {}@{}", name, project);
     }
 
     /// Remove all live WS sessions for agents in the given project.
