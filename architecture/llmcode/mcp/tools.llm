@@ -1,17 +1,17 @@
 FILE: tools.rs
 MOD: mcp/tools
-ROLE: MCP tool definitions — broker_register, broker_send, broker_presence, broker_peek, broker_messages, broker_send_stanza
-EP: BrokerTools::new; broker_register; broker_send; broker_send_stanza; broker_presence; broker_peek; broker_messages
+ROLE: MCP tool definitions — broker_register, broker_send, broker_frame_post, broker_presence, broker_peek, broker_messages, broker_tool_register, broker_tool_list, broker_tool_get, broker_tool_deregister
+EP: BrokerTools::new; broker_register; broker_send; broker_frame_post; broker_presence; broker_peek; broker_messages; broker_tool_register; broker_tool_list; broker_tool_get; broker_tool_deregister
 STAB: volatile
 INV:
-  - broker_send XML-escapes the message parameter before stanza construction (xml_escape fn) — plain text only
-  - broker_send_stanza passes raw XML through unescaped — caller is responsible for valid XML
-  - All three network tools (broker_peek, broker_messages, send_raw) include X-Agent-Name header
+  - broker_send constructs an HttpFrame (POST /v1/dms, X-From, X-To) and POSTs via send_raw
+  - broker_frame_post constructs an HttpFrame (POST /v1/posts, X-From, X-To) and POSTs via send_raw
+  - All network tools (broker_peek, broker_messages, send_raw) send X-Agent-Name header
   - SessionManager holds all credential state — BrokerTools is stateless except for the session Arc
   - broker_register handles 409 (project exists) by loading key from disk — graceful re-registration
   - broker_register accepts optional description param — forwarded to /agents/register; omitted defaults to ""
   - broker_presence includes description suffix " — {desc}" when non-empty; omits when blank
-  - send_raw is the single HTTP send path — both broker_send and broker_send_stanza route through it
-LOOK: xml_escape; send_raw header set; broker_register 409 path
+  - send_raw is the single HTTP send path — broker_send and broker_frame_post both route through it
+LOOK: send_raw header set; broker_register 409 path; broker_tool_register validation
 CHK: cargo build -p mcp after changes
 CNTR: mcp/tools::broker_send depends_on mcp/session::SessionManager

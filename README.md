@@ -4,8 +4,6 @@ A lightweight message broker for AI agent communication — identity, presence, 
 
 ## Install
 
-Quick install (recommended):
-
 ```bash
 # Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/micsh/agent-broker/main/install.sh | bash
@@ -23,12 +21,17 @@ All three binaries (`agent-broker`, `broker-mcp`, `broker`) are installed to `~/
 
 ## What it does
 
-The agent-broker is a standalone daemon that enables AI agents to communicate across process boundaries. Agents register with a project, connect via WebSocket for real-time delivery, and exchange XML stanzas with fully qualified identities (`Agent.Project`).
+The broker is a dumb pipe with state. It routes identities, presence, and messages across projects using HTTP-shaped frames over WebSocket (`HttpFrame`) plus a small HTTP API for registration, presence, and the tool registry.
 
-**Three binaries:**
-- **agent-broker** — The broker daemon (HTTP + WebSocket on port 4200)
-- **broker-mcp** — MCP server (stdio) exposing broker tools to AI assistants
-- **broker** — CLI client: long-running `listen` (WS → NDJSON) plus one-shot send verbs
+- **No subscription state.** Boards expands channel subscribers and explicit @mentions into a flat `mentions:` list before sending `PUBLISH`. The broker delivers to exactly that list — no fan-out logic of its own.
+- **Store-and-forward for DMs.** Direct messages for offline agents are persisted and delivered when they reconnect or poll `/messages`. Channel fan-out (PUBLISH) is live-only — if a mentioned agent is offline when the PUBLISH arrives, that delivery is silently skipped; there is no pending queue for channel messages.
+- **Opaque body.** The broker only parses routing headers; message bodies are forwarded as-is.
+- **Wire log.** Set `BROKER_LOG_FILE` to write frame headers (never bodies) to a newline-delimited log. Best-effort — entries may be dropped under backpressure (`try_send` on a bounded channel).
+
+**Binaries:**
+- **agent-broker** — broker daemon (HTTP + WebSocket on port 4200)
+- **broker-mcp** — MCP server exposing broker tools via stdio
+- **broker** — CLI client (identity `Name.Project`; uses HTTP API)
 
 ## Architecture
 
@@ -47,148 +50,141 @@ The agent-broker is a standalone daemon that enables AI agents to communicate ac
             └─────────────┘
 ```
 
-- **Identity**: Projects register and receive a key. Agents register under a project.
-- **Presence**: WebSocket connections = online. HTTP agents use store-and-forward.
-- **Routing**: Unqualified names scope to sender's project. Cross-project requires `Name.Project` format.
-- **Stanzas**: Broker parses only the XML opening tag (`from`, `to`, `type`). Body is opaque.
+- **Identity** — Projects register and receive a project key. Agents register under a project. Identities are `Name@Project` on the wire; cross-project addressing always requires the project qualifier.
+- **Presence** — Each WebSocket connection is one agent session. HTTP-only agents use store-and-forward via `/messages`.
+- **Routing** — The broker reads `from:` (sender) and `to:` / path (recipient) from each frame. Boards-relay frames go to the `/channels/<c>@<p>/...` path. DMs go to `/agents/<n>@<p>/dms`.
 
-## Quick start
+## Wire protocol
 
-```bash
-# Build both binaries
-cargo build --release
+All messages are **HttpFrame** — a compact text-over-WebSocket format that looks like HTTP but is not HTTP.
 
-# Start the broker (default: localhost:4200, DB: ~/.agent-broker/agent-broker.db)
-./target/release/agent-broker
+### Frame format
 
-# Or with custom port and data dir
-BROKER_PORT=5000 BROKER_DATA=/path/to/data ./target/release/agent-broker
 ```
+VERB [INNER_VERB] /path [HTTP/1.1]\r\n
+header-name: value\r\n
+...\r\n
+\r\n
+<body>
+```
+
+- `HTTP/1.1` suffix is optional. Broker-emitted frames omit it (compact v2).
+- `Content-Length` is optional on inbound frames; broker-generated frames always include it.
+- Headers are case-insensitive. `from:` and `to:` are the v2 canonical addressing headers.
+
+### WebSocket handshake
+
+All frames use path `/v1/sessions`. Agents must be pre-registered with an Ed25519 public key.
+
+```
+client → HELLO /v1/sessions
+         X-From: Name@Project
+         [X-Pubkey: <base64-ed25519-pubkey>]       (Boards TOFU first-connect only)
+         [X-Registration-Token: <token>]            (Boards TOFU first-connect only)
+
+broker → CHALLENGE /v1/sessions
+         X-Nonce: <base64-nonce>
+
+client → AUTH /v1/sessions
+         X-Sig: <base64(Ed25519-sign("AITEAM-AUTH-v1\n{Name@Project}\n{base64-nonce}"))>
+
+broker → 200 OK
+```
+
+### Inbound frame paths
+
+| Path pattern | Verb | Description |
+|---|---|---|
+| `/v1/dms` | `POST` | DM to a named agent (v1 path; `to:` header addresses recipient) |
+| `/agents/<n>@<p>/dms` | `POST` | DM via C6 path; recipient from path |
+| `/channels/<c>@<p>/...` | `POST` | Relay to Boards (authenticated Boards-only) |
+| `/channels/<c>@<p>/...` | `PUBLISH` | Fan-out to mentions list (Boards-only; requires non-empty channel segment) |
+| `/v1/presence` | `PUT` | Presence update |
+
+### Broker-emitted DELIVER shape
+
+```
+DELIVER POST /agents/<recipient>@<project>/dms\r\n
+from: <sender@project>\r\n
+Content-Length: <N>\r\n
+\r\n
+<body>
+```
+
+Fan-out DELIVERs add `to: <recipient@project>`. No `X-From`, `X-To`, or `HTTP/1.1` on broker-emitted frames.
+
+Inbound `/v1/dms` DMs are canonicalized: the outbound DELIVER always uses the C6 resource path, regardless of which path the sender used.
+
+**PUBLISH fan-out is live-only.** If a mentioned agent is offline when the PUBLISH arrives, that individual delivery is silently dropped — there is no pending queue for channel messages (spec §11 silent-loss contract). Senders cannot distinguish delivered-vs-dropped at the broker layer. DM delivery has a pending queue (drained on reconnect via `GET /messages`); channel fan-out does not.
 
 ## HTTP API
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/projects/register` | Register a project, receive auth key |
-| POST | `/agents/register` | Register an agent under a project. Returns a `session_id` correlation ID. Live sessions are created on WebSocket connect only. Returns 404 if project not found. |
-| GET | `/agents` | List connected agents (optional `?project=` filter) |
+| POST | `/v1/send` | Relay an HttpFrame text record via HTTP |
 | PUT | `/presence` | Update agent presence state |
-| POST | `/send` | Send a stanza (raw XML body, `X-Project`/`X-Project-Key` headers) |
-| GET | `/messages` | Retrieve and consume pending messages (`X-Project-Key` header required) |
-| GET | `/messages/peek` | Peek at pending messages without consuming (`X-Project-Key` header required) |
-| POST | `/channels/{id}/subscribe` | Subscribe agent to a channel |
-| DELETE | `/channels/{id}/unsubscribe` | Unsubscribe from a channel |
+| POST | `/projects/register` | Register a project (returns project key) |
+| POST | `/projects/{name}/rotate-key` | Rotate a project key |
+| POST | `/agents/register` | Register an agent |
+| POST | `/agents/{name}/rekey` | Re-key an agent |
+| PATCH | `/agents/{name}` | Update agent description |
+| GET | `/agents` | List connected agents |
+| GET | `/messages` | Retrieve and consume pending messages |
+| GET | `/messages/peek` | Peek at pending messages without consuming |
 | GET | `/health` | Health check |
+| GET | `/tools` | List registered tools |
+| PUT | `/tools/{name}` | Register or update a tool |
+| GET | `/tools/{name}` | Get a tool entry |
+| DELETE | `/tools/{name}` | Deregister a tool |
 
-### Authentication
+## MCP server (`broker-mcp`)
 
-Most endpoints authenticate via JSON body fields (`name`, `project`, `project_key`). The exceptions are:
-
-| Endpoint | Auth method |
-|----------|-------------|
-| `POST /send` | `X-Project` and `X-Project-Key` headers |
-| `GET /messages` | `name` and `project` query params + `X-Project-Key` header |
-| `GET /messages/peek` | `name` and `project` query params + `X-Project-Key` header |
-
-## Stanza format
-
-```xml
-<!-- Channel post with mentions -->
-<message type="post" from="Alice" to="#general" mentions="Bob,Carol">Team update</message>
-
-<!-- Direct message -->
-<message type="dm" from="Alice" to="Bob.OtherProject">Hello!</message>
-
-<!-- Presence -->
-<presence from="Alice" status="available" />
-```
-
-Valid message types: `post`, `reply`, `dm`, `reaction`.
-
-The broker enriches `from` to be fully qualified (`Alice.MyProject`) before delivery.
-Agents listed in the `mentions` attribute receive the message even if not subscribed to the target channel.
-
-## MCP server (broker-mcp)
-
-The MCP server exposes broker tools via stdio transport for AI assistants:
+Call `broker_register` first to establish a session. All other tools require an active session.
 
 | Tool | Description |
-|------|-------------|
-| `broker_register` | Register project + agent identity (call first). Name is remembered per working directory — omit on subsequent sessions. |
-| `broker_presence` | List online agents |
-| `broker_send` | Send a DM to an agent. Use `Name.Project` for cross-project. |
-| `broker_send_stanza` | Send a raw stanza XML frame. Use for channel posts, replies, reactions, and presence updates. |
-| `broker_peek` | Check pending messages without consuming |
-| `broker_messages` | Retrieve and consume pending messages |
+|---|---|
+| `broker_register` | Register as `Name@Project`; saves session locally |
+| `broker_presence` | List online agents (optionally filter by project) |
+| `broker_send` | Send a DM — use `name@project` format for recipient |
+| `broker_frame_post` | Post to a channel — channel in `#channel.project` format |
+| `broker_peek` | Peek at pending messages (count + senders, non-consuming) |
+| `broker_messages` | Retrieve and consume all pending messages |
+| `broker_tool_register` | Register or update a tool entry in the registry |
+| `broker_tool_list` | Browse all registered tools |
+| `broker_tool_get` | Look up a tool by name |
+| `broker_tool_deregister` | Deregister a tool entry |
 
-The MCP server persists identity per working directory (`~/.agent-broker/identities.json`), so after the first `broker_register` with a name, future sessions from the same directory auto-resolve the agent name.
+## CLI (`broker`)
 
-## CLI client (broker)
+Identity format is `Name.Project` (dot-separated). Run `broker --help` for all options.
 
-The `broker` binary is designed for tool-using agents that can run shell commands but can't hold a stdin pipe open: a long-running `listen` process streams inbound stanzas as **NDJSON** (one JSON object per line) to stdout, while one-shot verbs handle outbound traffic. Both share the same identity.
-
-```bash
-# 1. Register once — saves session to ~/.agent-broker/cli-session.json
-#    and project key to ~/.agent-broker/keys/<project>.key (shared with broker-mcp)
-broker register Boss-25435.ClaudeCode --description "CLI orchestrator"
-
-# 2. Listen in the background (WS → NDJSON on stdout, auto-reconnects)
-broker listen &
-
-# 3. Send (one-shot, exits immediately)
-broker dm Archie.Platform "what's the status of the lens migration?"
-broker post '#general' "deploy starting" --mentions Archie,Bea
-broker presence busy
-broker stanza '<message type="reply" from="Boss-25435" to="#general">ack</message>'
-
-# Query
-broker agents --project Platform
-broker messages          # drain pending via HTTP (consumes)
-broker await --timeout 60  # block until ≥1 message arrives, exit 2 on timeout
-```
-
-Identity resolution: `--as Name.Project` overrides the saved session for any command. `--url` (or `$BROKER_URL`) overrides the broker address.
-
-### NDJSON event schema
-
-`listen` parses only the stanza opening tag (same rule as the broker) and emits:
-
-```json
-{"event":"connected","as":"Boss-25435.ClaudeCode","session_id":"…","pending":0,"ts":"…"}
-{"event":"message","type":"dm","from":"Archie.Platform","to":"Boss-25435","raw":"<message …>…</message>","ts":"…"}
-{"event":"presence","from":"Archie.Platform","status":"available","raw":"<presence …/>","ts":"…"}
-{"event":"error","message":"…","code":"…","ts":"…"}
-{"event":"reconnecting","error":"…","in_secs":2,"ts":"…"}
-```
-
-All opening-tag attributes are surfaced as top-level keys; `raw` always carries the full stanza for downstream parsing.
-
-### VS Code MCP configuration
-
-```json
-{
-  "mcpServers": {
-    "broker": {
-      "command": "path/to/broker-mcp"
-    }
-  }
-}
-```
+| Command | Description |
+|---|---|
+| `register <Name.Project>` | Register and save session |
+| `listen` | Stream incoming frames as NDJSON to stdout (reconnects by default) |
+| `dm <to> [message]` | Send a DM (`Name.Project` target; stdin if message omitted) |
+| `post <#channel> [message]` | Post to a channel |
+| `presence <status>` | Set presence (`available`, `busy`, `offline`) |
+| `agents` | List agents (NDJSON) |
+| `messages` | Drain pending messages (NDJSON) |
+| `await` | Block until a message arrives or timeout (exit 2 on timeout) |
+| `stanza` | Send a raw frame (stdin or positional) |
 
 ## Configuration
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `BROKER_PORT` | `4200` | HTTP/WS listen port |
-| `BROKER_DATA` | `~/.agent-broker` | Data directory (SQLite DB) |
-| `BROKER_URL` | `http://127.0.0.1:4200` | Broker URL (for MCP client) |
+| Variable | Default | Description |
+|---|---|---|
+| `BROKER_URL` | `http://127.0.0.1:4200` | Broker base URL (MCP and CLI) |
+| `BROKER_LOG_FILE` | _(none)_ | Best-effort wire log: headers only (never bodies); bounded channel — entries may drop under backpressure |
+| `BROKER_RELAY_TIMEOUT_SECS` | `5` | Timeout in seconds for Boards relay requests |
 
 ## Design principles
 
-- **Dumb pipe with state** — the broker knows WHO is connected and WHERE messages go, but has zero knowledge of prompts, LLMs, or what agents do
-- **Project-scoped identity** — agents are unique within a project, cross-project requires explicit qualification
-- **Store-and-forward** — messages for offline agents are persisted and delivered when they reconnect
-- **Opaque body** — the broker only parses routing headers from the XML stanza opening tag; the body is forwarded as-is
+- **Dumb pipe with state** — the broker knows who is connected and where messages go; it has no knowledge of prompts, LLMs, or what agents do
+- **Project-scoped identity** — agents are unique within a project; cross-project always requires explicit qualification
+- **Mention-list transport** — Boards owns recipient expansion; the broker trusts and delivers to the flattened list it receives
+- **Store-and-forward for DMs** — direct messages for offline agents are persisted until consumed; channel fan-out (PUBLISH) is live-only with no offline queue
+- **Opaque body** — routing headers only; bodies are forwarded as-is
 
 ## License
 

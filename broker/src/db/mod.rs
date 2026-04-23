@@ -36,9 +36,9 @@ pub fn open_memory() -> Result<Repository, String> {
 }
 
 /// Run schema migrations (private — called from open() and open_memory()).
-/// Migration 1: channels composite PK (from old single-column PK) + backfill orphaned channel rows
-///   from subscriptions (NEW-8: pre-CT-2 data may have subscription references without channel rows).
+/// Migration 1: channels composite PK (from old single-column PK).
 /// Migration 2: seed cross_project_allowed_sources default-allow entries for all existing projects.
+/// Migration 3: drop subscriptions table (C13 — broker is pure mention-list transport).
 /// Safe to run on a fresh database (idempotent).
 fn migrate(conn: &Connection) -> Result<(), String> {
     // Migration 1: channels composite PK
@@ -63,29 +63,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             );
             INSERT INTO channels_new SELECT id, COALESCE(project, ''), description, created_utc FROM channels;
 
-            CREATE TABLE subscriptions_new (
-                agent_name     TEXT NOT NULL,
-                project        TEXT NOT NULL,
-                channel_id     TEXT NOT NULL,
-                subscribed_utc TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (agent_name, project, channel_id),
-                FOREIGN KEY (agent_name, project) REFERENCES agents(name, project),
-                FOREIGN KEY (channel_id, project) REFERENCES channels_new(id, project)
-            );
-            INSERT INTO subscriptions_new SELECT agent_name, project, channel_id, subscribed_utc FROM subscriptions;
-
-            DROP TABLE subscriptions;
             DROP TABLE channels;
             ALTER TABLE channels_new RENAME TO channels;
-            ALTER TABLE subscriptions_new RENAME TO subscriptions;
-
-            -- NEW-8: backfill any channel rows that existed only as subscription references
-            -- (pre-CT-2 data may have subscriptions whose channel rows were lost in the migration).
-            INSERT OR IGNORE INTO channels (id, project, created_utc)
-            SELECT DISTINCT channel_id, project, datetime('now')
-            FROM subscriptions
-            WHERE (channel_id || '|' || project) NOT IN
-                (SELECT id || '|' || project FROM channels);
 
             COMMIT;
             PRAGMA foreign_keys=ON;
@@ -98,6 +77,15 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         INSERT OR IGNORE INTO cross_project_allowed_sources
         SELECT '*', name FROM projects;
     ").map_err(|e| format!("cross_project_allowed_sources backfill failed: {e}"))?;
+
+    // Migration 3: drop subscriptions table (C13 — broker is pure mention-list transport).
+    // Boards resolves fan-out recipients via the mentions: header; the broker no longer
+    // needs subscription state. DROP IF EXISTS is idempotent — safe on fresh DBs.
+    conn.execute_batch("
+        PRAGMA foreign_keys=OFF;
+        DROP TABLE IF EXISTS subscriptions;
+        PRAGMA foreign_keys=ON;
+    ").map_err(|e| format!("Migration 3 (drop subscriptions) failed: {e}"))?;
 
     Ok(())
 }

@@ -1,2 +1,9 @@
 /target
 /.vs
+
+# Auto-generated code intelligence indexes (not source)
+/.code-intel/
+/architecture/generated/
+
+# Ephemeral probe/test directories
+/tmp-*/

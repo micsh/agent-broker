@@ -253,8 +253,8 @@ impl Repository {
     }
 
     /// Delete a project and all its associated data in a single transaction.
-    /// Cascade order respects FK constraints: delivery_log → messages → subscriptions
-    /// → channels → cross_project_allowed_sources → agents → projects.
+    /// Cascade order respects FK constraints: delivery_log → messages →
+    /// channels → cross_project_allowed_sources → agents → projects.
     /// Returns Err if the project is not found.
     pub fn delete_project(&self, name: &str) -> Result<(), String> {
         // Check existence before opening a transaction — no transaction needed for a missing project.
@@ -272,11 +272,6 @@ impl Repository {
              OR message_id IN (SELECT id FROM messages WHERE from_project = ?1)",
             params![name],
         ).map_err(|e| format!("delete_project delivery_log: {e}"))?;
-
-        tx.execute(
-            "DELETE FROM subscriptions WHERE project = ?1",
-            params![name],
-        ).map_err(|e| format!("delete_project subscriptions: {e}"))?;
 
         tx.execute(
             "DELETE FROM messages WHERE from_project = ?1",
@@ -538,40 +533,6 @@ impl Repository {
 
     // --- Channels ---
 
-    /// Ensure a channel exists within a project. Returns Err if the channel name is invalid.
-    /// Valid channel names match `[\w-]+` — word characters and hyphens only.
-    /// Dots are prohibited because '#channel.Project' is the cross-project addressing syntax.
-    pub fn ensure_channel(&self, id: &str, project: &str) -> Result<(), String> {
-        let valid = !id.is_empty()
-            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if !valid {
-            return Err(format!(
-                "Channel name '{}' must only contain word characters and hyphens — \
-                 dots are reserved for cross-project addressing (#channel.Project)",
-                id
-            ));
-        }
-        let _ = self.conn().execute(
-            "INSERT OR IGNORE INTO channels (id, project) VALUES (?1, ?2)",
-            params![id, project],
-        );
-        Ok(())
-    }
-
-    pub fn subscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
-        let _ = self.conn().execute(
-            "INSERT OR IGNORE INTO subscriptions (agent_name, project, channel_id) VALUES (?1, ?2, ?3)",
-            params![agent_name, project, channel_id],
-        );
-    }
-
-    pub fn unsubscribe(&self, agent_name: &str, project: &str, channel_id: &str) {
-        let _ = self.conn().execute(
-            "DELETE FROM subscriptions WHERE agent_name = ?1 AND project = ?2 AND channel_id = ?3",
-            params![agent_name, project, channel_id],
-        );
-    }
-
     // --- Messages ---
 
     /// Insert a DM frame into the messages table.
@@ -784,30 +745,6 @@ mod tests {
     use crate::db::schema::ensure_schema;
 
     #[test]
-    fn ensure_channel_rejects_dot_in_name() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let repo = Repository::new(conn);
-        repo.register_project("proj", "key").unwrap();
-        let result = repo.ensure_channel("chan.name", "proj");
-        assert!(result.is_err(), "dot in channel name must be rejected");
-        assert!(result.unwrap_err().contains("must only contain"), "error message should describe constraint");
-    }
-
-    #[test]
-    fn ensure_channel_accepts_hyphen_in_name() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let repo = Repository::new(conn);
-        repo.register_project("proj", "key").unwrap();
-        assert!(repo.ensure_channel("my-channel", "proj").is_ok(),
-            "hyphen in channel name must be accepted");
-        // Verify idempotent — second call must also succeed
-        assert!(repo.ensure_channel("my-channel", "proj").is_ok(),
-            "ensure_channel must be idempotent");
-    }
-
-    #[test]
     fn is_project_suspended_returns_false_for_active() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
@@ -876,14 +813,11 @@ mod tests {
         let repo = Repository::new(conn);
         repo.register_project("proj", "key").unwrap();
         repo.register_agent("Alice", "proj", "", "").unwrap();
-        repo.ensure_channel("general", "proj").unwrap();
-        repo.subscribe("Alice", "proj", "general");
 
         repo.delete_project("proj").unwrap();
 
         assert!(!repo.project_exists("proj"), "project row must be deleted");
         assert!(!repo.agent_exists("Alice", "proj"), "agent row must be deleted");
-        // Channel rows are cascade-deleted; verify project no longer exists as proxy
         assert!(!repo.project_exists("proj"), "project must be fully removed");
     }
 

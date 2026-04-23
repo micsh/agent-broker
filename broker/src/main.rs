@@ -72,7 +72,34 @@ async fn main() {
         archive_dms: std::env::var("BROKER_ARCHIVE_DMS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false),
+        relay_timeout: std::time::Duration::from_secs(
+            std::env::var("BROKER_RELAY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5u64),
+        ),
+        log_file: std::env::var("BROKER_LOG_FILE").ok().filter(|s| !s.is_empty()),
     };
+    let wire_log = config.log_file.as_ref().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| tracing::warn!("BROKER_LOG_FILE open failed for {path:?}: {e}"))
+            .ok()
+            .map(|file| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                std::thread::spawn(move || {
+                    use std::io::{BufWriter, Write};
+                    let mut writer = BufWriter::new(file);
+                    for entry in rx {
+                        let _ = writer.write_all(entry.as_bytes());
+                        let _ = writer.flush();
+                    }
+                });
+                Arc::new(tx)
+            })
+    });
     let rate_limiter = Arc::new(api::middleware::ProjectRateLimiter::new(config.rate_limit_rps));
 
     let app_state = Arc::new(AppState {
@@ -80,6 +107,8 @@ async fn main() {
         delivery,
         config,
         rate_limiter,
+        relay_map: Arc::new(dashmap::DashMap::new()),
+        wire_log,
     });
 
     let app = api::http_router(app_state.clone())

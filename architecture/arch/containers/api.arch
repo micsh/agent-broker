@@ -9,7 +9,7 @@ MOD: routes
   OWN: http-endpoints; request-types; response-types; AppState
   BND: HTTP boundary only — no business logic, no SQL
   DEP: broker/state; broker/delivery
-  ROUTES: POST /projects/register; POST /agents/register; GET /agents; PUT /presence; POST /v1/send; GET /messages; GET /messages/peek; POST /channels/{id}/subscribe; DELETE /channels/{id}/unsubscribe; GET /health
+  ROUTES: POST /projects/register; POST /projects/{name}/rotate-key; POST /agents/register; POST /agents/{name}/rekey; PATCH /agents/{name}; GET /agents; PUT /presence; POST /v1/send; GET /messages; GET /messages/peek; GET /health; GET /tools; PUT /tools/{name}; GET /tools/{name}; DELETE /tools/{name}
 
 MOD: ws
   FILE: ws.rs

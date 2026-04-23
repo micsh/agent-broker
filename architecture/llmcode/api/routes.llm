@@ -1,14 +1,14 @@
 FILE: routes.rs
 MOD: api/routes
-ROLE: HTTP route handlers — project/agent registration, message send, presence, channel subscribe, message retrieval, tool registry
-EP: router; register_project; register_agent; send_message; update_presence; get_messages; peek_messages; subscribe_channel; unsubscribe_channel; list_agents; update_agent_description; register_tool_entry; list_tools; get_tool_entry; delete_tool_entry; health
+ROLE: HTTP route handlers — project/agent registration, message send, presence, message retrieval, tool registry
+EP: router; register_project; register_agent; send_frame_http; update_presence; get_messages; peek_messages; list_agents; update_agent_description; register_tool_entry; list_tools; get_tool_entry; delete_tool_entry; health
 STAB: volatile
 INV:
   - All auth-gated routes use AgentAuth extractor — agent identity comes from X-Agent-Name header, not request body
   - PATCH /agents/{name} (update_agent_description) enforces self-update only: path name must match auth agent name, else 403; max 500 chars
   - GET /agents accepts ?include_offline=true to merge DB-registered offline agents into response
   - register_agent accepts optional description field; blank re-registration preserves existing description (COALESCE)
-  - send_message validates stanza from= matches authenticated agent (T8b) before dispatching
+  - send_frame_http (POST /v1/send) always rewrites from: to authenticated identity (H2) then forwards to Boards@target; never delivers directly
   - register_agent enforces no-dot constraint on agent names before calling broker
   - POST /agents/register is body-auth only (first-contact route — no X-Agent-Name header yet)
   - AmbiguousMention dispatch error maps to 400 with disambiguation message listing conflicting projects
@@ -22,5 +22,5 @@ INV:
   - Auth contract: missing X-Project or X-Project-Key → 401 UNAUTHORIZED; wrong key → 401; missing X-Agent-Name → 401; suspended project → 403; agent not registered → 403
 LOOK: AgentAuth extractor; send_message T8b check; AmbiguousMention error arm; register_agent dot guard; update_agent_description self-check; register_tool_entry validation block
 CHK: cargo test; arch fitness (api in allowed list for broker-callers, db-callers, stanza-callers)
-CNTR: api/routes::send_message depends_on broker/state::dispatch_stanza
-DEPS-ON: broker/state; broker/delivery; stanza/types
+CNTR: api/routes::send_frame_http depends_on broker/state::send_to_agent
+DEPS-ON: broker/state; broker/delivery; http_frame

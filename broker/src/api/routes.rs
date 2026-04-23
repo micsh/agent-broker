@@ -8,8 +8,22 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put, delete, patch};
 use axum::{Json, Router};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
+use std::time::Duration;
+
+/// A pending relay awaiting Boards' Resp frame.
+pub struct RelayEntry {
+    /// Channel to forward the (rewritten) Resp to the source connection.
+    pub resp_tx: tokio::sync::mpsc::Sender<String>,
+    /// Original `correlation-id` from the source agent (None if absent).
+    pub source_correlation_id: Option<String>,
+}
+
+/// Concurrent map from relay-id (`r-<uuid>`) → pending relay entry.
+pub type RelayMap = Arc<DashMap<String, RelayEntry>>;
 
 /// Startup configuration loaded from environment variables.
 pub struct BrokerConfig {
@@ -23,6 +37,12 @@ pub struct BrokerConfig {
     /// When true, DMs are archived to Boards@recipient_project after broker-direct delivery.
     /// Best-effort only — Boards offline never blocks delivery. Default: false.
     pub archive_dms: bool,
+    /// How long to wait for Boards' Resp before issuing 504. Default: 5s.
+    /// Also used as the bound on `resp_tx.send()` in the Resp routing branch.
+    pub relay_timeout: Duration,
+    /// Path to the wire log file. If set, one entry per inbound frame and per outbound DELIVER
+    /// is appended (headers only, no body). None = feature disabled, zero behavior change.
+    pub log_file: Option<String>,
 }
 
 /// Shared application state passed to all route handlers.
@@ -31,6 +51,11 @@ pub struct AppState {
     pub delivery: Arc<DeliveryEngine>,
     pub config: BrokerConfig,
     pub rate_limiter: Arc<crate::api::middleware::ProjectRateLimiter>,
+    /// Active relay entries: relay-id → entry awaiting Boards' Resp.
+    pub relay_map: RelayMap,
+    /// Wire log sender: entries are queued here and written by a background thread.
+    /// None when `BROKER_LOG_FILE` is unset — zero behavior change.
+    pub wire_log: Option<Arc<SyncSender<String>>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -40,8 +65,6 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let write_routes = Router::new()
         .route("/v1/send", post(send_frame_http))
         .route("/presence", put(update_presence))
-        .route("/channels/{id}/subscribe", post(subscribe_channel))
-        .route("/channels/{id}/unsubscribe", delete(unsubscribe_channel))
         .layer(from_fn_with_state(state, crate::api::middleware::rate_limit_middleware));
 
     // Exempt routes — no rate limiting
@@ -108,10 +131,6 @@ pub struct PresenceRequest {
     #[serde(default)]
     pub state: AgentState,
 }
-
-/// Channel subscribe/unsubscribe payload -- credentials carried by AgentAuth extractor.
-#[derive(Deserialize)]
-pub struct ChannelRequest {}
 
 #[derive(Deserialize)]
 pub struct AgentQuery {
@@ -401,9 +420,10 @@ async fn update_agent_description(
     Ok(StatusCode::OK)
 }
 
-/// POST /v1/send — accepts a raw HttpFrame text body, validates it, and forwards to Boards.
-/// Replaces POST /send (XML stanza path, removed in Phase 4). The frame's X-From is always
-/// overwritten with the authenticated session identity before forwarding (H2 invariant).
+/// POST /v1/send — validates an HttpFrame text body, rewrites `from:` to the authenticated
+/// identity (H2 invariant), then forwards the frame to Boards@<target_project>.
+/// All verb/path combinations (DMs, channel posts, reactions) are forwarded to Boards;
+/// this endpoint does not deliver messages directly.
 async fn send_frame_http(
     State(state): State<Arc<AppState>>,
     AgentAuth { project, agent_name }: AgentAuth,
@@ -421,34 +441,54 @@ async fn send_frame_http(
     let verb = frame.verb().unwrap_or("").to_string();
     let path = frame.path().unwrap_or("").to_string();
 
-    let xto = match frame.header("X-To").map(|s| s.to_string()) {
-        Some(v) => v,
-        None => return (StatusCode::BAD_REQUEST, "Missing X-To header").into_response(),
-    };
-
-    if let Err(e) = http_frame::validate_xto_shape(&verb, &path, &xto) {
-        return (StatusCode::BAD_REQUEST, format!("Invalid X-To: {e}")).into_response();
-    }
-
-    let target_project = match (verb.as_str(), path.as_str()) {
-        ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
-            match http_frame::parse_channel(&xto) {
-                Ok((_, p)) => p.to_string(),
-                Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To channel format").into_response(),
-            }
+    // C6: if the frame path is channel-rooted (/channels/<channel>@<project>/...), extract
+    // the target project from the path — no X-To header required.
+    // C6: if the frame path is agent-addressed (/agents/<name>@<project>/...), extract the
+    // target project from the identity segment — no X-To required.
+    // v1: X-To (or to:) is required; validate shape and extract project from it.
+    let target_project = if let Some((_, proj)) = http_frame::parse_channel_from_path(&path) {
+        // C6 channel-rooted path — project is in the path, X-To not needed.
+        if verb != "POST" {
+            return (StatusCode::BAD_REQUEST, format!("Unsupported verb for C6 channel path: {verb}")).into_response();
         }
-        ("POST", "/v1/dms") => {
-            match http_frame::parse_identity(&xto) {
-                Ok((_, p)) => p.to_string(),
-                Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To identity format").into_response(),
-            }
+        proj.to_string()
+    } else if let Some((_, proj)) = http_frame::parse_identity_from_path(&path) {
+        // C6 agent-addressed path (DMs, presence, etc.) — project is in the identity segment.
+        if verb != "POST" {
+            return (StatusCode::BAD_REQUEST, format!("Unsupported verb for C6 agent path: {verb}")).into_response();
         }
-        _ => return (StatusCode::BAD_REQUEST, format!("Unsupported verb/path: {verb} {path}")).into_response(),
+        proj.to_string()
+    } else {
+        // v1 path — X-To required.
+        let xto = match frame.header2("X-To", "to").map(|s| s.to_string()) {
+            Some(v) => v,
+            None => return (StatusCode::BAD_REQUEST, "Missing X-To header").into_response(),
+        };
+
+        if let Err(e) = http_frame::validate_xto_shape(&verb, &path, &xto) {
+            return (StatusCode::BAD_REQUEST, format!("Invalid X-To: {e}")).into_response();
+        }
+
+        match (verb.as_str(), path.as_str()) {
+            ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
+                match http_frame::parse_channel(&xto) {
+                    Ok((_, p)) => p.to_string(),
+                    Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To channel format").into_response(),
+                }
+            }
+            ("POST", "/v1/dms") => {
+                match http_frame::parse_identity(&xto) {
+                    Ok((_, p)) => p.to_string(),
+                    Err(_) => return (StatusCode::BAD_REQUEST, "Invalid X-To identity format").into_response(),
+                }
+            }
+            _ => return (StatusCode::BAD_REQUEST, format!("Unsupported verb/path: {verb} {path}")).into_response(),
+        }
     };
 
     // Canonicalize X-From to authenticated identity — never trust wire X-From from HTTP clients
-    // (same H2 invariant as the WS path in ws.rs handle_inbound)
-    frame.set_header("X-From", &format!("{}@{}", agent_name, project));
+    // (same H2 invariant as the WS path in ws.rs handle_inbound). Also strips any v2 `from:`.
+    frame.set_canonical_from(&format!("{}@{}", agent_name, project));
 
     let delivered = state.broker.send_to_agent("Boards", &target_project, &frame.serialize()).await;
     if delivered {
@@ -499,28 +539,6 @@ async fn peek_messages(
     }))
 }
 
-async fn subscribe_channel(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(channel_id): axum::extract::Path<String>,
-    AgentAuth { project, agent_name }: AgentAuth,
-    Json(_req): Json<ChannelRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.repo.ensure_channel(&channel_id, &project)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    state.broker.repo.subscribe(&agent_name, &project, &channel_id);
-    Ok(StatusCode::OK)
-}
-
-async fn unsubscribe_channel(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(channel_id): axum::extract::Path<String>,
-    AgentAuth { project, agent_name }: AgentAuth,
-    Json(_req): Json<ChannelRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    state.broker.repo.unsubscribe(&agent_name, &project, &channel_id);
-    Ok(StatusCode::OK)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,9 +557,9 @@ mod tests {
         let repo = Arc::new(db::open_memory().expect("in-memory DB"));
         let broker = Arc::new(BrokerState::new(repo));
         let delivery = Arc::new(DeliveryEngine::new(broker.clone()));
-        let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token: None, archive_dms: false };
+        let config = BrokerConfig { admin_key: None, rate_limit_rps: 100, boards_registration_token: None, archive_dms: false, relay_timeout: std::time::Duration::from_secs(5), log_file: None };
         let rate_limiter = Arc::new(ProjectRateLimiter::new(100));
-        Arc::new(AppState { broker, delivery, config, rate_limiter })
+        Arc::new(AppState { broker, delivery, config, rate_limiter, relay_map: Arc::new(DashMap::new()), wire_log: None })
     }
 
     fn test_app(state: Arc<AppState>) -> Router {
@@ -1265,15 +1283,59 @@ mod tests {
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // What Boards received must have X-From: Alice@proj (authenticated identity, not the forged value)
+        // What Boards received must have from: Alice@proj (authenticated identity, not the forged value)
         let received = boards_rx.recv().await.expect("Boards should have received the forwarded frame");
         assert!(
-            received.contains("X-From: Alice@proj") || received.contains("x-from: Alice@proj"),
-            "X-From not canonicalized; Boards received: {received}"
+            received.contains("from: Alice@proj"),
+            "from: not canonicalized; Boards received: {received}"
         );
         assert!(
             !received.contains("ForgedAgent"),
             "Forged X-From leaked to Boards; received: {received}"
         );
+    }
+
+    /// C6: POST /v1/send with a C6 channel-rooted path — no X-To required; Boards offline → 503.
+    #[tokio::test]
+    async fn v1_send_c6_channel_path_no_xto_required() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj", "Alice", "").await;
+        // C6 path in the frame body — no X-To header on the frame.
+        let body = "hello c6";
+        let frame = format!(
+            "POST /channels/general@proj/posts HTTP/1.1\r\nX-From: Alice@proj\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        // Boards offline → 503 (proves project extracted from path and routing attempted)
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// C6: deep C6 path with thread/post segments — project still extracted correctly → 503.
+    #[tokio::test]
+    async fn v1_send_c6_deep_path_routes_correctly() {
+        let state = make_state();
+        let app = test_app(state);
+        let key = register_project_and_agent(&app, "proj-deep", "Alice", "").await;
+        let body = "deep c6";
+        let frame = format!(
+            "POST /channels/analysis@proj-deep/threads/t-7/posts/p-91 HTTP/1.1\r\nX-From: Alice@proj-deep\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/send")
+                .header("X-Project", "proj-deep").header("X-Project-Key", &key).header("X-Agent-Name", "Alice")
+                .header("content-type", "text/plain")
+                .body(Body::from(frame)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

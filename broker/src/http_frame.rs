@@ -1,17 +1,20 @@
 //! HttpFrame — HTTP-shaped text framing for WebSocket transport (spec §1).
 //!
 //! One frame per WS `Message::Text`. Frames are never split across messages.
-//! `Content-Length` is mandatory on every frame; body is exactly that many bytes.
-//! Body may contain CR, LF, or CRLF — readers consume exactly Content-Length bytes.
+//! `Content-Length` is optional (C3): when present, body is consumed as exactly that many bytes
+//! (validated); when absent, body = entire remainder after `\r\n\r\n` (message boundary is safe).
+//! Body may contain CR, LF, or CRLF — readers consume exactly Content-Length bytes when given.
 //!
 //! # Wire format
 //! ```text
-//! VERB /path HTTP/1.1\r\n          ← request frame
+//! VERB /path HTTP/1.1\r\n          ← request frame (v1 — HTTP version suffix present)
+//! VERB /path\r\n                   ← request frame (v2 — version suffix omitted, C1)
 //! HTTP/1.1 NNN Reason\r\n          ← response frame
-//! Header-Name: value\r\n
-//! Content-Length: N\r\n
+//! Header-Name: value\r\n           ← v1 header style (X-Foo: value)
+//! header-name: value\r\n           ← v2 header style (foo: value); both accepted
+//! Content-Length: N\r\n            ← optional (C3); broker-generated frames always include it
 //! \r\n
-//! <body of exactly N bytes>
+//! <body — exactly N bytes if CL present, else full remainder>
 //! ```
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -19,7 +22,12 @@
 /// The opening line of a frame — request or response shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FirstLine {
-    Request { verb: String, path: String },
+    /// A request frame.
+    /// - `inner_verb`: optional inner-verb token (C7 `PUBLISH POST /path` form). `None` for
+    ///   standard 2-token frames. `serialize()` emits it between outer verb and path.
+    /// - `has_version`: true when wire form included `HTTP/1.1` suffix; false for v2 agents
+    ///   that omit it. `serialize()` preserves this (spec C1).
+    Request { verb: String, inner_verb: Option<String>, path: String, has_version: bool },
     Response { status: u16, reason: String },
 }
 
@@ -40,7 +48,6 @@ pub enum ParseError {
     MissingHeaderTerminator,
     InvalidFirstLine(String),
     HeaderMalformed(String),
-    MissingContentLength,
     BadContentLength(String),
     BodyTooShort { expected: usize, got: usize },
     BodyNotUtf8,
@@ -53,7 +60,6 @@ impl std::fmt::Display for ParseError {
             ParseError::MissingHeaderTerminator => write!(f, "Missing \\r\\n\\r\\n header terminator"),
             ParseError::InvalidFirstLine(s) => write!(f, "Invalid first line: '{s}'"),
             ParseError::HeaderMalformed(s) => write!(f, "Malformed header line: '{s}'"),
-            ParseError::MissingContentLength => write!(f, "Missing mandatory Content-Length header"),
             ParseError::BadContentLength(s) => write!(f, "Content-Length is not a valid integer: '{s}'"),
             ParseError::BodyTooShort { expected, got } => {
                 write!(f, "Body too short: Content-Length={expected}, got {got} bytes")
@@ -67,10 +73,11 @@ impl std::fmt::Display for ParseError {
 
 /// Parse a single HttpFrame from a WS text message string.
 ///
-/// # Spec §1 compliance
-/// - Content-Length is mandatory.
-/// - Body is consumed as exactly Content-Length bytes.
-/// - Body may contain CRLF; the byte slice is converted to UTF-8.
+/// # Spec §1 compliance (C3 update)
+/// - Content-Length is **optional**. When present, body is consumed as exactly that many bytes
+///   and the value is validated. When absent, body = entire remainder after `\r\n\r\n` (safe
+///   because one WS message = one frame, so message boundary is the length delimiter).
+/// - Serializer continues to emit Content-Length on broker-generated frames.
 pub fn parse(text: &str) -> Result<HttpFrame, ParseError> {
     if text.is_empty() {
         return Err(ParseError::EmptyFrame);
@@ -103,18 +110,23 @@ pub fn parse(text: &str) -> Result<HttpFrame, ParseError> {
         headers.push((name, value));
     }
 
-    // Content-Length is mandatory (spec §1)
-    let cl_str = headers.iter()
+    // Content-Length is optional (C3). When present: validate and consume exactly that many bytes.
+    // When absent: body = entire remainder (safe — one WS message = one frame).
+    let cl_opt = headers.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
-        .map(|(_, v)| v.as_str())
-        .ok_or(ParseError::MissingContentLength)?;
+        .map(|(_, v)| v.as_str());
 
-    let content_length: usize = cl_str.trim().parse()
-        .map_err(|_| ParseError::BadContentLength(cl_str.to_string()))?;
-
-    // Extract exactly content_length bytes from the body region
     let remaining = &text[body_start..];
     let remaining_bytes = remaining.as_bytes();
+
+    let content_length: usize = if let Some(cl_str) = cl_opt {
+        cl_str.trim().parse()
+            .map_err(|_| ParseError::BadContentLength(cl_str.to_string()))?
+    } else {
+        remaining_bytes.len()
+    };
+
+    // Extract exactly content_length bytes from the body region
     if remaining_bytes.len() < content_length {
         return Err(ParseError::BodyTooShort {
             expected: content_length,
@@ -138,24 +150,64 @@ fn parse_first_line(line: &str) -> Result<FirstLine, ParseError> {
             .map_err(|_| ParseError::InvalidFirstLine(line.to_string()))?;
         return Ok(FirstLine::Response { status, reason: reason.to_string() });
     }
-    // Request: "VERB /path HTTP/1.1"
-    let mut parts = line.splitn(3, ' ');
-    let verb = parts.next().unwrap_or("");
-    let path = parts.next().ok_or_else(|| ParseError::InvalidFirstLine(line.to_string()))?;
-    let proto = parts.next().ok_or_else(|| ParseError::InvalidFirstLine(line.to_string()))?;
-    if verb.is_empty() || path.is_empty() || proto != "HTTP/1.1" {
+    // Request — 2 to 4 tokens:
+    //   VERB /path                           (v2, no version)
+    //   VERB /path HTTP/1.1                  (v1, with version)
+    //   VERB INNER_VERB /path                (C7, no version)
+    //   VERB INNER_VERB /path HTTP/1.1       (C7, with version)
+    // Disambiguation: if token[1] starts with '/' it IS the path; otherwise it is inner_verb.
+    let parts: Vec<&str> = line.split(' ').collect();
+    if parts.len() < 2 {
         return Err(ParseError::InvalidFirstLine(line.to_string()));
     }
-    Ok(FirstLine::Request { verb: verb.to_string(), path: path.to_string() })
+    let verb = parts[0];
+    if verb.is_empty() {
+        return Err(ParseError::InvalidFirstLine(line.to_string()));
+    }
+
+    let (inner_verb, path, version_tok): (Option<&str>, &str, Option<&str>) =
+        if parts[1].starts_with('/') {
+            // No inner_verb: VERB /path [HTTP/1.1]
+            (None, parts[1], parts.get(2).copied())
+        } else {
+            // Has inner_verb: VERB INNER_VERB /path [HTTP/1.1]
+            if parts.len() < 3 {
+                return Err(ParseError::InvalidFirstLine(line.to_string()));
+            }
+            let iv = parts[1];
+            let p = parts[2];
+            if !p.starts_with('/') {
+                return Err(ParseError::InvalidFirstLine(line.to_string()));
+            }
+            (Some(iv), p, parts.get(3).copied())
+        };
+
+    if path.is_empty() {
+        return Err(ParseError::InvalidFirstLine(line.to_string()));
+    }
+
+    let has_version = match version_tok {
+        Some("HTTP/1.1") => true,
+        Some(_other) => return Err(ParseError::InvalidFirstLine(line.to_string())),
+        None => false,
+    };
+
+    Ok(FirstLine::Request {
+        verb: verb.to_string(),
+        inner_verb: inner_verb.map(str::to_string),
+        path: path.to_string(),
+        has_version,
+    })
 }
 
 // ── Frame builder / accessors ─────────────────────────────────────────────────
 
 impl HttpFrame {
     /// Create a request frame with no headers and an empty body.
+    /// Broker-generated frames always carry the HTTP/1.1 version suffix (`has_version: true`).
     pub fn request(verb: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
-            first_line: FirstLine::Request { verb: verb.into(), path: path.into() },
+            first_line: FirstLine::Request { verb: verb.into(), inner_verb: None, path: path.into(), has_version: true },
             headers: Vec::new(),
             body: String::new(),
         }
@@ -186,6 +238,14 @@ impl HttpFrame {
         }
     }
 
+    /// Inner verb of a request frame (C7); `None` for standard frames and all response frames.
+    pub fn inner_verb(&self) -> Option<&str> {
+        match &self.first_line {
+            FirstLine::Request { inner_verb, .. } => inner_verb.as_deref(),
+            FirstLine::Response { .. } => None,
+        }
+    }
+
     /// Status code of a response frame; `None` for request frames.
     pub fn status(&self) -> Option<u16> {
         match &self.first_line {
@@ -199,6 +259,13 @@ impl HttpFrame {
         self.headers.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Dual-form header read: try `v1_name` first, fall back to `v2_name`.
+    /// Use for headers that exist in both v1 (X-Foo) and v2 (foo) forms during transition.
+    /// The lookup for each name is case-insensitive.
+    pub fn header2<'a>(&'a self, v1_name: &str, v2_name: &str) -> Option<&'a str> {
+        self.header(v1_name).or_else(|| self.header(v2_name))
     }
 
     /// Append a header (builder pattern; does not deduplicate).
@@ -216,6 +283,25 @@ impl HttpFrame {
         }
     }
 
+    /// Remove all headers matching `name` (case-insensitive).
+    pub fn remove_header(&mut self, name: &str) {
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    }
+
+    /// Canonicalize sender identity: remove ALL `X-From` and `from:` headers, then add a
+    /// single authoritative `from: identity` (v2). Prevents spoofed or duplicate sender
+    /// headers from surviving alongside the broker-asserted identity (spec H2).
+    pub fn set_canonical_from(&mut self, identity: &str) {
+        self.remove_header("X-From");
+        self.remove_header("from");
+        self.headers.push(("from".to_string(), identity.to_string()));
+    }
+
+    /// Returns true if this is a response frame (has status, no verb).
+    pub fn is_response(&self) -> bool {
+        self.status().is_some() && self.verb().is_none()
+    }
+
     /// Ensure `Content-Length` header matches `body.len()`. Call before `serialize()`.
     #[must_use]
     pub fn finalize(mut self) -> Self {
@@ -225,14 +311,26 @@ impl HttpFrame {
     }
 
     /// Serialize to wire-format string.
+    ///
+    /// For request frames, the `HTTP/1.1` version suffix is emitted only if the frame
+    /// was parsed from a versioned first line (`has_version: true`). Broker-built frames
+    /// always have `has_version: true`. This preserves "forward as-is" for v2 agents that
+    /// omit the suffix (spec C1).
     pub fn serialize(&self) -> String {
         let mut out = String::new();
         match &self.first_line {
-            FirstLine::Request { verb, path } => {
+            FirstLine::Request { verb, inner_verb, path, has_version } => {
                 out.push_str(verb);
                 out.push(' ');
+                if let Some(iv) = inner_verb {
+                    out.push_str(iv);
+                    out.push(' ');
+                }
                 out.push_str(path);
-                out.push_str(" HTTP/1.1\r\n");
+                if *has_version {
+                    out.push_str(" HTTP/1.1");
+                }
+                out.push_str("\r\n");
             }
             FirstLine::Response { status, reason } => {
                 out.push_str("HTTP/1.1 ");
@@ -265,27 +363,14 @@ pub fn validate_xto_shape(verb: &str, path: &str, xto: &str) -> Result<(), Strin
         ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
             parse_channel(xto)
                 .map(|_| ())
-                .map_err(|_| format!("X-To for {verb} {path} must be '#channel.project', got: '{xto}'"))
+                .map_err(|_| format!("X-To for {verb} {path} must be '#channel.project' or '#channel@project', got: '{xto}'"))
         }
         ("POST", "/v1/dms") => {
             parse_identity(xto)
                 .map(|_| ())
                 .map_err(|_| format!("X-To for POST /v1/dms must be 'name@project', got: '{xto}'"))
         }
-        ("PUBLISH", "/v1/deliveries") => {
-            if xto.is_empty() {
-                return Err("X-To on PUBLISH /v1/deliveries must not be empty".to_string());
-            }
-            for part in xto.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    return Err("X-To on PUBLISH contains an empty recipient segment".to_string());
-                }
-                parse_identity(part)
-                    .map_err(|_| format!("X-To on PUBLISH: '{part}' is not a valid name@project"))?;
-            }
-            Ok(())
-        }
+        // PUBLISH /v1/deliveries: broker trusts the pre-resolved mentions: list from Boards — no validation.
         // All other verb/path combinations are not validated here.
         _ => Ok(()),
     }
@@ -305,42 +390,62 @@ pub fn parse_identity(s: &str) -> Result<(&str, &str), ()> {
     Ok((name, project))
 }
 
-/// Parse a `#channel.project` channel address (spec §4).
+/// Parse a C6 agent-addressed resource path and extract `(name, project)`.
 ///
-/// Requires `#` prefix. Splits on the first `.`. Returns `(channel, project)` on success.
-pub fn parse_channel(s: &str) -> Result<(&str, &str), ()> {
-    let s = s.strip_prefix('#').ok_or(())?;
-    let dot = s.find('.').ok_or(())?;
-    let channel = &s[..dot];
-    let project = &s[dot + 1..];
-    if channel.is_empty() || project.is_empty() { return Err(()); }
-    Ok((channel, project))
+/// Accepts any path of the form `/agents/<name>@<project>/...` — e.g. `/agents/alice@TeamA/dms`.
+/// The `<name>@<project>` segment is the first path component after `/agents/`; everything
+/// after the next `/` is ignored (broker only needs the recipient identity for routing).
+/// Returns `None` for paths that don't start with `/agents/` or have a malformed identity segment.
+/// Parse a C6 agent-scoped DM path and extract `(name, project)`.
+///
+/// Only accepts exactly `/agents/<name>@<project>/dms`. Any other tail
+/// (e.g. `/presence`, `/evil`, or no tail at all) returns `None` so the
+/// caller can respond 400 rather than silently misrouting.
+pub fn parse_identity_from_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/agents/")?;
+    let seg_end = rest.find('/')?; // require a '/' after identity — no bare /agents/<id>
+    let addr = &rest[..seg_end];
+    let tail = &rest[seg_end..]; // e.g. "/dms"
+    if tail != "/dms" {
+        return None;
+    }
+    parse_identity(addr).ok()
 }
 
-/// Partition a PUBLISH X-To value into valid and invalid recipients.
+/// Parse a C6 resource path and extract `(channel, project)` from the first path segment.
 ///
-/// X-To is a comma-separated list of `name@project` identities. Each part is
-/// trimmed and validated with `parse_identity`. Returns:
-/// - `valid`: owned strings that passed validation
-/// - `invalid`: `(part, reason)` pairs for parts that failed
-///
-/// Empty parts (from trailing commas or double commas) are silently skipped —
-/// they are formatting artifacts, not intended recipients, and do not appear
-/// in `X-Dropped`. The caller should 400 if `valid` is empty.
-pub fn partition_publish_recipients(xto: &str) -> (Vec<String>, Vec<(String, String)>) {
-    let mut valid = Vec::new();
-    let mut invalid = Vec::new();
-    for part in xto.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue; // formatting artifact — not an identity, skip silently
-        }
-        match parse_identity(part) {
-            Ok(_) => valid.push(part.to_string()),
-            Err(_) => invalid.push((part.to_string(), format!("'{}' is not a valid name@project", part))),
-        }
+/// Accepts any path of the form `/channels/<channel>@<project>/...`.
+/// The `<channel>@<project>` segment is the first path component after `/channels/`; everything
+/// after the next `/` is ignored (broker only needs the project for routing).
+/// Returns `None` for any path that does not start with `/channels/` or is malformed.
+pub fn parse_channel_from_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/channels/")?;
+    // Find the end of the channel@project segment (first '/' after the prefix, or end of string).
+    let seg_end = rest.find('/').unwrap_or(rest.len());
+    let addr = &rest[..seg_end];
+    // addr must be `channel@project` — '@' is the C6 separator (no '#' prefix, no '.' separator here).
+    let at = addr.find('@')?;
+    let channel = &addr[..at];
+    let project = &addr[at + 1..];
+    if channel.is_empty() || project.is_empty() {
+        return None;
     }
-    (valid, invalid)
+    Some((channel, project))
+}
+
+/// Parse a channel address (spec §4).
+///
+/// Accepts both v1 (`#channel.project`) and v2 (`#channel@project`) separator forms.
+/// Requires `#` prefix. Splits on the first `.` or `@` (whichever appears first after `#`).
+/// Returns `(channel, project)` on success. Empty channel or project → Err.
+pub fn parse_channel(s: &str) -> Result<(&str, &str), ()> {
+    let s = s.strip_prefix('#').ok_or(())?;
+    // Find the first separator — either '.' (v1) or '@' (v2).
+    let sep = s.find(['.', '@']).ok_or(())?;
+    let channel = &s[..sep];
+    let project = &s[sep + 1..];
+    if channel.is_empty() || project.is_empty() { return Err(()); }
+    Ok((channel, project))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -489,9 +594,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_content_length() {
-        let bad = "HELLO /v1/sessions HTTP/1.1\r\nX-From: alice@TeamA\r\n\r\n";
-        assert_eq!(parse(bad).unwrap_err(), ParseError::MissingContentLength);
+    fn parse_no_content_length_infers_body_from_remainder() {
+        // C3: Content-Length absent — body = entire remainder after \r\n\r\n.
+        let text = "HELLO /v1/sessions HTTP/1.1\r\nX-From: alice@TeamA\r\n\r\nhello";
+        let frame = parse(text).expect("frame without Content-Length should parse");
+        assert_eq!(frame.verb(), Some("HELLO"));
+        assert_eq!(frame.body, "hello");
+    }
+
+    #[test]
+    fn parse_no_content_length_empty_body() {
+        // C3: Content-Length absent, no body after \r\n\r\n — body is empty string.
+        let text = "HELLO /v1/sessions HTTP/1.1\r\nX-From: alice@TeamA\r\n\r\n";
+        let frame = parse(text).expect("frame without Content-Length and no body should parse");
+        assert_eq!(frame.body, "");
     }
 
     #[test]
@@ -517,7 +633,8 @@ mod tests {
 
     #[test]
     fn parse_invalid_first_line_no_path() {
-        let bad = "HELLO HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        // A single-token line (no path at all) must fail.
+        let bad = "HELLO\r\nContent-Length: 0\r\n\r\n";
         assert!(matches!(parse(bad).unwrap_err(), ParseError::InvalidFirstLine(_)));
     }
 
@@ -574,8 +691,14 @@ mod tests {
 
     #[test]
     fn parse_channel_valid() {
+        // v1 separator: '.'
         assert_eq!(parse_channel("#planning.TeamA"), Ok(("planning", "TeamA")));
         assert_eq!(parse_channel("#general.AITeam.Platform"), Ok(("general", "AITeam.Platform")));
+        // v2 separator: '@'
+        assert_eq!(parse_channel("#planning@TeamA"), Ok(("planning", "TeamA")));
+        assert_eq!(parse_channel("#general@AITeam.Platform"), Ok(("general", "AITeam.Platform")));
+        // v2 with dotted project: '@' is separator, project contains '.'
+        assert_eq!(parse_channel("#analysis@Org.Sub"), Ok(("analysis", "Org.Sub")));
     }
 
     #[test]
@@ -585,14 +708,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_channel_no_dot() {
+    fn parse_channel_no_separator() {
+        // Neither '.' nor '@' after '#' — invalid
         assert!(parse_channel("#planning").is_err());
     }
 
     #[test]
     fn parse_channel_empty_components() {
-        assert!(parse_channel("#.TeamA").is_err());    // empty channel
-        assert!(parse_channel("#planning.").is_err()); // empty project
+        assert!(parse_channel("#.TeamA").is_err());    // empty channel (v1)
+        assert!(parse_channel("#planning.").is_err()); // empty project (v1)
+        assert!(parse_channel("#@TeamA").is_err());    // empty channel (v2)
+        assert!(parse_channel("#planning@").is_err()); // empty project (v2)
     }
 
     // ── validate_xto_shape tests ──────────────────────────────────────────────
@@ -617,12 +743,11 @@ mod tests {
     }
 
     #[test]
-    fn xto_publish_requires_comma_separated_identities() {
+    fn xto_publish_passes_through() {
+        // C13: broker trusts Boards' pre-resolved mentions: list — PUBLISH X-To is not validated.
         assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "alice@A,bob@B").is_ok());
-        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "alice@A").is_ok()); // single is ok
-        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "").is_err());       // empty
-        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "alice@A,bad").is_err()); // no @
-        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "#chan.A,bob@B").is_err()); // channel mixed in
+        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "").is_ok());
+        assert!(validate_xto_shape("PUBLISH", "/v1/deliveries", "bad-identity").is_ok());
     }
 
     #[test]
@@ -632,45 +757,277 @@ mod tests {
         assert!(validate_xto_shape("HELLO", "/v1/sessions", "").is_ok());
     }
 
-    // ── partition_publish_recipients tests ────────────────────────────────────
+    // ── header2 dual-form read tests ─────────────────────────────────────────
 
     #[test]
-    fn partition_all_valid() {
-        let (valid, invalid) = partition_publish_recipients("alice@A,bob@B");
-        assert_eq!(valid, vec!["alice@A", "bob@B"]);
-        assert!(invalid.is_empty());
+    fn header2_returns_v1_when_present() {
+        let frame = HttpFrame::request("POST", "/v1/dms")
+            .add_header("X-To", "alice@TeamA")
+            .finalize();
+        assert_eq!(frame.header2("X-To", "to"), Some("alice@TeamA"));
     }
 
     #[test]
-    fn partition_mixed_valid_and_invalid() {
-        let (valid, invalid) = partition_publish_recipients("alice@A,BadIdentity,bob@B");
-        assert_eq!(valid, vec!["alice@A", "bob@B"]);
-        assert_eq!(invalid.len(), 1);
-        assert_eq!(invalid[0].0, "BadIdentity");
+    fn header2_falls_back_to_v2_when_v1_absent() {
+        let frame = HttpFrame::request("POST", "/v1/dms")
+            .add_header("to", "alice@TeamA")
+            .finalize();
+        assert_eq!(frame.header2("X-To", "to"), Some("alice@TeamA"));
     }
 
     #[test]
-    fn partition_all_invalid() {
-        let (valid, invalid) = partition_publish_recipients("BadOne,BadTwo");
-        assert!(valid.is_empty());
-        assert_eq!(invalid.len(), 2);
+    fn header2_v1_wins_when_both_present() {
+        let frame = HttpFrame::request("POST", "/v1/dms")
+            .add_header("X-To", "v1@TeamA")
+            .add_header("to", "v2@TeamA")
+            .finalize();
+        assert_eq!(frame.header2("X-To", "to"), Some("v1@TeamA"));
     }
 
     #[test]
-    fn partition_empty_segments_skipped_not_invalid() {
-        // Trailing comma: empty segment is silently skipped, not added to invalid.
-        let (valid, invalid) = partition_publish_recipients("alice@proj,");
-        assert_eq!(valid, vec!["alice@proj"]);
-        assert!(invalid.is_empty(), "trailing comma must not produce X-Dropped entry");
+    fn header2_returns_none_when_neither_present() {
+        let frame = HttpFrame::request("POST", "/v1/dms").finalize();
+        assert_eq!(frame.header2("X-To", "to"), None);
+    }
 
-        // Double comma: same behaviour.
-        let (valid2, invalid2) = partition_publish_recipients("alice@proj,,bob@proj");
-        assert_eq!(valid2, vec!["alice@proj", "bob@proj"]);
-        assert!(invalid2.is_empty(), "double comma must not produce X-Dropped entry");
+    #[test]
+    fn set_canonical_from_sets_from_and_strips_xfrom() {
+        let mut frame = HttpFrame::request("POST", "/v1/posts")
+            .add_header("from", "attacker@evil")   // v2 spoofed identity
+            .add_header("X-From", "attacker@evil") // v1 spoofed identity
+            .finalize();
+        frame.set_canonical_from("alice@TeamA");
+        assert_eq!(frame.header("from"), Some("alice@TeamA"), "from: must be set to canonical identity");
+        assert_eq!(frame.header("X-From"), None, "X-From must be stripped after canonicalization");
+        // Only one from: header
+        let from_count = frame.headers.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("from"))
+            .count();
+        assert_eq!(from_count, 1, "exactly one from: must remain");
+    }
 
-        // Only commas → valid is empty → caller returns 400 (all-invalid path).
-        let (valid3, invalid3) = partition_publish_recipients(",,");
-        assert!(valid3.is_empty());
-        assert!(invalid3.is_empty(), "comma-only input must yield empty invalid (no false X-Dropped)");
+    #[test]
+    fn set_canonical_from_purges_duplicate_from_headers() {
+        // Attacker sends multiple X-From + from: headers. All must be removed; only the
+        // broker-asserted identity survives as a single from: header.
+        let mut frame = HttpFrame::request("POST", "/v1/posts")
+            .add_header("X-From", "evil1@proj")
+            .add_header("from", "evil2@proj")
+            .add_header("X-From", "evil3@proj")
+            .finalize();
+        frame.set_canonical_from("alice@proj");
+        assert_eq!(frame.header("from"), Some("alice@proj"), "canonical from: must be alice@proj");
+        assert_eq!(frame.header("X-From"), None, "X-From must be gone");
+        let from_count = frame.headers.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("from"))
+            .count();
+        assert_eq!(from_count, 1, "exactly one from: must remain — all attacker copies removed");
+    }
+
+    #[test]
+    fn set_canonical_from_works_when_no_from_present() {
+        let mut frame = HttpFrame::request("POST", "/v1/posts").finalize();
+        frame.set_canonical_from("alice@TeamA");
+        assert_eq!(frame.header("from"), Some("alice@TeamA"));
+        assert_eq!(frame.header("X-From"), None);
+    }
+
+    // ── C1 request-line no-version tests ────────────────────────────────────
+
+    #[test]
+    fn parse_request_no_version_suffix_accepted() {
+        // v2 agents may omit "HTTP/1.1" from the request line — broker must accept.
+        let text = "POST /v1/dms\r\nX-From: alice@TeamA\r\nContent-Length: 0\r\n\r\n";
+        let frame = parse(text).expect("no-version frame should parse");
+        assert_eq!(frame.verb(), Some("POST"));
+        assert_eq!(frame.path(), Some("/v1/dms"));
+        // has_version is false — serialize() must NOT add HTTP/1.1 suffix
+        let serialized = frame.serialize();
+        assert!(serialized.starts_with("POST /v1/dms\r\n"), "first line must be preserved without version: {serialized:?}");
+    }
+
+    #[test]
+    fn parse_request_with_version_suffix_still_accepted() {
+        // v1 form with HTTP/1.1 still works after C1 change.
+        let text = "POST /v1/dms HTTP/1.1\r\nX-From: alice@TeamA\r\nContent-Length: 0\r\n\r\n";
+        let frame = parse(text).expect("versioned frame should parse");
+        let serialized = frame.serialize();
+        assert!(serialized.starts_with("POST /v1/dms HTTP/1.1\r\n"), "v1 form must round-trip: {serialized:?}");
+    }
+
+    #[test]
+    fn parse_request_unknown_version_still_rejected() {
+        // An unrecognized third token is still an error (not silently ignored).
+        let bad = "POST /v1/dms HTTP/2\r\nContent-Length: 0\r\n\r\n";
+        assert!(matches!(parse(bad).unwrap_err(), ParseError::InvalidFirstLine(_)));
+    }
+
+    // ── C7 inner_verb tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_inner_verb_no_version() {
+        // C7 form: VERB INNER_VERB /path (3 tokens, no HTTP/1.1)
+        let text = "PUBLISH POST /channels/general@proj/threads/t-1/posts/p-91\r\nContent-Length: 0\r\n\r\n";
+        let frame = parse(text).expect("C7 no-version should parse");
+        assert_eq!(frame.verb(), Some("PUBLISH"));
+        assert_eq!(frame.inner_verb(), Some("POST"));
+        assert_eq!(frame.path(), Some("/channels/general@proj/threads/t-1/posts/p-91"));
+        assert!(!matches!(&frame.first_line, super::FirstLine::Request { has_version: true, .. }));
+        // Serialize must not add HTTP/1.1
+        let s = frame.serialize();
+        assert!(s.starts_with("PUBLISH POST /channels/general@proj/threads/t-1/posts/p-91\r\n"),
+            "C7 no-version must round-trip: {s:?}");
+    }
+
+    #[test]
+    fn parse_inner_verb_with_version() {
+        // C7 form: VERB INNER_VERB /path HTTP/1.1 (4 tokens)
+        let text = "PUBLISH POST /channels/general@proj/threads/t-1/posts/p-91 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let frame = parse(text).expect("C7 versioned should parse");
+        assert_eq!(frame.verb(), Some("PUBLISH"));
+        assert_eq!(frame.inner_verb(), Some("POST"));
+        assert_eq!(frame.path(), Some("/channels/general@proj/threads/t-1/posts/p-91"));
+        let s = frame.serialize();
+        assert!(s.starts_with("PUBLISH POST /channels/general@proj/threads/t-1/posts/p-91 HTTP/1.1\r\n"),
+            "C7 versioned must round-trip: {s:?}");
+    }
+
+    #[test]
+    fn inner_verb_none_for_standard_frame() {
+        let frame = super::HttpFrame::request("POST", "/v1/posts");
+        assert_eq!(frame.inner_verb(), None, "standard frame must have no inner_verb");
+    }
+
+    #[test]
+    fn deliver_frame_carries_inner_verb() {
+        // A DELIVER frame constructed with inner_verb round-trips correctly.
+        use super::FirstLine;
+        let mut frame = super::HttpFrame::request("DELIVER", "/channels/general@proj/threads/t-1/posts/p-91");
+        frame.first_line = FirstLine::Request {
+            verb: "DELIVER".to_string(),
+            inner_verb: Some("POST".to_string()),
+            path: "/channels/general@proj/threads/t-1/posts/p-91".to_string(),
+            has_version: true,
+        };
+        let s = frame.serialize();
+        assert!(s.starts_with("DELIVER POST /channels/general@proj/threads/t-1/posts/p-91 HTTP/1.1\r\n"),
+            "DELIVER with inner_verb must serialize correctly: {s:?}");
+    }
+
+    // ── Pass-through guarantee test ──────────────────────────────────────────
+
+    #[test]
+    fn unknown_headers_survive_serialize_round_trip() {
+        // Headers the broker does not read must be preserved verbatim through parse+serialize.
+        let text = "POST /v1/posts HTTP/1.1\r\nX-Thread: t-abc\r\nthread: t-abc\r\nX-Post-Id: p-xyz\r\ncustom-v2-header: some-value\r\nContent-Length: 0\r\n\r\n";
+        let frame = parse(text).expect("parse");
+        let serialized = frame.serialize();
+        let reparsed = parse(&serialized).expect("re-parse");
+        assert_eq!(reparsed.header("X-Thread"), Some("t-abc"));
+        assert_eq!(reparsed.header("thread"), Some("t-abc"));
+        assert_eq!(reparsed.header("X-Post-Id"), Some("p-xyz"));
+        assert_eq!(reparsed.header("custom-v2-header"), Some("some-value"));
+    }
+
+    // ── parse_identity_from_path tests (C6 agent paths) ─────────────────────
+
+    #[test]
+    fn parse_identity_from_path_basic() {
+        assert_eq!(
+            parse_identity_from_path("/agents/alice@TeamA/dms"),
+            Some(("alice", "TeamA"))
+        );
+        assert_eq!(
+            parse_identity_from_path("/agents/Bob@AITeam.Platform/dms"),
+            Some(("Bob", "AITeam.Platform"))
+        );
+    }
+
+    #[test]
+    fn parse_identity_from_path_no_tail() {
+        // No trailing slash — must return None (not a DM path).
+        assert_eq!(parse_identity_from_path("/agents/alice@proj"), None);
+    }
+
+    #[test]
+    fn parse_identity_from_path_rejects_arbitrary_tail() {
+        // Arbitrary tail must not route as DM.
+        assert_eq!(parse_identity_from_path("/agents/Bob@proj/evil"), None);
+        assert_eq!(parse_identity_from_path("/agents/Bob@proj/presence"), None);
+        assert_eq!(parse_identity_from_path("/agents/Bob@proj/notifications"), None);
+    }
+
+    #[test]
+    fn parse_identity_from_path_not_an_agent_path() {
+        assert_eq!(parse_identity_from_path("/v1/dms"), None);
+        assert_eq!(parse_identity_from_path("/channels/general@proj/posts"), None);
+        assert_eq!(parse_identity_from_path(""), None);
+    }
+
+    #[test]
+    fn parse_identity_from_path_malformed_segment() {
+        // No '@' in identity segment → None.
+        assert_eq!(parse_identity_from_path("/agents/alice.TeamA/dms"), None);
+        // Empty name → None.
+        assert_eq!(parse_identity_from_path("/agents/@proj/dms"), None);
+        // Empty project → None.
+        assert_eq!(parse_identity_from_path("/agents/alice@/dms"), None);
+    }
+
+    // ── parse_channel_from_path tests (C6 resource paths) ───────────────────
+
+    #[test]
+    fn parse_channel_from_path_basic() {
+        // Simplest form: /channels/<c>@<p>/<tail>
+        assert_eq!(
+            parse_channel_from_path("/channels/general@AITeam.Platform/posts"),
+            Some(("general", "AITeam.Platform"))
+        );
+        assert_eq!(
+            parse_channel_from_path("/channels/planning@MyOrg/reactions"),
+            Some(("planning", "MyOrg"))
+        );
+    }
+
+    #[test]
+    fn parse_channel_from_path_deep_subpath() {
+        // Full C6 path with thread/post segments — broker only needs the first segment.
+        assert_eq!(
+            parse_channel_from_path("/channels/general@AITeam.Platform/threads/t-7/posts/p-91"),
+            Some(("general", "AITeam.Platform"))
+        );
+        assert_eq!(
+            parse_channel_from_path("/channels/analysis@Org/threads/t-1/posts/p-2/reactions"),
+            Some(("analysis", "Org"))
+        );
+    }
+
+    #[test]
+    fn parse_channel_from_path_no_tail() {
+        // Channel root with no trailing segment — still valid (address alone).
+        assert_eq!(
+            parse_channel_from_path("/channels/general@proj"),
+            Some(("general", "proj"))
+        );
+    }
+
+    #[test]
+    fn parse_channel_from_path_not_a_channel_path() {
+        // v1 paths and unrelated paths return None.
+        assert_eq!(parse_channel_from_path("/v1/posts"), None);
+        assert_eq!(parse_channel_from_path("/v1/dms"), None);
+        assert_eq!(parse_channel_from_path("/agents/alice@proj/dms"), None);
+        assert_eq!(parse_channel_from_path("/tools/my-tool"), None);
+        assert_eq!(parse_channel_from_path(""), None);
+    }
+
+    #[test]
+    fn parse_channel_from_path_malformed_segment() {
+        // Missing '@' in channel@project segment → None.
+        assert_eq!(parse_channel_from_path("/channels/general/posts"), None);
+        // Empty channel name → None.
+        assert_eq!(parse_channel_from_path("/channels/@proj/posts"), None);
+        // Empty project name → None.
+        assert_eq!(parse_channel_from_path("/channels/general@/posts"), None);
     }
 }

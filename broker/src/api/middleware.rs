@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn rate_limiter_allows_first_then_blocks() {
         // rps=1: the first call must succeed, the second (in the same second) must fail.
-        // This simulates the WS path: over-limit stanza receives an error frame, not delivery.
+        // This simulates the WS path: over-limit frame receives an error frame, not delivery.
         let limiter = ProjectRateLimiter::new(1);
         assert!(limiter.check("proj-a"), "first request must be allowed");
         assert!(!limiter.check("proj-a"), "second request in same second must be rate-limited");

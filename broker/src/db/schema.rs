@@ -28,16 +28,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
             FOREIGN KEY (project) REFERENCES projects(name)
         );
 
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            agent_name     TEXT NOT NULL,
-            project        TEXT NOT NULL,
-            channel_id     TEXT NOT NULL,
-            subscribed_utc TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (agent_name, project, channel_id),
-            FOREIGN KEY (agent_name, project) REFERENCES agents(name, project),
-            FOREIGN KEY (channel_id, project) REFERENCES channels(id, project)
-        );
-
         CREATE TABLE IF NOT EXISTS messages (
             id          TEXT PRIMARY KEY,
             from_agent  TEXT NOT NULL,

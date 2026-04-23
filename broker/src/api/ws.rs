@@ -10,7 +10,38 @@ use base64::Engine;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
 use uuid::Uuid;
+
+/// Append a wire-log entry (headers only, no body) to the optional log channel.
+/// Best-effort: formats to a String and calls `try_send` — silently drops if the
+/// channel is full. Never blocks, never panics.
+/// Format:
+/// ```text
+/// [INBOUND] 2026-04-23T04:01:00Z
+/// POST /agents/Tesla@AITeam.Platform/dms
+/// from: Operator@CopilotCli
+/// → <outcome>
+/// ```
+fn log_wire(
+    wire_log: &Option<Arc<SyncSender<String>>>,
+    direction: &str,
+    wire_bytes: &str,
+    outcome: &str,
+) {
+    let Some(sender) = wire_log else { return };
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    // Log the headers block (before \r\n\r\n separator) of the actual wire bytes.
+    // Using the serialized string ensures has_version is faithfully reproduced (e.g.
+    // relay frames forwarded with HTTP/1.1 appear correctly in the log).
+    let headers_block = wire_bytes
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or(wire_bytes)
+        .replace("\r\n", "\n");
+    let entry = format!("{direction} {ts}\n{headers_block}\n→ {outcome}\n\n");
+    let _ = sender.try_send(entry); // silently drop if channel full — never blocks routing
+}
 
 pub async fn handle_ws(
     ws: WebSocketUpgrade,
@@ -105,7 +136,7 @@ async fn wait_for_handshake(
         return None;
     }
 
-    let xfrom = match frame.header("X-From") {
+    let xfrom = match frame.header2("X-From", "from") {
         Some(v) => v.to_string(),
         None => {
             let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
@@ -121,7 +152,7 @@ async fn wait_for_handshake(
         }
     };
 
-    let xpubkey = frame.header("X-Pubkey").map(|s| s.to_string());
+    let xpubkey = frame.header2("X-Pubkey", "pubkey").map(|s| s.to_string());
 
     if name == "Boards" {
         // TOFU bootstrap rule (spec §6): check for an existing stored key first.
@@ -144,7 +175,7 @@ async fn wait_for_handshake(
                         return None;
                     }
                     Some(expected) => {
-                        let provided = match frame.header("X-Registration-Token") {
+                        let provided = match frame.header2("X-Registration-Token", "registration-token") {
                             Some(t) => t.to_string(),
                             None => {
                                 tracing::warn!(
@@ -288,7 +319,7 @@ async fn wait_for_handshake(
         let _ = send_frame(sender, &error_response_with_code(400, "PROTOCOL_ERROR", "Bad Request")).await;
         return None;
     }
-    let xsig = match auth_frame.header("X-Sig") {
+    let xsig = match auth_frame.header2("X-Sig", "sig") {
         Some(s) => s.to_string(),
         None => {
             let _ = send_frame(sender, &error_response(400, "Bad Request")).await;
@@ -416,23 +447,28 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    // Rate-limit per project — same bucket as HTTP write-path routes.
-                    if !rate_limiter.check(&agent_project) {
-                        tracing::debug!("WS rate limit exceeded for project '{}'", agent_project);
-                        let _ = resp_tx.try_send(error_response(429, "Too Many Requests").serialize());
-                        continue;
-                    }
-                    match http_frame::parse(&text) {
-                        Ok(frame) => {
-                            handle_inbound(frame, &agent_name, &agent_project, &state_for_recv, &resp_tx).await;
-                        }
+                    // Parse first — Resp frames (relay responses from Boards) must bypass
+                    // rate limiting since they are broker-internal, not client-initiated.
+                    let frame = match http_frame::parse(&text) {
+                        Ok(f) => f,
                         Err(e) => {
                             tracing::warn!("HttpFrame parse error from {}@{}: {}", agent_name, agent_project, e);
                             let _ = resp_tx.try_send(
                                 error_response_with_code(400, "PARSE_ERROR", "Bad Request").serialize(),
                             );
+                            continue;
                         }
+                    };
+                    // Rate-limit per project — same bucket as HTTP write-path routes.
+                    // Resp frames from Boards bypass this check — they are relay responses,
+                    // not client-initiated traffic. Any other sender must pass the check
+                    // regardless of frame shape (no throttle-bypass lane for non-Boards).
+                    if !(frame.is_response() && agent_name == "Boards") && !rate_limiter.check(&agent_project) {
+                        tracing::debug!("WS rate limit exceeded for project '{}'", agent_project);
+                        let _ = resp_tx.try_send(error_response(429, "Too Many Requests").serialize());
+                        continue;
                     }
+                    handle_inbound(frame, &agent_name, &agent_project, &state_for_recv, &resp_tx).await;
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -452,8 +488,9 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 // ── Inbound frame dispatch ────────────────────────────────────────────────────
 
 /// Dispatch a verified inbound frame from an authenticated connection.
-/// Handles: POST /v1/posts|reactions (→ Boards), POST /v1/dms (broker-direct),
-/// PUBLISH /v1/deliveries (Boards→agents), PUT /v1/presence.
+/// Handles: Resp frames from Boards (relay back to source), POST /v1/posts|reactions
+/// (→ Boards via relay), POST /v1/dms (broker-direct), PUBLISH <any-path>
+/// (Boards→agents), PUT /v1/presence.
 /// Sends a response frame via resp_tx on completion.
 async fn handle_inbound(
     mut frame: HttpFrame,
@@ -462,165 +499,194 @@ async fn handle_inbound(
     state: &Arc<AppState>,
     resp_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
+    // Resp frames from Boards: relay back to source via relay_map lookup.
+    // Must be checked before the verb/path match — Resp frames have no verb.
+    // Guard: only Boards is authorized to send Resp frames. A non-Boards sender
+    // that emits a response-shaped frame is already rate-limited by recv_task;
+    // reject here to prevent relay-map access and relay-id spoofing.
+    if frame.is_response() {
+        // Log relay responses before any early-return path.
+        log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "(relay response)");
+        if name != "Boards" {
+            tracing::warn!("Resp-shaped frame from non-Boards sender {}@{} — rejected", name, project);
+            let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+            return;
+        }
+        let relay_id = frame.header("correlation-id").map(|s| s.to_string());
+        if let Some(ref rid) = relay_id {
+            if rid.starts_with("r-") {
+                if let Some((_, entry)) = state.relay_map.remove(rid) {
+                    // Rewrite correlation-id back to source's original (or remove if source had none).
+                    match entry.source_correlation_id {
+                        Some(ref cid) => frame.set_header("correlation-id", cid),
+                        None => frame.remove_header("correlation-id"),
+                    }
+                    // Bounded send: timeout prevents head-of-line blocking if source's queue
+                    // (8 slots) is full. Entry is already removed — timeout task is dead — so
+                    // we must cap this ourselves.
+                    match tokio::time::timeout(
+                        state.config.relay_timeout,
+                        entry.resp_tx.send(frame.serialize()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            tracing::debug!(
+                                "relay: source disconnected before Boards Resp for relay-id {} — dropped",
+                                rid
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "relay: resp_tx backpressure timeout for relay-id {} — dropped",
+                                rid
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!("Resp from {}@{}: unknown relay-id '{}' — dropping", name, project, rid);
+                }
+                return;
+            }
+        }
+        // Resp with no relay-id or non-relay correlation-id — unexpected, drop.
+        tracing::warn!("Unexpected Resp from {}@{} — dropping", name, project);
+        return;
+    }
+
+    // Extract correlation-id once so every locally-generated response can echo it back.
+    // The CLI uses cid to match responses to requests — missing cid causes 8s timeouts.
+    let source_cid = frame.header("correlation-id").map(|s| s.to_string());
+    let reply = |mut r: HttpFrame| -> String {
+        if let Some(ref cid) = source_cid {
+            r.set_header("correlation-id", cid);
+        }
+        r.serialize()
+    };
+
     let verb = frame.verb().unwrap_or("").to_string();
     let path = frame.path().unwrap_or("").to_string();
 
     match (verb.as_str(), path.as_str()) {
         ("POST", "/v1/posts") | ("POST", "/v1/reactions") => {
-            let xto = match frame.header("X-To").map(|s| s.to_string()) {
+            let xto = match frame.header2("X-To", "to").map(|s| s.to_string()) {
                 Some(v) => v,
                 None => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (missing to:)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
             let channel_project = match http_frame::parse_channel(&xto) {
                 Ok((_, p)) => p.to_string(),
                 Err(_) => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (invalid channel)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
             // Canonicalize X-From to the authenticated session identity (spec §5).
             // Prevents agents from forging a different sender identity to Boards.
-            frame.set_header("X-From", &format!("{}@{}", name, project));
-            forward_to_boards(frame, &channel_project, &state.broker, resp_tx).await;
+            // Also strips any v2 `from:` header so exactly one identity header survives.
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ relayed (async)");
+            frame.set_canonical_from(&format!("{}@{}", name, project));
+            let relay_timeout = state.config.relay_timeout;
+            forward_to_boards(frame, &channel_project, &state.broker, &state.relay_map, resp_tx, relay_timeout, &state.wire_log).await;
         }
         ("POST", "/v1/dms") => {
             // Broker-direct DM delivery — no Boards dependency on the hot path (spec §5).
-            // Live recipient → DELIVER + 200 OK.
-            // Offline recipient → store pending + 202 Accepted (drain on reconnect).
-            // Unknown recipient → 404.
-            let xto = match frame.header("X-To").map(|s| s.to_string()) {
+            let xto = match frame.header2("X-To", "to").map(|s| s.to_string()) {
                 Some(v) => v,
                 None => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (missing to:)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
             let (recv_name, recv_project) = match http_frame::parse_identity(&xto) {
                 Ok((n, p)) => (n.to_string(), p.to_string()),
                 Err(_) => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (invalid identity)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
-
-            // Canonicalize X-From to the authenticated session identity (spec §5).
-            let sender_identity = format!("{}@{}", name, project);
-            frame.set_header("X-From", &sender_identity);
-
-            // Unknown recipient → 404.
-            if !state.broker.repo.agent_exists(&recv_name, &recv_project) {
-                let _ = resp_tx.try_send(error_response(404, "Not Found").serialize());
-                return;
-            }
-
-            // Build DELIVER frame: same body, verb changed to DELIVER /v1/dms.
-            let mut deliver = HttpFrame::request("DELIVER", "/v1/dms")
-                .add_header("X-From", &sender_identity)
-                .add_header("X-To", &xto);
-            deliver.body = frame.body.clone();
-            let deliver = deliver.finalize();
-
-            // Attempt live delivery.
-            let delivered = state.broker.send_to_agent(&recv_name, &recv_project, &deliver.serialize()).await;
-            if delivered {
-                let _ = resp_tx.try_send(HttpFrame::response(200, "OK").finalize().serialize());
-
-                // Best-effort archive fan-out — Boards offline must NOT block delivery.
-                if state.config.archive_dms {
-                    let archive_broker = state.broker.clone();
-                    let mut archive = HttpFrame::request("POST", "/v1/dms")
-                        .add_header("X-Original-From", &sender_identity)
-                        .add_header("X-Original-To", &xto);
-                    archive.body = frame.body.clone();
-                    let archive = archive.finalize();
-                    let recv_project_clone = recv_project.clone();
-                    tokio::spawn(async move {
-                        let sent = archive_broker
-                            .send_to_agent("Boards", &recv_project_clone, &archive.serialize())
-                            .await;
-                        if !sent {
-                            tracing::debug!(
-                                "DM archive: Boards@{} not connected — drop",
-                                recv_project_clone
-                            );
-                        }
-                    });
-                }
-            } else {
-                // Recipient offline — store for drain on reconnect.
-                match state.delivery.store_pending(
-                    &recv_name,
-                    &recv_project,
-                    name,
-                    project,
-                    &deliver.serialize(),
-                ) {
-                    Ok(()) => {
-                        let _ = resp_tx
-                            .try_send(HttpFrame::response(202, "Accepted").finalize().serialize());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "DM store_pending failed for {}@{}: {}",
-                            recv_name,
-                            recv_project,
-                            e
-                        );
-                        let _ = resp_tx.try_send(error_response(503, "Service Unavailable").serialize());
-                    }
-                }
-            }
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ DM routing");
+            let deliver_path = format!("/agents/{}@{}/dms", recv_name, recv_project);
+            deliver_dm_frame(frame, recv_name, recv_project, xto, &deliver_path, name, project, source_cid.clone(), state, resp_tx).await;
         }
-        ("PUBLISH", "/v1/deliveries") => {
+        // C6: agent-addressed resource paths — POST /agents/<name>@<project>/dms delivers as DM.
+        // Recipient is extracted from the path; no X-To required. Delivery logic is identical
+        // to the v1 /v1/dms arm (both delegate to deliver_dm_frame).
+        ("POST", p) if p.starts_with("/agents/") => {
+            let (recv_name, recv_project) = match http_frame::parse_identity_from_path(p) {
+                Some((n, pr)) => (n.to_string(), pr.to_string()),
+                None => {
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (invalid agent path)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
+                    return;
+                }
+            };
+            let xto = format!("{}@{}", recv_name, recv_project);
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ DM routing (C6)");
+            deliver_dm_frame(frame, recv_name, recv_project, xto, p, name, project, source_cid.clone(), state, resp_tx).await;
+        }
+        ("PUBLISH", _) => {
             // Boards-only verb — reject from regular agents.
+            // Path is informational (forwarded as-is in DELIVER frames); routing is entirely from
+            // mentions: list. Accept any path so C6 resource paths (e.g. /channels/<c>@<p>/...) work.
             if name != "Boards" {
                 tracing::warn!("PUBLISH rejected from non-Boards agent {}@{}", name, project);
-                let _ = resp_tx.try_send(error_response(403, "Forbidden").serialize());
+                log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 403 forbidden");
+                let _ = resp_tx.try_send(reply(error_response(403, "Forbidden")));
                 return;
             }
-            let xto = match frame.header("X-To").map(|s| s.to_string()) {
-                Some(v) => v,
-                None => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
-                    return;
-                }
+
+            // Guard: if the path starts with /channels/, validate it parses correctly.
+            // A malformed segment like `/channels/@project/...` (empty channel name) must be
+            // rejected — `parse_channel_from_path` returns None for empty channel or project.
+            if path.starts_with("/channels/") && http_frame::parse_channel_from_path(&path).is_none() {
+                tracing::warn!("PUBLISH from Boards@{}: malformed channel path '{}' — 400", project, path);
+                log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (malformed channel path)");
+                let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
+                return;
+            }
+
+            // C13: broker trusts the pre-resolved mentions: list from Boards.
+            // No validation — Boards resolves recipients; broker just fans out.
+            // mentions: absent → 400 (no X-To fallback — binary swap is gated on Lisa's cutover).
+            let recipients: Vec<String> = if let Some(mentions) = frame.header2("mentions", "X-Mentions").map(|s| s.to_string()) {
+                mentions.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            } else {
+                log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (no mentions)");
+                let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
+                return;
             };
-            // Partial delivery: filter invalid recipients, fan out to valid ones.
-            // All-invalid → 400. Some-invalid → 200 with X-Dropped header.
-            let (valid, dropped) = http_frame::partition_publish_recipients(&xto);
-            if valid.is_empty() {
-                tracing::warn!("PUBLISH from {}@{}: all recipients invalid — dropping", name, project);
-                let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+
+            if recipients.is_empty() {
+                tracing::warn!("PUBLISH from {}@{}: empty recipient list — dropping", name, project);
+                log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (empty recipients)");
+                let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                 return;
             }
-            if !dropped.is_empty() {
-                tracing::warn!(
-                    "PUBLISH from {}@{}: dropped {} invalid recipients: {:?}",
-                    name, project, dropped.len(), dropped
-                );
-            }
-            // Build 200 response with optional X-Dropped header.
-            let mut ok_frame = HttpFrame::response(200, "OK");
-            if !dropped.is_empty() {
-                let dropped_list = dropped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(",");
-                ok_frame.set_header("X-Dropped", &dropped_list);
-            }
-            let ok_frame = ok_frame.finalize();
-            let _ = resp_tx.try_send(ok_frame.serialize());
+
+            let _ = resp_tx.try_send(reply(HttpFrame::response(200, "OK").finalize()));
             // MUST NOT block the recv loop — spawn fan-out.
+            // wire_log_clone is cloned here and moved into the spawn — confirmed correct.
             let broker_clone = state.broker.clone();
+            let wire_log_clone = state.wire_log.clone();
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ fan-out (async)");
             tokio::spawn(async move {
-                fan_out_publish(frame, valid, &broker_clone).await;
+                fan_out_publish(frame, recipients, &broker_clone, wire_log_clone).await;
             });
         }
         ("PUT", "/v1/presence") => {
-            let status = match frame.header("X-Status").map(|s| s.to_string()) {
+            let status = match frame.header2("X-Status", "status").map(|s| s.to_string()) {
                 Some(s) => s,
                 None => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (missing status)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
@@ -629,45 +695,250 @@ async fn handle_inbound(
                 "busy" => AgentState::Busy,
                 "offline" => AgentState::Offline,
                 _ => {
-                    let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (invalid status)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
                     return;
                 }
             };
             state.broker.set_state(name, project, agent_state).await;
-            let _ = resp_tx.try_send(HttpFrame::response(200, "OK").finalize().serialize());
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ presence update");
+            let _ = resp_tx.try_send(reply(HttpFrame::response(200, "OK").finalize()));
+        }
+        // C6: channel-rooted resource paths — any POST to /channels/<channel>@<project>/...
+        // is forwarded to Boards@project. Broker extracts the project from the path; no X-To
+        // required (path is the canonical address). X-From is canonicalized as usual.
+        ("POST", p) if p.starts_with("/channels/") => {
+            let channel_project = match http_frame::parse_channel_from_path(p) {
+                Some((_, proj)) => proj.to_string(),
+                None => {
+                    log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (invalid channel path)");
+                    let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
+                    return;
+                }
+            };
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ relayed (async)");
+            frame.set_canonical_from(&format!("{}@{}", name, project));
+            let relay_timeout = state.config.relay_timeout;
+            forward_to_boards(frame, &channel_project, &state.broker, &state.relay_map, resp_tx, relay_timeout, &state.wire_log).await;
         }
         _ => {
             tracing::warn!("Unknown verb/path from {}@{}: {} {}", name, project, verb, path);
-            let _ = resp_tx.try_send(error_response(400, "Bad Request").serialize());
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (unknown verb/path)");
+            let _ = resp_tx.try_send(reply(error_response(400, "Bad Request")));
         }
     }
 }
 
-/// Forward a POST frame to Boards@target_project.
-/// Responds 200 OK if delivered, 503 Service Unavailable (Retry-After: 1) if not connected.
-async fn forward_to_boards(
-    frame: HttpFrame,
-    target_project: &str,
-    broker: &Arc<BrokerState>,
+/// Deliver a DM frame to its recipient. Shared by both the v1 (`/v1/dms`) and C6
+/// (`/agents/<name>@<project>/dms`) match arms.
+///
+/// - Canonicalizes X-From to authenticated sender identity.
+/// - Unknown recipient → 404.
+/// - Live recipient → DELIVER + 200.
+/// - Offline recipient → store_pending + 202.
+/// - Optional archive fan-out to Boards (best-effort, non-blocking).
+///
+/// AUDIT(C13-Q6): DELIVER body is `frame.body` (application content), NOT the full
+/// inbound wire frame bytes nested as an opaque blob. Safe.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_dm_frame(
+    mut frame: HttpFrame,
+    recv_name: String,
+    recv_project: String,
+    xto: String,
+    source_path: &str,
+    sender_name: &str,
+    sender_project: &str,
+    source_cid: Option<String>,
+    state: &Arc<AppState>,
     resp_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
-    let delivered = broker.send_to_agent("Boards", target_project, &frame.serialize()).await;
-    let response = if delivered {
-        HttpFrame::response(200, "OK").finalize()
-    } else {
-        tracing::warn!("Boards@{} not connected — 503", target_project);
-        let mut r = HttpFrame::response(503, "Service Unavailable").finalize();
-        r.set_header("Retry-After", "1");
-        r
+    let reply = |mut r: HttpFrame| -> String {
+        if let Some(ref cid) = source_cid {
+            r.set_header("correlation-id", cid);
+        }
+        r.serialize()
     };
-    let _ = resp_tx.try_send(response.serialize());
+
+    // Canonicalize X-From to the authenticated session identity (spec §5).
+    // Also strips any v2 `from:` header so exactly one identity header survives.
+    let sender_identity = format!("{}@{}", sender_name, sender_project);
+    frame.set_canonical_from(&sender_identity);
+
+    // Unknown recipient → 404.
+    if !state.broker.repo.agent_exists(&recv_name, &recv_project) {
+        let _ = resp_tx.try_send(reply(error_response(404, "Not Found")));
+        return;
+    }
+
+    // Build DELIVER frame: verb=DELIVER, path is always C6 resource form (/agents/<n>@<p>/dms),
+    // inner_verb=POST (C7), has_version=false (compact v2, no HTTP/1.1 suffix).
+    // Only `from:` header on broker-emitted DM DELIVER — no redundant addressing headers.
+    // Recipient addressed by direct WS session send; path always carries recipient identity.
+    // v1 callers (POST /v1/dms) are canonicalized to C6 path before reaching here.
+    let mut deliver = HttpFrame {
+        first_line: FirstLine::Request {
+            verb: "DELIVER".to_string(),
+            inner_verb: Some("POST".to_string()),
+            path: source_path.to_string(),
+            has_version: false,
+        },
+        headers: Vec::new(),
+        body: String::new(),
+    };
+    deliver = deliver
+        .add_header("from", &sender_identity);
+    deliver.body = frame.body.clone();
+    let deliver = deliver.finalize();
+
+    tracing::debug!(
+        "DELIVER {} → {}: from={} to={}",
+        source_path,
+        recv_name,
+        sender_identity,
+        xto
+    );
+
+    // Serialize once — reused for live send, store_pending, and wire log (ground truth).
+    let serialized_deliver = deliver.serialize();
+    // Attempt live delivery.
+    let delivered = state.broker.send_to_agent(&recv_name, &recv_project, &serialized_deliver).await;
+    if delivered {
+        log_wire(&state.wire_log, "[OUTBOUND]", &serialized_deliver, &format!("delivered live to {}@{}", recv_name, recv_project));
+        let _ = resp_tx.try_send(reply(HttpFrame::response(200, "OK").finalize()));
+
+        // Best-effort archive fan-out — Boards offline must NOT block delivery.
+        if state.config.archive_dms {
+            let archive_broker = state.broker.clone();
+            let archive_path = format!("/agents/{}@{}/dms", recv_name, recv_project);
+            let mut archive = HttpFrame::request("POST", &archive_path)
+                .add_header("from", &sender_identity)
+                .add_header("to", &xto);
+            archive.body = frame.body.clone();
+            let archive = archive.finalize();
+            let recv_project_clone = recv_project.clone();
+            tokio::spawn(async move {
+                let sent = archive_broker
+                    .send_to_agent("Boards", &recv_project_clone, &archive.serialize())
+                    .await;
+                if !sent {
+                    tracing::debug!(
+                        "DM archive: Boards@{} not connected — drop",
+                        recv_project_clone
+                    );
+                }
+            });
+        }
+    } else {
+        // Recipient offline — store for drain on reconnect.
+        match state.delivery.store_pending(
+            &recv_name,
+            &recv_project,
+            sender_name,
+            sender_project,
+            &serialized_deliver,
+        ) {
+            Ok(()) => {
+                log_wire(&state.wire_log, "[OUTBOUND]", &serialized_deliver, &format!("stored pending → {}@{}", recv_name, recv_project));
+                let _ = resp_tx.try_send(reply(HttpFrame::response(202, "Accepted").finalize()));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "DM store_pending failed for {}@{}: {}",
+                    recv_name,
+                    recv_project,
+                    e
+                );
+                let _ = resp_tx.try_send(reply(error_response(503, "Service Unavailable")));
+            }
+        }
+    }
 }
 
-/// Fan out a PUBLISH frame to a pre-validated list of recipients.
-/// Sends a DELIVER frame (same headers, verb changed) to each connected recipient.
+/// Forward a POST frame to Boards@target_project, inserting a relay entry so Boards'
+/// Resp can be routed back to the source connection.
+///
+/// Protocol (Q7):
+/// 1. Generate relay-id `r-<uuid>`; replace source's `correlation-id` with it on the outbound frame.
+///    Boards echoes the `correlation-id` back on its Resp — broker uses it to find this entry.
+/// 2. Insert RelayEntry BEFORE calling send_to_agent — closes the TOCTOU window where a very
+///    fast Boards Resp could arrive before the entry is registered (→ unknown relay-id drop).
+/// 3. If Boards not connected: remove the entry, return 503 immediately.
+/// 4. Spawn timeout task to fire 504 if Boards doesn't reply within relay_timeout.
+///
+/// On source disconnect before Boards replies: `entry.resp_tx.send().await` returns Err
+/// (channel closed) — logged at debug level, no further action needed.
+async fn forward_to_boards(
+    mut frame: HttpFrame,
+    target_project: &str,
+    broker: &Arc<BrokerState>,
+    relay_map: &crate::api::routes::RelayMap,
+    resp_tx: &tokio::sync::mpsc::Sender<String>,
+    relay_timeout: std::time::Duration,
+    wire_log: &Option<Arc<SyncSender<String>>>,
+) {
+    use crate::api::routes::RelayEntry;
+
+    let source_correlation_id = frame.header("correlation-id").map(|s| s.to_string());
+    let relay_id = format!("r-{}", Uuid::new_v4());
+
+    // Replace source's correlation-id with relay-id so Boards echoes it back on Resp.
+    frame.set_header("correlation-id", &relay_id);
+
+    // Register BEFORE sending — closes the TOCTOU window.
+    relay_map.insert(
+        relay_id.clone(),
+        RelayEntry {
+            resp_tx: resp_tx.clone(),
+            source_correlation_id: source_correlation_id.clone(),
+        },
+    );
+
+    // Serialize once — used for both the send and the wire log (ground truth of bytes on wire).
+    let serialized = frame.serialize();
+    // AUDIT(C13-Q6): frame.serialize() sends headers + application body of the original request.
+    // The body field is the raw application content the agent sent — NOT the full inbound wire
+    // frame nested as an opaque blob. The broker re-serializes from the parsed HttpFrame struct,
+    // so only the intended fields are forwarded. Safe.
+    let delivered = broker.send_to_agent("Boards", target_project, &serialized).await;
+    if !delivered {
+        // Boards not connected — cancel relay entry, 503 immediately.
+        relay_map.remove(&relay_id);
+        tracing::warn!("Boards@{} not connected — 503", target_project);
+        log_wire(wire_log, "[OUTBOUND]", &serialized, &format!("→ Boards@{} not connected — 503", target_project));
+        let mut r = HttpFrame::response(503, "Service Unavailable").finalize();
+        r.set_header("Retry-After", "1");
+        if let Some(cid) = source_correlation_id {
+            r.set_header("correlation-id", &cid);
+        }
+        let _ = resp_tx.try_send(r.serialize());
+        return;
+    }
+    log_wire(wire_log, "[OUTBOUND]", &serialized, &format!("→ relayed to Boards@{}", target_project));
+
+    // Timeout: if Boards doesn't respond within relay_timeout, fire a 504.
+    let relay_map_clone = relay_map.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(relay_timeout).await;
+        if let Some((_, entry)) = relay_map_clone.remove(&relay_id) {
+            tracing::warn!("relay-id {} timed out — 504", relay_id);
+            let mut r = HttpFrame::response(504, "Gateway Timeout").finalize();
+            if let Some(cid) = entry.source_correlation_id {
+                r.set_header("correlation-id", &cid);
+            }
+            // Source may have disconnected — log but don't panic.
+            if entry.resp_tx.send(r.serialize()).await.is_err() {
+                tracing::debug!("relay: source disconnected before timeout for relay-id {} — dropped", relay_id);
+            }
+        }
+    });
+}
+
+/// Fan out a PUBLISH frame to a pre-resolved list of recipients (C13 mentions: list).
+/// Sends a DELIVER frame (same headers and body, verb changed) to each connected recipient.
 /// Live-only: drops delivery if recipient is not connected (no pending queue for DELIVER).
-/// Recipients are already validated — no re-parsing needed.
-async fn fan_out_publish(frame: HttpFrame, recipients: Vec<String>, broker: &Arc<BrokerState>) {
+/// Broker trusts the list from Boards — no re-validation of recipient identities.
+async fn fan_out_publish(frame: HttpFrame, recipients: Vec<String>, broker: &Arc<BrokerState>, wire_log: Option<Arc<SyncSender<String>>>) {
     for recipient in &recipients {
         let (recv_name, recv_project) = match http_frame::parse_identity(recipient) {
             Ok(r) => r,
@@ -678,16 +949,36 @@ async fn fan_out_publish(frame: HttpFrame, recipients: Vec<String>, broker: &Arc
             }
         };
 
-        // Clone PUBLISH frame and change verb+path to DELIVER; replace X-To with single recipient.
+        // Clone PUBLISH frame and change verb+path to DELIVER for this recipient.
+        // AUDIT(C13-Q6): deliver.body = frame.body (clone) — the application content from Boards.
+        // NOT the full PUBLISH wire bytes nested as a body. The broker clones the parsed struct
+        // and mutates verb/X-To only; path is preserved from the original PUBLISH (C6 or v1). Safe.
+        let publish_path = frame.path().unwrap_or("/v1/deliveries").to_string();
+        let publish_inner_verb = frame.inner_verb().map(str::to_string);
         let mut deliver = frame.clone();
         deliver.first_line = FirstLine::Request {
             verb: "DELIVER".to_string(),
-            path: "/v1/deliveries".to_string(),
+            inner_verb: publish_inner_verb,
+            path: publish_path,
+            has_version: false, // broker-emitted frames use compact v2 form (no HTTP/1.1 suffix)
         };
-        deliver.set_header("X-To", recipient);
+        // v2-only headers on broker-emitted fan-out DELIVER.
+        // `to:` identifies the individual recipient on the broadcast (retained — meaningful).
+        // `from:` normalised from whichever form Boards sent (v1 X-From or v2 from:).
+        // X-From and X-To stripped — broker-emitted frames use v2 only.
+        deliver.set_header("to", recipient);
+        deliver.remove_header("X-To");
+        if let Some(sender) = deliver.header2("X-From", "from").map(str::to_string) {
+            deliver.set_header("from", &sender);
+        }
+        deliver.remove_header("X-From");
 
-        let delivered = broker.send_to_agent(recv_name, recv_project, &deliver.serialize()).await;
-        if !delivered {
+        // Serialize once — reused for send and wire log (ground truth of bytes on wire).
+        let serialized_deliver = deliver.serialize();
+        let delivered = broker.send_to_agent(recv_name, recv_project, &serialized_deliver).await;
+        if delivered {
+            log_wire(&wire_log, "[OUTBOUND]", &serialized_deliver, recipient);
+        } else {
             tracing::debug!(
                 "DELIVER to {} not connected — dropping (live-only fan-out)",
                 recipient

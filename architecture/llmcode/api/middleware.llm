@@ -10,8 +10,8 @@ INV:
   - Requests with missing or empty X-Project pass through unthrottled — downstream auth rejects them
   - Returns 429 with Retry-After: 1 on limit exceeded — no body delivery attempt
   - Quota is configured at startup via BROKER_RATE_LIMIT env var — not per-project from DB (v1)
-  - Applied only to state-mutating routes: /send, /channels/*/subscribe, /channels/*/unsubscribe, /messages, /messages/peek
-  - NOT applied to: /projects/register, /agents/register, /agents, /presence, /health, /ws upgrade, /admin/*
+  - Applied only to state-mutating routes: /v1/send, /presence, /messages, /messages/peek
+  - NOT applied to: /projects/register, /agents/register, /agents, /health, /ws upgrade, /admin/*, /tools/*
   - WS per-stanza rate limiting is out of scope — would require in-broker logic
 LOOK: route group in routes.rs that applies the layer; AppState.rate_limiter field
 CHK: cargo test middleware; verify per-project bucket isolation test; verify pass-through for missing X-Project
