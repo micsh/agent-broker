@@ -721,6 +721,41 @@ async fn handle_inbound(
             let relay_timeout = state.config.relay_timeout;
             forward_to_boards(frame, &channel_project, &state.broker, &state.relay_map, resp_tx, relay_timeout, &state.wire_log).await;
         }
+        // C-ART: artifact GET — GET /<project>/artifacts/<id> forwarded to Boards@project.
+        // Path must be exactly four raw tokens from split('/'): ["", project, "artifacts", id].
+        // Non-canonical paths (double-slash, missing id, extra segment) are rejected with 400.
+        // correlation-id is generated before any early return so all responses carry it.
+        ("GET", _) => {
+            // Fix 1: generate/echo effective_cid BEFORE path validation so 400 carries it too.
+            let effective_cid = source_cid.clone().unwrap_or_else(|| format!("g-{}", Uuid::new_v4()));
+
+            // Fix 2: raw split without filter — double-slash paths produce extra empty tokens → 400.
+            // Valid form produces exactly ["", project, "artifacts", id].
+            let segments: Vec<&str> = path.split('/').collect();
+            if segments.len() != 4
+                || !segments[0].is_empty()
+                || segments[1].is_empty()
+                || segments[2] != "artifacts"
+                || segments[3].is_empty()
+            {
+                log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (malformed artifact path)");
+                let mut err = HttpFrame::response(400, "Bad Request");
+                err.body = r#"{"code":"malformed-path","message":"path must be /<project>/artifacts/<id>"}"#.to_string();
+                let mut err = err.finalize();
+                err.set_header("correlation-id", &effective_cid);
+                let _ = resp_tx.try_send(err.serialize());
+                return;
+            }
+            let artifact_project = segments[1].to_string();
+
+            // Stamp correlation-id and sender identity on the forwarded frame.
+            frame.set_header("correlation-id", &effective_cid);
+            frame.set_canonical_from(&format!("{}@{}", name, project));
+
+            log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ artifact relay (async)");
+            let relay_timeout = state.config.relay_timeout;
+            forward_artifact_to_boards(frame, &artifact_project, &state.broker, &state.relay_map, resp_tx, relay_timeout, &state.wire_log).await;
+        }
         _ => {
             tracing::warn!("Unknown verb/path from {}@{}: {} {}", name, project, verb, path);
             log_wire(&state.wire_log, "[INBOUND]", &frame.serialize(), "→ 400 bad request (unknown verb/path)");
@@ -929,6 +964,77 @@ async fn forward_to_boards(
             // Source may have disconnected — log but don't panic.
             if entry.resp_tx.send(r.serialize()).await.is_err() {
                 tracing::debug!("relay: source disconnected before timeout for relay-id {} — dropped", relay_id);
+            }
+        }
+    });
+}
+
+/// Relay a GET /<project>/artifacts/<id> frame to Boards@<project> via the Q7 relay mechanism.
+///
+/// Identical to `forward_to_boards` in relay mechanics, but broker-generated errors (503, 504)
+/// carry a JSON body `{"code":"...", "message":"..."}` with artifact-specific codes so callers
+/// can distinguish artifact-retrieval failures from generic relay failures:
+/// - 503: `artifact-provider-offline` — Boards@project not connected
+/// - 504: `artifact-provider-timeout` — no Boards Resp within relay_timeout
+///
+/// The caller must have already set `correlation-id` on the frame (generated if caller omitted one).
+async fn forward_artifact_to_boards(
+    mut frame: HttpFrame,
+    target_project: &str,
+    broker: &Arc<BrokerState>,
+    relay_map: &crate::api::routes::RelayMap,
+    resp_tx: &tokio::sync::mpsc::Sender<String>,
+    relay_timeout: std::time::Duration,
+    wire_log: &Option<Arc<SyncSender<String>>>,
+) {
+    use crate::api::routes::RelayEntry;
+
+    let source_correlation_id = frame.header("correlation-id").map(|s| s.to_string());
+    let relay_id = format!("r-{}", Uuid::new_v4());
+
+    // Replace caller's CID with relay-id so Boards echoes it back on Resp.
+    frame.set_header("correlation-id", &relay_id);
+
+    // Register BEFORE sending — closes the TOCTOU window.
+    relay_map.insert(
+        relay_id.clone(),
+        RelayEntry {
+            resp_tx: resp_tx.clone(),
+            source_correlation_id: source_correlation_id.clone(),
+        },
+    );
+
+    let serialized = frame.serialize();
+    let delivered = broker.send_to_agent("Boards", target_project, &serialized).await;
+    if !delivered {
+        relay_map.remove(&relay_id);
+        tracing::warn!("Boards@{} not connected — artifact GET 503", target_project);
+        log_wire(wire_log, "[OUTBOUND]", &serialized, &format!("→ Boards@{} not connected — 503 (artifact)", target_project));
+        let mut r = HttpFrame::response(503, "Service Unavailable");
+        r.body = r#"{"code":"artifact-provider-offline","message":"Boards not connected"}"#.to_string();
+        let mut r = r.finalize();
+        if let Some(cid) = source_correlation_id {
+            r.set_header("correlation-id", &cid);
+        }
+        let _ = resp_tx.try_send(r.serialize());
+        return;
+    }
+    log_wire(wire_log, "[OUTBOUND]", &serialized, &format!("→ relayed to Boards@{} (artifact)", target_project));
+
+    // Timeout: if Boards doesn't respond within relay_timeout, fire a 504 with artifact code.
+    let relay_map_clone = relay_map.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(relay_timeout).await;
+        if let Some((_, entry)) = relay_map_clone.remove(&relay_id) {
+            tracing::warn!("artifact relay-id {} timed out — 504", relay_id);
+            let mut r = HttpFrame::response(504, "Gateway Timeout");
+            r.body = r#"{"code":"artifact-provider-timeout","message":"no response from Boards within timeout"}"#.to_string();
+            let mut r = r.finalize();
+            if let Some(cid) = entry.source_correlation_id {
+                r.set_header("correlation-id", &cid);
+            }
+            if entry.resp_tx.send(r.serialize()).await.is_err() {
+                tracing::debug!("artifact relay: source disconnected before timeout for relay-id {} — dropped", relay_id);
             }
         }
     });

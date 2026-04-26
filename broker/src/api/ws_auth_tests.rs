@@ -2298,3 +2298,213 @@ async fn ws_wire_log_forward_to_boards_503() {
     let _ = std::fs::remove_file(&log_path);
     drop(alice_ws);
 }
+
+// ── Artifact GET relay tests (C-ART) ─────────────────────────────────────────
+
+/// C-ART t1: GET /<project>/artifacts/<id> — Boards online, returns 200 JSON body.
+/// Caller receives 200 with original correlation-id restored and body forwarded.
+#[tokio::test]
+async fn ws_artifact_get_success_relayed_200() {
+    let (addr, state) = spawn_relay_server(5).await;
+    let agent_key = setup_agent(&state, "proj-art1", "key-art1", "Alice");
+    let mut boards_ws = connect_boards_tofu(addr, "proj-art1").await;
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art1", &agent_key).await;
+
+    let get = HttpFrame::request("GET", "/proj-art1/artifacts/a-abc123")
+        .add_header("correlation-id", "cid-art-1")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    // Boards receives the forwarded frame; source CID replaced with relay-id.
+    let forwarded = recv_frame(&mut boards_ws).await;
+    let relay_id = forwarded.header("correlation-id")
+        .expect("relay-id must be present on forwarded frame")
+        .to_string();
+    assert!(relay_id.starts_with("r-"), "relay-id must have r- prefix: {relay_id}");
+    assert_eq!(forwarded.verb(), Some("GET"));
+    assert_eq!(forwarded.path(), Some("/proj-art1/artifacts/a-abc123"));
+
+    // Boards responds 200 with a JSON body.
+    let mut boards_resp = HttpFrame::response(200, "OK");
+    boards_resp.set_header("Content-Type", "application/json");
+    boards_resp.set_header("correlation-id", &relay_id);
+    boards_resp.body = r#"{"id":"a-abc123","title":"Test Artifact"}"#.to_string();
+    let boards_resp = boards_resp.finalize();
+    send_frame(&mut boards_ws, &boards_resp).await;
+
+    // Alice receives 200 with her original correlation-id restored.
+    let alice_resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(alice_resp.status(), Some(200), "must get 200: {:?}", alice_resp.first_line);
+    assert_eq!(alice_resp.header("correlation-id"), Some("cid-art-1"), "source cid must be restored");
+    assert!(alice_resp.body.contains("a-abc123"), "body must be forwarded: {}", alice_resp.body);
+
+    drop(boards_ws); drop(alice_ws);
+}
+
+/// C-ART t2: Boards returns 404 — relayed unchanged to caller with correlation-id preserved.
+#[tokio::test]
+async fn ws_artifact_get_404_relayed_unchanged() {
+    let (addr, state) = spawn_relay_server(5).await;
+    let agent_key = setup_agent(&state, "proj-art2", "key-art2", "Alice");
+    let mut boards_ws = connect_boards_tofu(addr, "proj-art2").await;
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art2", &agent_key).await;
+
+    let get = HttpFrame::request("GET", "/proj-art2/artifacts/a-missing")
+        .add_header("correlation-id", "cid-art-2")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    let forwarded = recv_frame(&mut boards_ws).await;
+    let relay_id = forwarded.header("correlation-id").expect("relay-id").to_string();
+
+    // Boards replies 404.
+    let mut boards_resp = HttpFrame::response(404, "Not Found");
+    boards_resp.set_header("correlation-id", &relay_id);
+    let boards_resp = boards_resp.finalize();
+    send_frame(&mut boards_ws, &boards_resp).await;
+
+    let alice_resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(alice_resp.status(), Some(404), "404 must be relayed: {:?}", alice_resp.first_line);
+    assert_eq!(alice_resp.header("correlation-id"), Some("cid-art-2"), "cid must be echoed on 404");
+
+    drop(boards_ws); drop(alice_ws);
+}
+
+/// C-ART t3: Boards not connected — 503 with artifact-specific JSON error code and correlation-id.
+#[tokio::test]
+async fn ws_artifact_get_boards_offline_503_with_code() {
+    let (addr, state) = spawn_relay_server(5).await;
+    // Boards intentionally not connected — only the agent connects.
+    let agent_key = setup_agent(&state, "proj-art3", "key-art3", "Alice");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art3", &agent_key).await;
+
+    let get = HttpFrame::request("GET", "/proj-art3/artifacts/a-abc")
+        .add_header("correlation-id", "cid-art-3")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    let resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(resp.status(), Some(503), "must get 503 when Boards offline: {:?}", resp.first_line);
+    assert_eq!(resp.header("correlation-id"), Some("cid-art-3"), "cid must be echoed on 503");
+    assert!(resp.body.contains("artifact-provider-offline"),
+        "body must contain artifact-provider-offline; got: {}", resp.body);
+
+    drop(alice_ws);
+}
+
+/// C-ART t4: Boards connected but never replies → timeout fires 504 with artifact error code.
+#[tokio::test]
+async fn ws_artifact_get_timeout_fires_504_with_code() {
+    let (addr, state) = spawn_relay_server(1).await; // 1-second timeout for fast test
+    let agent_key = setup_agent(&state, "proj-art4", "key-art4", "Alice");
+    let mut boards_ws = connect_boards_tofu(addr, "proj-art4").await;
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art4", &agent_key).await;
+
+    let get = HttpFrame::request("GET", "/proj-art4/artifacts/a-timeout")
+        .add_header("correlation-id", "cid-art-4")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    // Boards receives the frame but intentionally does NOT reply.
+    let _forwarded = recv_frame(&mut boards_ws).await;
+
+    // Wait for the 504 — relay_timeout is 1s, allow 3s for CI headroom.
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async { recv_frame(&mut alice_ws).await },
+    )
+    .await
+    .expect("timed out waiting for 504 from broker");
+
+    assert_eq!(resp.status(), Some(504), "must get 504 on timeout: {:?}", resp.first_line);
+    assert_eq!(resp.header("correlation-id"), Some("cid-art-4"), "cid must be preserved on 504");
+    assert!(resp.body.contains("artifact-provider-timeout"),
+        "body must contain artifact-provider-timeout; got: {}", resp.body);
+
+    drop(boards_ws); drop(alice_ws);
+}
+
+/// C-ART t5: Malformed path — missing artifact id segment → 400 with malformed-path code.
+/// Caller omits correlation-id — broker must generate one and include it on the 400 response.
+#[tokio::test]
+async fn ws_artifact_get_malformed_missing_id_400() {
+    let (addr, state) = spawn_relay_server(5).await;
+    let agent_key = setup_agent(&state, "proj-art5", "key-art5", "Alice");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art5", &agent_key).await;
+
+    // GET /proj-art5/artifacts — missing the id segment; intentionally NO correlation-id from caller.
+    let get = HttpFrame::request("GET", "/proj-art5/artifacts")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    let resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(resp.status(), Some(400), "must get 400 for missing id: {:?}", resp.first_line);
+    // Broker must generate a correlation-id even when caller omitted one.
+    assert!(resp.header("correlation-id").is_some(),
+        "400 must carry a broker-generated correlation-id even when caller omitted one");
+    assert!(resp.body.contains("malformed-path"),
+        "body must contain malformed-path; got: {}", resp.body);
+
+    drop(alice_ws);
+}
+
+/// C-ART t6: Malformed path — extra segment after id → 400 with malformed-path code.
+/// Caller omits correlation-id — broker must generate one and include it on the 400 response.
+#[tokio::test]
+async fn ws_artifact_get_malformed_extra_segment_400() {
+    let (addr, state) = spawn_relay_server(5).await;
+    let agent_key = setup_agent(&state, "proj-art6", "key-art6", "Alice");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art6", &agent_key).await;
+
+    // GET /proj-art6/artifacts/a-123/extra — extra segment beyond id; NO correlation-id from caller.
+    let get = HttpFrame::request("GET", "/proj-art6/artifacts/a-123/extra")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    let resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(resp.status(), Some(400), "must get 400 for extra segment: {:?}", resp.first_line);
+    // Broker must generate a correlation-id even when caller omitted one.
+    assert!(resp.header("correlation-id").is_some(),
+        "400 must carry a broker-generated correlation-id even when caller omitted one");
+    assert!(resp.body.contains("malformed-path"),
+        "body must contain malformed-path; got: {}", resp.body);
+
+    drop(alice_ws);
+}
+
+/// C-ART t7: Non-canonical double-slash path → 400 malformed-path (raw split, no filter).
+/// `//proj/artifacts/id` must produce extra empty token and be rejected, not forwarded.
+#[tokio::test]
+async fn ws_artifact_get_double_slash_path_400() {
+    let (addr, state) = spawn_relay_server(5).await;
+    let agent_key = setup_agent(&state, "proj-art7", "key-art7", "Alice");
+
+    let mut alice_ws = ws_connect(addr).await;
+    complete_handshake(&mut alice_ws, "Alice@proj-art7", &agent_key).await;
+
+    // Double-slash before project: //proj-art7/artifacts/a-id → extra empty token → 400.
+    let get = HttpFrame::request("GET", "//proj-art7/artifacts/a-id")
+        .add_header("correlation-id", "cid-art-7")
+        .finalize();
+    send_frame(&mut alice_ws, &get).await;
+
+    let resp = recv_frame(&mut alice_ws).await;
+    assert_eq!(resp.status(), Some(400), "double-slash path must be rejected: {:?}", resp.first_line);
+    assert_eq!(resp.header("correlation-id"), Some("cid-art-7"), "cid must be echoed on 400");
+    assert!(resp.body.contains("malformed-path"),
+        "body must contain malformed-path; got: {}", resp.body);
+
+    drop(alice_ws);
+}
