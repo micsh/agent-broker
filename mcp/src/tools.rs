@@ -154,7 +154,8 @@ impl BrokerTools {
         }
 
         // Delegate key persistence, identity persistence, and session mutation to SessionManager
-        self.session.register(agent_name.clone(), args.project.clone(), project_key, broker_url.clone());
+        self.session.register(agent_name.clone(), args.project.clone(), project_key, broker_url.clone())
+            .map_err(|e| mcp_err(format!("Key persistence failed: {e}")))?;
 
         Ok(CallToolResult::success(vec![Content::text(
             format!("Registered as {}.{} on {}", agent_name, args.project, broker_url))]))

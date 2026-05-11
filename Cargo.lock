@@ -216,11 +216,14 @@ name = "broker-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "ed25519-dalek",
  "futures-util",
- "regex",
+ "hex",
+ "rand_core 0.6.4",
  "reqwest",
  "serde",
  "serde_json",

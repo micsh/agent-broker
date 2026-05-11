@@ -30,8 +30,8 @@ impl SessionManager {
         project: String,
         project_key: String,
         broker_url: String,
-    ) {
-        save_key(&project, &project_key);
+    ) -> Result<(), std::io::Error> {
+        save_key(&project, &project_key)?;
         if let Ok(cwd) = std::env::current_dir() {
             save_identity(&cwd.to_string_lossy(), &agent_name);
         }
@@ -41,6 +41,7 @@ impl SessionManager {
             agent_name,
             broker_url,
         });
+        Ok(())
     }
 
     /// Return (agent_name, project, project_key, broker_url) or an error if not registered.
@@ -75,12 +76,18 @@ pub fn load_key(project: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-pub fn save_key(project: &str, key: &str) {
+pub fn save_key(project: &str, key: &str) -> Result<(), std::io::Error> {
     let path = key_file_path(project);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::write(path, key);
+    std::fs::write(&path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Identity file: ~/.agent-broker/identities.json — maps CWD → agent name

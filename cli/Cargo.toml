@@ -1,6 +1,6 @@
 [package]
 name = "broker-cli"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 description = "Command-line client for agent-broker: listen on WS (NDJSON to stdout) + one-shot send verbs."
 
@@ -17,6 +17,9 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-regex = "1"
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+base64 = "0.22"

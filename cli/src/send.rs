@@ -1,81 +1,104 @@
 use crate::identity::Identity;
+use crate::ws_session;
+#[cfg(windows)]
+use crate::pipe;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-#[derive(Deserialize)]
-struct SendResp {
-    message_id: String,
-}
-
-async fn send_raw(client: &reqwest::Client, id: &Identity, stanza: String) -> Result<String> {
-    let key = id.project_key()?;
-    let resp = client
-        .post(format!("{}/send", id.broker_url))
-        .header("X-Project", &id.project)
-        .header("X-Project-Key", &key)
-        .header("X-Agent-Name", &id.name)
-        .header("Content-Type", "application/xml")
-        .body(stanza)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("send failed: {body}");
+/// Normalize a user-supplied identity string to `name@project` wire format.
+/// Accepts `Name@Project` (v2) and `Name.Project` (v1, splits on last `.`).
+fn normalize_identity(s: &str) -> String {
+    if s.contains('@') {
+        s.to_string()
+    } else if let Some(dot) = s.rfind('.') {
+        format!("{}@{}", &s[..dot], &s[dot + 1..])
+    } else {
+        s.to_string() // single token — broker will reject, but let it produce the error
     }
-    let r: SendResp = resp.json().await?;
-    Ok(r.message_id)
 }
 
-pub async fn dm(client: &reqwest::Client, id: &Identity, to: &str, body: &str) -> Result<String> {
-    let stanza = format!(
-        r#"<message type="dm" from="{}" to="{}"><body>{}</body></message>"#,
-        id.name,
-        to,
-        xml_escape(body)
-    );
-    send_raw(client, id, stanza).await
+/// Build the C6 channel resource path `/channels/<chan>@<project>`.
+/// Accepts: `#general`, `#general.Project`, `#general@Project`, `general`, `general@Project`.
+/// When no cross-project qualifier is present, `sender_project` is used.
+fn channel_path(channel: &str, sender_project: &str) -> String {
+    let ch = channel.trim_start_matches('#');
+    if ch.contains('@') {
+        format!("/channels/{ch}")
+    } else if let Some(dot) = ch.find('.') {
+        format!("/channels/{}@{}", &ch[..dot], &ch[dot + 1..])
+    } else {
+        format!("/channels/{ch}@{sender_project}")
+    }
 }
 
+/// Send a frame using the named pipe if `broker listen` is active (Windows),
+/// otherwise fall back to a one-shot WS connection.
+/// TODO: pipe auth token — currently no authentication on the pipe.
+async fn send_frame(id: &Identity, frame: String) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let name = pipe::pipe_name(&id.project, &id.name);
+        match pipe::try_send(&name, &frame).await {
+            Some(Ok(resp)) => {
+                if resp.starts_with("HTTP/1.1 2") {
+                    return Ok(());
+                }
+                let status_line = resp.lines().next().unwrap_or("unknown error").to_string();
+                bail!("pipe error: {status_line}");
+            }
+            Some(Err(e)) => bail!("pipe send failed: {e}"),
+            None => {} // pipe not available (listen not running) → fall through to WS
+        }
+    }
+    ws_session::send_one(id, frame).await
+}
+
+/// Send a direct message: `POST /v1/dms` with `from:` and `to:` headers.
+pub async fn dm(id: &Identity, to: &str, body: &str) -> Result<()> {
+    let from = id.fq();
+    let to_canon = normalize_identity(to);
+    let frame = format!("POST /v1/dms\r\nfrom: {from}\r\nto: {to_canon}\r\n\r\n{body}");
+    send_frame(id, frame).await
+}
+
+/// Post to a channel: `POST /channels/<chan>@<project>` with `from:` and optional `mentions:`.
 pub async fn post(
-    client: &reqwest::Client,
     id: &Identity,
     channel: &str,
     body: &str,
     mentions: Option<&str>,
-) -> Result<String> {
-    let chan = if channel.starts_with('#') {
-        channel.to_string()
-    } else {
-        format!("#{channel}")
-    };
-    let mentions_attr = mentions
-        .map(|m| format!(r#" mentions="{}""#, m))
+) -> Result<()> {
+    let from = id.fq();
+    let path = channel_path(channel, &id.project);
+    let mentions_line = mentions
+        .map(|m| format!("mentions: {m}\r\n"))
         .unwrap_or_default();
-    let stanza = format!(
-        r#"<message type="post" from="{}" to="{}"{}> <body>{}</body></message>"#,
-        id.name,
-        chan,
-        mentions_attr,
-        xml_escape(body)
-    );
-    send_raw(client, id, stanza).await
+    let frame = format!("POST {path}\r\nfrom: {from}\r\n{mentions_line}\r\n{body}");
+    send_frame(id, frame).await
 }
 
-pub async fn presence(client: &reqwest::Client, id: &Identity, status: &str) -> Result<String> {
-    let stanza = format!(r#"<presence from="{}" status="{}"/>"#, id.name, status);
-    send_raw(client, id, stanza).await
+/// Update presence via `PUT /presence` with a JSON body `{"state": "..."}`.
+/// Uses AgentAuth headers (X-Project, X-Project-Key, X-Agent-Name).
+pub async fn presence(client: &reqwest::Client, id: &Identity, status: &str) -> Result<()> {
+    let key = id.project_key()?;
+    let resp = client
+        .put(format!("{}/presence", id.broker_url))
+        .header("X-Project", &id.project)
+        .header("X-Project-Key", &key)
+        .header("X-Agent-Name", &id.name)
+        .json(&serde_json::json!({ "state": status }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("presence update failed: {}", body.trim());
+    }
+    Ok(())
 }
 
-pub async fn stanza(client: &reqwest::Client, id: &Identity, raw: String) -> Result<String> {
-    send_raw(client, id, raw).await
+/// Send a raw HttpFrame string verbatim. Caller is responsible for correct frame format.
+pub async fn frame_raw(id: &Identity, raw: String) -> Result<()> {
+    send_frame(id, raw).await
 }
 
 #[derive(Deserialize)]

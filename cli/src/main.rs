@@ -1,6 +1,8 @@
 mod identity;
 mod listen;
+mod pipe;
 mod send;
+mod ws_session;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -12,11 +14,11 @@ use std::io::Read;
     name = "broker",
     version,
     about = "agent-broker CLI: long-running `listen` (WS → NDJSON) + one-shot send verbs.\n\
-             Identity is Name.Project; pass --as or rely on the session saved by `register`."
+             Identity is Name@Project; pass --as or rely on the session saved by `register`."
 )]
 struct Cli {
-    /// Act as Name.Project (overrides saved session).
-    #[arg(long, global = true, value_name = "NAME.PROJECT")]
+    /// Act as Name@Project (overrides saved session).
+    #[arg(long, global = true, value_name = "NAME@PROJECT")]
     r#as: Option<String>,
 
     /// Broker base URL (overrides $BROKER_URL; default http://127.0.0.1:4200).
@@ -29,16 +31,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Register Name.Project with the broker and save as the active CLI session.
+    /// Register Name@Project with the broker and save as the active CLI session.
+    /// Generates an Ed25519 keypair and enrolls the public key with the broker.
     Register {
-        /// Name.Project (required here; --as is also accepted).
-        #[arg(value_name = "NAME.PROJECT")]
+        /// Name@Project (required here; --as is also accepted).
+        #[arg(value_name = "NAME@PROJECT")]
         who: Option<String>,
         /// Optional description shown in agent listings.
         #[arg(long)]
         description: Option<String>,
     },
-    /// Open a WebSocket and stream incoming stanzas as NDJSON to stdout (run in background).
+    /// Open a WebSocket and stream incoming frames as NDJSON to stdout (run in background).
+    /// Performs Ed25519 HELLO→CHALLENGE→AUTH handshake before streaming.
     Listen {
         /// Reconnect automatically with backoff on disconnect/error.
         #[arg(long, default_value_t = true)]
@@ -47,13 +51,13 @@ enum Cmd {
         #[arg(long, conflicts_with = "reconnect")]
         once: bool,
     },
-    /// Send a direct message. Use Name.Project for cross-project targets.
+    /// Send a direct message. Use Name@Project for cross-project targets.
     Dm {
         to: String,
         /// Message body. Omit or pass '-' to read from stdin.
         message: Option<String>,
     },
-    /// Post to a channel (#chan or #chan.Project).
+    /// Post to a channel (#chan or #chan@Project or #chan.Project).
     Post {
         channel: String,
         /// Message body. Omit or pass '-' to read from stdin.
@@ -67,8 +71,8 @@ enum Cmd {
         #[arg(value_parser = ["available", "busy", "offline"])]
         status: String,
     },
-    /// Send a raw stanza XML frame. Reads stdin if XML is omitted or '-'.
-    Stanza { xml: Option<String> },
+    /// Send a raw HttpFrame string. Reads stdin if frame is omitted or '-'.
+    Frame { frame: Option<String> },
     /// List agents (optionally filtered by project). JSON to stdout.
     Agents {
         #[arg(long)]
@@ -115,7 +119,7 @@ async fn main() -> Result<()> {
         Cmd::Register { who, description } => {
             let spec = who
                 .or(cli.r#as.clone())
-                .ok_or_else(|| anyhow::anyhow!("register requires NAME.PROJECT (positional or --as)"))?;
+                .ok_or_else(|| anyhow::anyhow!("register requires NAME@PROJECT (positional or --as)"))?;
             let (name, project) = parse_as(&spec)?;
             let id = identity::register(&client, &name, &project, description.as_deref(), &url).await?;
             eprintln!("registered {} on {}", id.fq(), id.broker_url);
@@ -130,28 +134,28 @@ async fn main() -> Result<()> {
         Cmd::Dm { to, message } => {
             let id = resolve(cli.r#as.as_deref(), &url)?;
             let body = read_body(message)?;
-            let mid = send::dm(&client, &id, &to, &body).await?;
-            println!("{}", serde_json::json!({ "message_id": mid, "to": to }));
+            send::dm(&id, &to, &body).await?;
+            println!("{}", serde_json::json!({ "ok": true, "to": to }));
         }
 
         Cmd::Post { channel, message, mentions } => {
             let id = resolve(cli.r#as.as_deref(), &url)?;
             let body = read_body(message)?;
-            let mid = send::post(&client, &id, &channel, &body, mentions.as_deref()).await?;
-            println!("{}", serde_json::json!({ "message_id": mid, "to": channel }));
+            send::post(&id, &channel, &body, mentions.as_deref()).await?;
+            println!("{}", serde_json::json!({ "ok": true, "to": channel }));
         }
 
         Cmd::Presence { status } => {
             let id = resolve(cli.r#as.as_deref(), &url)?;
-            let mid = send::presence(&client, &id, &status).await?;
-            println!("{}", serde_json::json!({ "message_id": mid, "status": status }));
+            send::presence(&client, &id, &status).await?;
+            println!("{}", serde_json::json!({ "ok": true, "status": status }));
         }
 
-        Cmd::Stanza { xml } => {
+        Cmd::Frame { frame } => {
             let id = resolve(cli.r#as.as_deref(), &url)?;
-            let raw = read_body(xml)?;
-            let mid = send::stanza(&client, &id, raw).await?;
-            println!("{}", serde_json::json!({ "message_id": mid }));
+            let raw = read_body(frame)?;
+            send::frame_raw(&id, raw).await?;
+            println!("{}", serde_json::json!({ "ok": true }));
         }
 
         Cmd::Agents { project } => {
@@ -176,7 +180,7 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::json!({
                         "event": "message",
-                        "from": format!("{}.{}", m.from_agent, m.from_project),
+                        "from": format!("{}@{}", m.from_agent, m.from_project),
                         "raw": m.body,
                         "ts": m.created_utc,
                     })
@@ -196,7 +200,7 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::json!({
                         "event": "message",
-                        "from": format!("{}.{}", m.from_agent, m.from_project),
+                        "from": format!("{}@{}", m.from_agent, m.from_project),
                         "raw": m.body,
                         "ts": m.created_utc,
                     })
