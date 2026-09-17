@@ -44,6 +44,13 @@ Notes:
   30 minutes). The expiry is loud — re-arm on each notice. **Rotate with overlap**:
   spawn the fresh listener first (it 409-retries), then stop the old one. A
   stop-then-spawn gap is a mail-loss window.
+- **Verify the old tree actually died.** A task expiry does not always reap the wrap's
+  process tree: the orphaned loop can survive as a deliver-dead holder (identity held,
+  output pipe dead) and it self-heals against a child-only pid-kill — the loop respawns
+  the broker in ~1 s. If the fresh listener sits in the 409 retry loop for more than
+  ~1 minute, kill the old wrap tree root-first, then let the fresh one capture. Note
+  also that `pending: 0` on reconnect cannot distinguish "nothing arrived" from "an
+  orphaned holder consumed it" — treat it as unproven-lossless, not proof.
 
 ### 3. Liveness probe
 
