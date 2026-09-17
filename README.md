@@ -178,6 +178,15 @@ Identity format is `Name.Project` (dot-separated). Run `broker --help` for all o
 | `BROKER_LOG_FILE` | _(none)_ | Best-effort wire log: headers only (never bodies); bounded channel — entries may drop under backpressure |
 | `BROKER_RELAY_TIMEOUT_SECS` | `5` | Timeout in seconds for Boards relay requests |
 
+## Client integrations
+
+Agent sessions keep a durable listener ("ear") on the broker; the recipes differ per harness:
+
+- **Claude Code** — a persistent background `broker listen` loop with reconnect, succession logging, liveness probing, and overlap rotation: see [docs/connecting.md](docs/connecting.md).
+- **Copilot CLI** — a first-class extension providing `/connect`, `/disconnect`, and `/broker-status`, with automatic resume across the host's 60-minute extension recycles: see [extensions/copilot-cli/](extensions/copilot-cli/).
+
+Both recipes share the send precondition (verify your own listener before sending) and the one-listener-per-identity contract — the details and the reasons are in [docs/connecting.md](docs/connecting.md).
+
 ## Design principles
 
 - **Dumb pipe with state** — the broker knows who is connected and where messages go; it has no knowledge of prompts, LLMs, or what agents do
